@@ -915,6 +915,10 @@ namespace ExtendedLSC
         {
             if (currentVehicle == null) return;
 
+            // CRITICAL: Install mod kit before any mod operations
+            // This is REQUIRED for SET_VEHICLE_MOD to work properly
+            Function.Call(Hash.SET_VEHICLE_MOD_KIT, currentVehicle, 0);
+
             // Set current vehicle for MenuConfig (used for vehicle-specific overrides)
             MenuConfig.CurrentVehicle = currentVehicle.DisplayName;
 
@@ -1957,6 +1961,8 @@ namespace ExtendedLSC
             {
                 if (isPreviewingMod && currentVehicle != null && currentVehicle.Exists() && previewModIndex == idx)
                 {
+                    // Ensure mod kit is installed (required for SET_VEHICLE_MOD to work)
+                    Function.Call(Hash.SET_VEHICLE_MOD_KIT, currentVehicle, 0);
                     Function.Call(Hash.SET_VEHICLE_MOD, currentVehicle, idx, previewOriginalValue, false);
                     isPreviewingMod = false;
                     previewModIndex = -1;
@@ -1968,6 +1974,8 @@ namespace ExtendedLSC
             {
                 if (currentVehicle != null && currentVehicle.Exists())
                 {
+                    // Ensure mod kit is installed (required for SET_VEHICLE_MOD to work)
+                    Function.Call(Hash.SET_VEHICLE_MOD_KIT, currentVehicle, 0);
                     // Index 0 = Stock (-1), Index 1+ = mod value (index - 1)
                     int previewValue = e.Index == 0 ? -1 : e.Index - 1;
                     Function.Call(Hash.SET_VEHICLE_MOD, currentVehicle, idx, previewValue, false);
@@ -2158,38 +2166,42 @@ namespace ExtendedLSC
         {
             var menu = CreateMenu(isPrimary ? "Primary" : "Secondary");
 
-            // Classic colors
-            string[] colors = {
-                "Black", "Carbon Black", "Graphite", "Anthracite Black", "Black Steel",
-                "Dark Silver", "Silver", "Bluish Silver", "Rolled Steel", "Shadow Silver",
-                "Stone Silver", "Midnight Silver", "Cast Iron Silver", "Red",
-                "Torino Red", "Formula Red", "Lava Red", "Blaze Red", "Grace Red",
-                "Garnet Red", "Sunset Red", "Cabernet Red", "Wine Red", "Candy Red",
-                "Hot Pink", "Pfsiter Pink", "Salmon Pink", "Sunrise Orange",
-                "Orange", "Bright Orange", "Gold", "Bronze",
-                "Yellow", "Race Yellow", "Dew Yellow", "Dark Green", "Racing Green",
-                "Sea Green", "Olive Green", "Bright Green", "Gasoline Green",
-                "Lime Green", "Midnight Blue", "Galaxy Blue", "Dark Blue",
-                "Saxon Blue", "Blue", "Mariner Blue", "Harbor Blue", "Diamond Blue",
-                "Surf Blue", "Nautical Blue", "Racing Blue", "Ultra Blue", "Light Blue",
-                "Chocolate Brown", "Bison Brown", "Creek Brown", "Feltzer Brown",
-                "Maple Brown", "Beechwood Brown", "Sienna Brown", "Saddle Brown",
-                "Moss Brown", "Woodbeech Brown", "Straw Brown", "Sandy Brown",
-                "Bleached Brown", "Schafter Purple", "Spinnaker Purple", "Midnight Purple",
-                "Bright Purple", "Cream", "Ice White", "Frost White"
+            // Create category submenus
+            var categories = new (string name, VehicleColors.ColorInfo[] colors, int paintType, int price)[]
+            {
+                ("Classic", VehicleColors.ClassicColors, 0, ModPricing.ClassicPrice),
+                ("Metallic", VehicleColors.MetallicColors, 1, ModPricing.MetallicPrice),
+                ("Matte", VehicleColors.MatteColors, 3, ModPricing.MattePrice),
+                ("Metal", VehicleColors.MetalFinishes, 4, ModPricing.MetalPrice),
+                ("Chrome", VehicleColors.ChromeColors, 5, ModPricing.ChromePrice),
             };
 
-            for (int i = 0; i < colors.Length && i < 75; i++)
+            foreach (var (categoryName, colors, paintType, basePrice) in categories)
             {
-                var item = new NativeItem(colors[i]);
-                item.AltTitle = $"${ModPricing.MetallicPrice}";
-                int colorIndex = i;
-                item.Activated += (s, e) =>
+                var categoryMenu = CreateMenu(categoryName);
+                categoryMenu.Closed += (s, e) => { if (!isNavigatingMenu) menu.Visible = true; };
+
+                foreach (var color in colors)
                 {
-                    if (!TryPurchase(ModPricing.MetallicPrice, false)) return;
-                    ApplyColor(colorIndex, isPrimary);
-                };
-                menu.Add(item);
+                    var item = new NativeItem(color.DisplayName);
+                    item.AltTitle = $"${basePrice}";
+                    var capturedColor = color;
+                    int capturedPaintType = paintType;
+                    int capturedPrice = basePrice;
+                    item.Activated += (s, e) =>
+                    {
+                        if (!TryPurchase(capturedPrice, false)) return;
+                        ApplyPaintColor(capturedColor.ColorIndex, capturedColor.PearlescentSpec, capturedPaintType, isPrimary);
+                    };
+                    categoryMenu.Add(item);
+                }
+
+                var navItem = new NativeItem(categoryName);
+                navItem.AltTitle = ">>";
+                navItem.Description = $"{colors.Length} colors";
+                var capturedMenu = categoryMenu;
+                navItem.Activated += (s, e) => { isNavigatingMenu = true; menu.Visible = false; capturedMenu.Visible = true; isNavigatingMenu = false; };
+                menu.Add(navItem);
             }
 
             return menu;
@@ -2199,14 +2211,11 @@ namespace ExtendedLSC
         {
             var menu = CreateMenu("Pearlescent");
 
-            string[] colors = { "Black", "Red", "Green", "Blue", "Yellow", "Orange", "White", "Purple" };
-            int[] colorIds = { 0, 27, 53, 64, 88, 38, 111, 145 };
-
-            for (int i = 0; i < colors.Length; i++)
+            foreach (var color in VehicleColors.PearlescentColors)
             {
-                var item = new NativeItem(colors[i]);
+                var item = new NativeItem(color.DisplayName);
                 item.AltTitle = $"${ModPricing.PearlescentPrice}";
-                int colorId = colorIds[i];
+                int colorId = color.ColorIndex;
                 item.Activated += (s, e) =>
                 {
                     if (!TryPurchase(ModPricing.PearlescentPrice, false)) return;
@@ -2222,19 +2231,14 @@ namespace ExtendedLSC
         {
             var menu = CreateMenu("Wheel Color");
 
-            string[] colors = { "Default", "Black", "Chrome", "Gold", "White" };
-            int[] colorIds = { 0, 0, 120, 37, 111 };
-            int[] prices = { 0, 500, 500, 500, 500 };
-
-            for (int i = 0; i < colors.Length; i++)
+            foreach (var color in VehicleColors.WheelColors)
             {
-                var item = new NativeItem(colors[i]);
-                item.AltTitle = prices[i] == 0 ? "Free" : $"${prices[i]}";
-                int colorId = colorIds[i];
-                int price = prices[i];
+                var item = new NativeItem(color.DisplayName);
+                item.AltTitle = $"${ModPricing.WheelColorPrice}";
+                int colorId = color.ColorIndex;
                 item.Activated += (s, e) =>
                 {
-                    if (!TryPurchase(price, false)) return;
+                    if (!TryPurchase(ModPricing.WheelColorPrice, false)) return;
                     ApplyWheelColor(colorId);
                 };
                 menu.Add(item);
@@ -2541,6 +2545,8 @@ namespace ExtendedLSC
         {
             if (currentVehicle == null) return;
 
+            // Ensure mod kit is installed (required for SET_VEHICLE_MOD to work)
+            Function.Call(Hash.SET_VEHICLE_MOD_KIT, currentVehicle, 0);
             Function.Call(Hash.SET_VEHICLE_MOD, currentVehicle, modIndex, valueIndex, false);
             ShowNotification($"~g~{ModCategories.GetDisplayName(modIndex)} installed!");
             MechanicSpeak();
@@ -2776,6 +2782,8 @@ namespace ExtendedLSC
         {
             if (currentVehicle == null) return;
 
+            // Ensure mod kit is installed (required for SET_VEHICLE_MOD to work)
+            Function.Call(Hash.SET_VEHICLE_MOD_KIT, currentVehicle, 0);
             Function.Call(Hash.SET_VEHICLE_WHEEL_TYPE, currentVehicle, wheelType);
             Function.Call(Hash.SET_VEHICLE_MOD, currentVehicle, 23, wheelIndex, false); // Front wheels
             Function.Call(Hash.SET_VEHICLE_MOD, currentVehicle, 24, wheelIndex, false); // Back wheels
@@ -2796,6 +2804,8 @@ namespace ExtendedLSC
             else
             {
                 // Mod-based livery (mod index 48)
+                // Ensure mod kit is installed (required for SET_VEHICLE_MOD to work)
+                Function.Call(Hash.SET_VEHICLE_MOD_KIT, currentVehicle, 0);
                 Function.Call(Hash.SET_VEHICLE_MOD, currentVehicle, 48, index, false);
             }
             ShowNotification("~g~Livery applied!");
@@ -2818,6 +2828,39 @@ namespace ExtendedLSC
                 Function.Call(Hash.SET_VEHICLE_COLOURS, currentVehicle, primary, colorIndex);
 
             ShowNotification($"~g~{(isPrimary ? "Primary" : "Secondary")} color applied!");
+            MechanicSpeak();
+        }
+
+        /// <summary>
+        /// Apply paint color with proper paint type (Classic=0, Metallic=1, Pearl=2, Matte=3, Metal=4, Chrome=5)
+        /// </summary>
+        private void ApplyPaintColor(int colorIndex, int pearlescentSpec, int paintType, bool isPrimary)
+        {
+            if (currentVehicle == null) return;
+
+            // Paint types: 0=Normal, 1=Metallic, 2=Pearl, 3=Matte, 4=Metal, 5=Chrome
+            if (isPrimary)
+            {
+                // SET_VEHICLE_MOD_COLOR_1: vehicle, paintType, color, pearlescent
+                Function.Call(Hash.SET_VEHICLE_MOD_COLOR_1, currentVehicle, paintType, colorIndex, pearlescentSpec);
+            }
+            else
+            {
+                // SET_VEHICLE_MOD_COLOR_2: vehicle, paintType, color
+                Function.Call(Hash.SET_VEHICLE_MOD_COLOR_2, currentVehicle, paintType, colorIndex);
+            }
+
+            string paintTypeName = paintType switch
+            {
+                0 => "Classic",
+                1 => "Metallic",
+                2 => "Pearl",
+                3 => "Matte",
+                4 => "Metal",
+                5 => "Chrome",
+                _ => ""
+            };
+            ShowNotification($"~g~{paintTypeName} {(isPrimary ? "primary" : "secondary")} color applied!");
             MechanicSpeak();
         }
 

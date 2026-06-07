@@ -66,6 +66,9 @@ namespace ExtendedLSC
         {
             if (vehicle == null) return;
 
+            // Ensure mod kit is installed (required for SET_VEHICLE_MOD to work)
+            Function.Call(Hash.SET_VEHICLE_MOD_KIT, vehicle, 0);
+
             // Set wheel category type first
             Function.Call(Hash.SET_VEHICLE_WHEEL_TYPE, vehicle, (int)category);
 
@@ -118,6 +121,8 @@ namespace ExtendedLSC
         {
             if (vehicle == null) return;
 
+            // Ensure mod kit is installed (required for SET_VEHICLE_MOD to work)
+            Function.Call(Hash.SET_VEHICLE_MOD_KIT, vehicle, 0);
             Function.Call(Hash.SET_VEHICLE_MOD, vehicle, (int)VehicleModType.FrontWheel,
                 Function.Call<int>(Hash.GET_VEHICLE_MOD, vehicle, (int)VehicleModType.FrontWheel), custom);
         }

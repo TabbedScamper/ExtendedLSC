@@ -83,10 +83,13 @@ namespace ExtendedLSC
         public static readonly int[] PlatePrices = { 0, 200, 200, 200, 200, 200 };
 
         // Respray prices
-        public static readonly int MetallicPrice = 500;
-        public static readonly int MattePrice = 750;
-        public static readonly int ChromePrice = 2500;
-        public static readonly int PearlescentPrice = 1000;
+        public static readonly int ClassicPrice = 250;      // Standard solid colors
+        public static readonly int MetallicPrice = 500;     // Metallic with pearlescent
+        public static readonly int MattePrice = 750;        // Matte finish
+        public static readonly int MetalPrice = 1500;       // Brushed metal finishes
+        public static readonly int ChromePrice = 2500;      // Chrome
+        public static readonly int PearlescentPrice = 1000; // Pearlescent overlay
+        public static readonly int WheelColorPrice = 500;   // Wheel color change
 
         /// <summary>
         /// Get the price for a specific mod type and index
