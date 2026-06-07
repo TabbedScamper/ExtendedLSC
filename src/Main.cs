@@ -17,7 +17,7 @@ namespace ExtendedLSC
     /// Extended Los Santos Customs - Main entry point
     /// Overlays a custom menu while blocking game input
     /// </summary>
-    public class Main : Script
+    public partial class Main : Script
     {
         // Menu system
         private ObjectPool menuPool;
