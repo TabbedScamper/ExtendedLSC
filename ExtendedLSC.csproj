@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <OutputType>Library</OutputType>
+    <AssemblyName>ExtendedLSC</AssemblyName>
+    <RootNamespace>ExtendedLSC</RootNamespace>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <!-- Output directly to GTA V scripts folder for easy testing -->
+    <!-- Uncomment and adjust path as needed: -->
+    <!-- <OutputPath>C:\Program Files\Rockstar Games\Grand Theft Auto V\scripts\</OutputPath> -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      ScriptHookVDotNet Enhanced - works on BOTH Legacy AND Enhanced Edition
+      https://github.com/Chiheb-Bacha/ScriptHookVDotNetEnhanced
+
+      If you only need Legacy, you can swap to:
+      <PackageReference Include="ScriptHookVDotNet3" Version="3.6.0" />
+    -->
+    <PackageReference Include="ScriptHookVDotNet3" Version="3.6.0" />
+
+    <!-- LemonUI - modern menu framework (works with both) -->
+    <PackageReference Include="LemonUI.SHVDN3" Version="2.1.1" />
+
+    <!-- JSON serialization for config files -->
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Copy config file to output -->
+    <None Update="ExtendedLSC.ini">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>

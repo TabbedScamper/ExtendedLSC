@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CDataFileMgr__ContentsOfDataFileXml>
+  <disabledFiles />
+  <includedXmlFiles />
+  <includedDataFiles />
+  <dataFiles>
+    <Item>
+      <filename>dlc_elsc:/x64/textures/elsc_textures.ytd</filename>
+      <fileType>TXD_FILE</fileType>
+      <overlay value="false" />
+      <disabled value="false" />
+      <persistent value="true" />
+    </Item>
+  </dataFiles>
+  <contentChangeSets>
+    <Item>
+      <changeSetName>ELSC_AUTOGEN</changeSetName>
+      <mapChangeSetData />
+      <filesToInvalidate />
+      <filesToEnable>
+        <Item>dlc_elsc:/x64/textures/elsc_textures.ytd</Item>
+      </filesToEnable>
+      <filesToDisable />
+      <txdToLoad>
+        <Item>dlc_elsc:/x64/textures/elsc_textures</Item>
+      </txdToLoad>
+      <txdToUnload />
+      <residentResources />
+      <unregisterResources />
+      <requiresLoadingScreen value="false" />
+    </Item>
+  </contentChangeSets>
+  <patchFiles />
+</CDataFileMgr__ContentsOfDataFileXml>

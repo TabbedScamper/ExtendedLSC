@@ -1,0 +1,11 @@
+# Build outputs
+bin/
+obj/
+
+# IDE
+.vs/
+*.user
+*.suo
+
+# Debug
+*.log

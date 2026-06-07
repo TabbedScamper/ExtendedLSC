@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<SSetupData>
+  <deviceName>dlc_elsc</deviceName>
+  <datFile>content.xml</datFile>
+  <timeStamp>01/01/2026 00:00:00</timeStamp>
+  <nameHash>elsc</nameHash>
+  <contentChangeSets />
+  <contentChangeSetGroups>
+    <Item>
+      <NameHash>GROUP_STARTUP</NameHash>
+      <ContentChangeSets>
+        <Item>ELSC_AUTOGEN</Item>
+      </ContentChangeSets>
+    </Item>
+  </contentChangeSetGroups>
+  <startupScript />
+  <scriptCallstackSize value="0" />
+  <type>EXTRACONTENT_COMPAT_PACK</type>
+  <order value="100" />
+  <minorOrder value="0" />
+  <isLevelPack value="false" />
+  <dependencyPackHash />
+  <requiredVersion />
+  <subPackCount value="0" />
+</SSetupData>
