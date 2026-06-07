@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using GTA;
 using GTA.Native;
@@ -10,9 +11,417 @@ using GTA.UI;
 using LemonUI;
 using LemonUI.Menus;
 using LemonUI.Elements;
+using ExtendedLSC.ManualTransmission;
 
 namespace ExtendedLSC
 {
+    /// <summary>
+    /// ikt's Manual Transmission (Gears.asi) integration via LoadLibrary/GetProcAddress
+    /// API reference: https://github.com/ikt32/GTAVManualTransmission
+    /// </summary>
+    public static class ManualTransmissionAPI
+    {
+        private static bool? _isAvailable = null;
+        private static bool _initialized = false;
+        private static IntPtr _moduleHandle = IntPtr.Zero;
+        private static string _lastError = null;
+
+        // Logging delegate - set by Main class
+        public static Action<string> Log { get; set; }
+
+        // Kernel32 imports for dynamic loading
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr GetModuleHandle(string lpModuleName);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr GetProcAddress(IntPtr hModule, string lpProcName);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr LoadLibrary(string lpFileName);
+
+        [DllImport("psapi.dll", SetLastError = true)]
+        private static extern bool EnumProcessModules(IntPtr hProcess, [Out] IntPtr[] lphModule, uint cb, out uint lpcbNeeded);
+
+        [DllImport("psapi.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        private static extern uint GetModuleFileNameEx(IntPtr hProcess, IntPtr hModule, [Out] System.Text.StringBuilder lpBaseName, uint nSize);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetCurrentProcess();
+
+        // Function delegates
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr MT_GetVersionDelegate();
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate bool MT_IsActiveDelegate();
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void MT_SetActiveDelegate(bool active);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate bool MT_NeutralGearDelegate();
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int MT_GetShiftModeDelegate();
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void MT_SetShiftModeDelegate(int mode);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int MT_GetShiftIndicatorDelegate();
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int MT_GetManagedVehicleDelegate();
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void MT_AddIgnoreVehicleDelegate(int vehicle);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void MT_DelIgnoreVehicleDelegate(int vehicle);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void MT_ClearIgnoredVehiclesDelegate();
+
+        // Function pointers
+        private static MT_GetVersionDelegate _getVersion;
+        private static MT_IsActiveDelegate _isActive;
+        private static MT_SetActiveDelegate _setActive;
+        private static MT_NeutralGearDelegate _neutralGear;
+        private static MT_GetShiftModeDelegate _getShiftMode;
+        private static MT_SetShiftModeDelegate _setShiftMode;
+        private static MT_GetShiftIndicatorDelegate _getShiftIndicator;
+        private static MT_GetManagedVehicleDelegate _getManagedVehicle;
+        private static MT_AddIgnoreVehicleDelegate _addIgnoreVehicle;
+        private static MT_DelIgnoreVehicleDelegate _delIgnoreVehicle;
+        private static MT_ClearIgnoredVehiclesDelegate _clearIgnoredVehicles;
+
+        /// <summary>
+        /// Get the last error message for debugging
+        /// </summary>
+        public static string LastError => _lastError;
+
+        /// <summary>
+        /// Initialize the API by getting the module handle and function pointers
+        /// Gears.asi is already loaded by the ASI loader, we just need to get its handle
+        /// </summary>
+        private static void Initialize()
+        {
+            if (_initialized) return;
+            _initialized = true;
+
+            try
+            {
+                Log?.Invoke("[MT API] Initializing Manual Transmission API...");
+
+                // First, try to find Gears.asi by enumerating all loaded modules
+                _moduleHandle = FindModuleByName("Gears.asi");
+
+                if (_moduleHandle == IntPtr.Zero)
+                {
+                    // Try GetModuleHandle with various names
+                    string[] names = { "Gears.asi", "Gears", "gears.asi", "gears" };
+                    foreach (var name in names)
+                    {
+                        _moduleHandle = GetModuleHandle(name);
+                        if (_moduleHandle != IntPtr.Zero)
+                        {
+                            Log?.Invoke($"[MT API] Found via GetModuleHandle(\"{name}\")");
+                            break;
+                        }
+                    }
+                }
+
+                if (_moduleHandle == IntPtr.Zero)
+                {
+                    // Last resort: try LoadLibrary with full path
+                    string gtaPath = AppDomain.CurrentDomain.BaseDirectory;
+                    string fullPath = Path.Combine(gtaPath, "Gears.asi");
+                    if (File.Exists(fullPath))
+                    {
+                        Log?.Invoke($"[MT API] Trying LoadLibrary: {fullPath}");
+                        _moduleHandle = LoadLibrary(fullPath);
+                        if (_moduleHandle != IntPtr.Zero)
+                        {
+                            Log?.Invoke("[MT API] Loaded via LoadLibrary");
+                        }
+                    }
+                    else
+                    {
+                        _lastError = $"Gears.asi not found at: {fullPath}";
+                        Log?.Invoke($"[MT API] {_lastError}");
+                    }
+                }
+
+                if (_moduleHandle == IntPtr.Zero)
+                {
+                    _lastError = "Could not find or load Gears.asi module";
+                    Log?.Invoke($"[MT API] {_lastError}");
+                    _isAvailable = false;
+                    return;
+                }
+
+                Log?.Invoke($"[MT API] Module handle: 0x{_moduleHandle.ToInt64():X}");
+
+                // Get function pointers
+                _getVersion = GetDelegate<MT_GetVersionDelegate>("MT_GetVersion");
+                _isActive = GetDelegate<MT_IsActiveDelegate>("MT_IsActive");
+                _setActive = GetDelegate<MT_SetActiveDelegate>("MT_SetActive");
+                _neutralGear = GetDelegate<MT_NeutralGearDelegate>("MT_NeutralGear");
+                _getShiftMode = GetDelegate<MT_GetShiftModeDelegate>("MT_GetShiftMode");
+                _setShiftMode = GetDelegate<MT_SetShiftModeDelegate>("MT_SetShiftMode");
+                _getShiftIndicator = GetDelegate<MT_GetShiftIndicatorDelegate>("MT_GetShiftIndicator");
+                _getManagedVehicle = GetDelegate<MT_GetManagedVehicleDelegate>("MT_GetManagedVehicle");
+                _addIgnoreVehicle = GetDelegate<MT_AddIgnoreVehicleDelegate>("MT_AddIgnoreVehicle");
+                _delIgnoreVehicle = GetDelegate<MT_DelIgnoreVehicleDelegate>("MT_DelIgnoreVehicle");
+                _clearIgnoredVehicles = GetDelegate<MT_ClearIgnoredVehiclesDelegate>("MT_ClearIgnoredVehicles");
+
+                Log?.Invoke($"[MT API] GetVersion delegate: {(_getVersion != null ? "OK" : "NULL")}");
+
+                // Test if the API works
+                if (_getVersion != null)
+                {
+                    var ptr = _getVersion();
+                    _isAvailable = ptr != IntPtr.Zero;
+                    if (_isAvailable == true)
+                    {
+                        string ver = Marshal.PtrToStringAnsi(ptr);
+                        Log?.Invoke($"[MT API] SUCCESS! Version: {ver}");
+                    }
+                    else
+                    {
+                        _lastError = "MT_GetVersion returned null";
+                        Log?.Invoke($"[MT API] {_lastError}");
+                    }
+                }
+                else
+                {
+                    _lastError = "Could not get MT_GetVersion function pointer";
+                    Log?.Invoke($"[MT API] {_lastError}");
+                    _isAvailable = false;
+                }
+            }
+            catch (Exception ex)
+            {
+                _lastError = $"Exception: {ex.Message}";
+                Log?.Invoke($"[MT API] {_lastError}");
+                _isAvailable = false;
+            }
+        }
+
+        /// <summary>
+        /// Find a module by name by enumerating all loaded modules
+        /// </summary>
+        private static IntPtr FindModuleByName(string moduleName)
+        {
+            try
+            {
+                IntPtr hProcess = GetCurrentProcess();
+                IntPtr[] modules = new IntPtr[1024];
+                uint cbNeeded;
+
+                if (EnumProcessModules(hProcess, modules, (uint)(modules.Length * IntPtr.Size), out cbNeeded))
+                {
+                    int count = (int)(cbNeeded / IntPtr.Size);
+                    Log?.Invoke($"[MT API] Enumerating {count} loaded modules...");
+
+                    var sb = new System.Text.StringBuilder(260);
+                    for (int i = 0; i < count; i++)
+                    {
+                        sb.Clear();
+                        if (GetModuleFileNameEx(hProcess, modules[i], sb, (uint)sb.Capacity) > 0)
+                        {
+                            string path = sb.ToString();
+                            string name = Path.GetFileName(path);
+
+                            // Log ASI files we find
+                            if (name.EndsWith(".asi", StringComparison.OrdinalIgnoreCase))
+                            {
+                                Log?.Invoke($"[MT API] Found ASI: {name}");
+                            }
+
+                            if (name.Equals(moduleName, StringComparison.OrdinalIgnoreCase))
+                            {
+                                Log?.Invoke($"[MT API] MATCH! {path}");
+                                return modules[i];
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    Log?.Invoke($"[MT API] EnumProcessModules failed: {Marshal.GetLastWin32Error()}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log?.Invoke($"[MT API] FindModuleByName error: {ex.Message}");
+            }
+
+            return IntPtr.Zero;
+        }
+
+        private static T GetDelegate<T>(string procName) where T : Delegate
+        {
+            if (_moduleHandle == IntPtr.Zero) return null;
+            IntPtr procAddr = GetProcAddress(_moduleHandle, procName);
+            if (procAddr == IntPtr.Zero) return null;
+            return Marshal.GetDelegateForFunctionPointer<T>(procAddr);
+        }
+
+        /// <summary>
+        /// Check if ikt's Manual Transmission mod (Gears.asi) is installed and API is working
+        /// </summary>
+        public static bool IsAvailable
+        {
+            get
+            {
+                if (_isAvailable == null)
+                {
+                    Initialize();
+                }
+                return _isAvailable ?? false;
+            }
+        }
+
+        /// <summary>
+        /// Get the mod version string
+        /// </summary>
+        public static string GetVersion()
+        {
+            if (!IsAvailable || _getVersion == null) return null;
+            try
+            {
+                IntPtr ptr = _getVersion();
+                return ptr != IntPtr.Zero ? Marshal.PtrToStringAnsi(ptr) : null;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// Check if Manual Transmission is currently active (controlling the vehicle)
+        /// </summary>
+        public static bool IsActive()
+        {
+            if (!IsAvailable || _isActive == null) return false;
+            try { return _isActive(); }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// Enable or disable Manual Transmission
+        /// </summary>
+        public static void SetActive(bool active)
+        {
+            if (!IsAvailable || _setActive == null) return;
+            try { _setActive(active); }
+            catch { }
+        }
+
+        /// <summary>
+        /// Check if currently in neutral gear
+        /// </summary>
+        public static bool InNeutral()
+        {
+            if (!IsAvailable || _neutralGear == null) return false;
+            try { return _neutralGear(); }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// Shift modes: 1=Sequential, 2=H-Pattern, 3=Automatic
+        /// </summary>
+        public enum ShiftMode
+        {
+            Sequential = 1,
+            HPattern = 2,
+            Automatic = 3
+        }
+
+        /// <summary>
+        /// Get current shift mode
+        /// </summary>
+        public static ShiftMode GetShiftMode()
+        {
+            if (!IsAvailable || _getShiftMode == null) return ShiftMode.Automatic;
+            try { return (ShiftMode)_getShiftMode(); }
+            catch { return ShiftMode.Automatic; }
+        }
+
+        /// <summary>
+        /// Set shift mode
+        /// </summary>
+        public static void SetShiftMode(ShiftMode mode)
+        {
+            if (!IsAvailable || _setShiftMode == null) return;
+            try { _setShiftMode((int)mode); }
+            catch { }
+        }
+
+        /// <summary>
+        /// Get shift indicator: 0=None, 1=Shift Up, 2=Shift Down
+        /// </summary>
+        public static int GetShiftIndicator()
+        {
+            if (!IsAvailable || _getShiftIndicator == null) return 0;
+            try { return _getShiftIndicator(); }
+            catch { return 0; }
+        }
+
+        /// <summary>
+        /// Get the vehicle handle currently managed by MT
+        /// </summary>
+        public static int GetManagedVehicle()
+        {
+            if (!IsAvailable || _getManagedVehicle == null) return 0;
+            try { return _getManagedVehicle(); }
+            catch { return 0; }
+        }
+
+        /// <summary>
+        /// Tell MT to ignore a specific vehicle (for custom control)
+        /// </summary>
+        public static void AddIgnoreVehicle(int vehicleHandle)
+        {
+            if (!IsAvailable || _addIgnoreVehicle == null) return;
+            try { _addIgnoreVehicle(vehicleHandle); }
+            catch { }
+        }
+
+        /// <summary>
+        /// Remove a vehicle from MT's ignore list
+        /// </summary>
+        public static void RemoveIgnoreVehicle(int vehicleHandle)
+        {
+            if (!IsAvailable || _delIgnoreVehicle == null) return;
+            try { _delIgnoreVehicle(vehicleHandle); }
+            catch { }
+        }
+
+        /// <summary>
+        /// Clear all vehicles from MT's ignore list
+        /// </summary>
+        public static void ClearIgnoredVehicles()
+        {
+            if (!IsAvailable || _clearIgnoredVehicles == null) return;
+            try { _clearIgnoredVehicles(); }
+            catch { }
+        }
+
+        /// <summary>
+        /// Get display name for shift mode
+        /// </summary>
+        public static string GetShiftModeName(ShiftMode mode)
+        {
+            switch (mode)
+            {
+                case ShiftMode.Sequential: return "Sequential";
+                case ShiftMode.HPattern: return "H-Pattern";
+                case ShiftMode.Automatic: return "Automatic";
+                default: return "Unknown";
+            }
+        }
+    }
+
     /// <summary>
     /// Extended Los Santos Customs - Main entry point
     /// Overlays a custom menu while blocking game input
@@ -44,6 +453,10 @@ namespace ExtendedLSC
         private const int STATUS_INSTALLED = 1;
         private const int STATUS_OWNED = 2;
 
+        // Track scroll position per menu (to match LemonUI's internal firstItem)
+        private Dictionary<NativeMenu, int> menuFirstItem = new Dictionary<NativeMenu, int>();
+        private Dictionary<NativeMenu, int> menuLastSelectedIndex = new Dictionary<NativeMenu, int>();
+
         // Track config item metadata for refresh: Key = NativeItem, Value = (categoryPath, itemValue)
         private Dictionary<NativeItem, (string categoryPath, int itemValue, int price)> configItemMetadata = new Dictionary<NativeItem, (string, int, int)>();
 
@@ -51,33 +464,66 @@ namespace ExtendedLSC
         private bool isMenuActive = false;
         private Vehicle currentVehicle = null;
 
+        // ELSC Manual Transmission (our own implementation - no external dependencies)
+        private ELSCTransmission elscTransmission = new ELSCTransmission();
+        private TransmissionHUD transmissionHUD;
+        private Vehicle lastTransmissionVehicle = null;
+
+        // Manual transmission key binding setup state
+        private int mtBindingState = 0; // 0=none, 1=waiting for shift up, 2=waiting for shift down
+        private NativeItem mtBindingItem = null; // Reference to the menu item to update after binding
+
         // Transaction display (custom drawn to match GTA style)
         private int transactionAmount = 0;
         private int transactionStartTime = 0;
         private const int TRANSACTION_DISPLAY_DURATION = 4000; // 4 seconds
 
         // Consolidated Debug Menu (F7 to open, select tool, B to exit)
-        private enum DebugMode { None, Menu, TextSize, SpriteBrowser, MenuPosition, InputTiming }
+        private enum DebugMode { None, Menu, Resizer, SpriteBrowser, MenuPosition, InputTiming, StatsCalibration }
         private DebugMode activeDebugMode = DebugMode.None;
         private int debugMenuSelection = 0;
-        private readonly string[] debugMenuOptions = { "Text Size", "Sprite Browser", "Menu Position", "Input Timing", "Exit Debug" };
+        private readonly string[] debugMenuOptions = { "Resizer", "Sprite Browser", "Menu Position", "Input Timing", "Stats Calibration", "Exit Debug" };
+        private bool debugGameInputMode = false;  // R3 toggle: when true, allows game input and hides our menu for comparison
+        private bool debugBlockBButton = false;    // Flag to block B button processing this frame
 
-        // Text size debug settings
-        private int textSizeDebugFieldIndex = 0;
+        // Resizer debug settings (text scales, sprite scales, element dimensions)
+        private int resizerFieldIndex = 0;
         private float transactionTextScale = 0.5f;
-        private float descriptionTextScale = 0.38f;
+        private float descriptionTextScale = 0.35f;
         private float spriteScale = 1.8f; // Multiplier for tick/ownership icons
-        private List<string> activeDebugFields = new List<string>(); // Built dynamically
+        private float arrowSpriteScale = 1.5f;       // Multiplier for scroll arrow sprite
+        private float statsRowHeight = 0.026f;       // Height of each stat row
+        private float statsSegmentHeight = 0.007f;   // Height of stat bar segments
+        private float statsSegmentGap = 0.001f;      // Gap between segments
+        private float statsLabelScale = 0.35f;       // Text scale for stat labels
+        private float statsPanelPadding = 0.011f;    // Padding inside stats panel
+        private float statsContentOffsetY = 0.01f;   // Vertical offset for stat bars within panel
+        private float statsBarInset = 0.012f;        // Inset from edges to squeeze bars from both sides
+        private float statsTextLeftPadding = 0.005f; // Left padding for stat label text
+        private float statsBarOffsetY = 0.006f;      // Vertical offset to center bars with text
+        private List<string> activeResizerFields = new List<string>(); // Built dynamically
+
+        // Light mode tracking (for continuous application of brake/reverse lights)
+        private int currentLightMode = 0; // 0=Off, 6=Reverse, 7=Brake Lights
 
         // "Not enough cash" message (replaces description temporarily)
         private bool showNotEnoughCash = false;
         private int notEnoughCashStartTime = 0;
         private const int NOT_ENOUGH_CASH_DURATION = 5000; // 5 seconds
+        private NativeItem notEnoughCashItem = null;
+        private string notEnoughCashOriginalDesc = null;
 
         // Preview system - temporarily apply mods when hovering
         private bool isPreviewingMod = false;
         private int previewModIndex = -1;
         private int previewOriginalValue = -1;
+
+        // Original vehicle stats (stored when entering performance mod menu)
+        private float originalTopSpeed = 0f;
+        private float originalAcceleration = 0f;
+        private float originalBraking = 0f;
+        private float originalTraction = 0f;
+        private bool hasStoredOriginalStats = false;
 
         // Config
         private Keys menuKey = Keys.F5;
@@ -133,6 +579,50 @@ namespace ExtendedLSC
         // Input timing debug settings
         private int inputTimingDebugSetting = 0;  // 0=InitialDelay, 1=SlowRepeat, 2=FastRepeat, 3=AccelThreshold
         private readonly string[] inputTimingSettingNames = { "Initial Delay", "Slow Repeat", "Fast Repeat", "Accel Threshold" };
+
+        // Stats calibration debug settings (divisors and multipliers for each stat bar)
+        // Divisors based on actual handling.meta max values across all GTA V vehicles
+        private int statsCalibrationSetting = 0;  // 0-7 for 4 stats x 2 values each
+        private float statsTopSpeedDiv = 65f;     // Max ~65 m/s (supercars with upgrades)
+        private float statsTopSpeedMult = 0.95f;
+        private float statsAccelDiv = 0.50f;      // Max ~0.50 (fInitialDriveForce with upgrades)
+        private float statsAccelMult = 0.95f;
+        private float statsBrakingDiv = 1.5f;     // Max ~1.5 (fBrakeForce)
+        private float statsBrakingMult = 0.95f;
+        private float statsTractionDiv = 3.0f;    // Max ~3.0 (fTractionCurveMax)
+        private float statsTractionMult = 0.95f;
+        private readonly string[] statsCalibrationNames = {
+            "TopSpeed Div", "TopSpeed Mult",
+            "Accel Div", "Accel Mult",
+            "Braking Div", "Braking Mult",
+            "Traction Div", "Traction Mult"
+        };
+
+        // Menu Position debug settings - multiple UI elements can be positioned
+        private enum UIElement { Menu, ScrollArrows, Description, StatsPanel }
+        private UIElement selectedUIElement = UIElement.Menu;
+        private readonly string[] uiElementNames = { "Menu", "Scroll Arrows", "Description", "Stats Panel" };
+
+        // Offsets for each UI element (relative to menu position)
+        private float scrollArrowsOffsetX = 0f;
+        private float scrollArrowsOffsetY = -0.004f;
+        private float descriptionOffsetX = 0f;
+        private float descriptionOffsetY = -0.0124f;
+        private float statsPanelOffsetX = 0f;
+        private float statsPanelOffsetY = -0.0035f;
+
+        // Scale for custom UI elements (width, height multipliers)
+        private float scrollArrowsScaleW = 1f;
+        private float scrollArrowsScaleH = 1f;
+        private float descriptionScaleW = 1f;
+        private float descriptionScaleH = 1.43f;
+        private float statsPanelScaleW = 1f;
+        private float statsPanelScaleH = 1.31f;
+
+        // Menu Position debug: position vs scale mode, speed control
+        private bool menuPositionScaleMode = false;  // false = position, true = scale
+        private float menuPositionSpeed = 1f;        // Right stick adjusts this (0.1 to 5.0)
+        private bool menuPositionUniformScale = true; // L3 toggle: true = both axes scale together
 
         // Description editor state (editorModeEnabled is in ModSettings)
         private bool isEditingDescription = false;
@@ -221,6 +711,14 @@ namespace ExtendedLSC
             new ModCameraPreset("Engine", VehicleModType.Engine, new Vector3(0.3f, 0.7f, 0.4f)),
         };
 
+        #region Manual Transmission Integration (ikt's Gears.asi)
+
+        // Integration with ikt's Manual Transmission mod
+        // All transmission logic is handled by Gears.asi - we just provide menu access
+        // API: https://github.com/ikt32/GTAVManualTransmission
+
+        #endregion
+
         public Main()
         {
             menuPool = new ObjectPool();
@@ -236,6 +734,16 @@ namespace ExtendedLSC
             // Initialize vehicle save data (tracks purchased mods)
             VehicleSaveData.Log = Log;
             VehicleSaveData.Initialize();
+
+            // Initialize Manual Transmission API logging (for ikt's mod if present)
+            ManualTransmissionAPI.Log = Log;
+
+            // Initialize ELSC's built-in manual transmission
+            ELSCTransmission.Log = Log;
+            VehicleMemory.Log = Log;
+            ELSCTransmission.Initialize();
+            transmissionHUD = new TransmissionHUD(elscTransmission);
+            Log($"[ELSC MT] Built-in transmission available: {ELSCTransmission.IsAvailable}");
 
             // Build static menus
             BuildMainMenu();
@@ -265,6 +773,86 @@ namespace ExtendedLSC
             menu.MaxItems = 10; // Show 10 items, then scroll (shows scroll indicator)
             menu.ItemCount = CountVisibility.Always; // Always show "X/Y" counter
             menuPool.Add(menu);
+
+            // Track scroll position to match LemonUI's internal firstItem
+            menu.Shown += (s, e) =>
+            {
+                menuFirstItem[menu] = 0;
+                menuLastSelectedIndex[menu] = menu.SelectedIndex;
+            };
+
+            menu.SelectedIndexChanged += (s, e) =>
+            {
+                // Clear "not enough cash" message and restore original description
+                if (showNotEnoughCash && notEnoughCashItem != null)
+                {
+                    notEnoughCashItem.Description = notEnoughCashOriginalDesc;
+                    notEnoughCashItem = null;
+                    notEnoughCashOriginalDesc = null;
+                }
+                showNotEnoughCash = false;
+                notEnoughCashStartTime = 0;
+
+                // Replicate LemonUI's scroll logic
+                int maxItems = menu.MaxItems;
+                int totalItems = menu.Items.Count;
+                int newIndex = e.Index;
+
+                if (!menuFirstItem.TryGetValue(menu, out int firstItem)) firstItem = 0;
+                if (!menuLastSelectedIndex.TryGetValue(menu, out int lastIndex)) lastIndex = 0;
+
+                if (totalItems > maxItems)
+                {
+                    int lower = firstItem;
+                    int upper = firstItem + maxItems;
+
+                    if (newIndex >= lower && newIndex < upper)
+                    {
+                        // Still in visible range, no scroll
+                    }
+                    else if (newIndex == upper)
+                    {
+                        // Scrolled down past visible
+                        firstItem++;
+                    }
+                    else if (newIndex == lower - 1)
+                    {
+                        // Scrolled up past visible
+                        firstItem--;
+                    }
+                    else
+                    {
+                        // Jumped (e.g., wrap around)
+                        if (newIndex < maxItems)
+                            firstItem = 0;
+                        else
+                            firstItem = newIndex - maxItems + 1;
+                    }
+
+                    firstItem = Math.Max(0, Math.Min(firstItem, totalItems - maxItems));
+                }
+                else
+                {
+                    firstItem = 0;
+                }
+
+                menuFirstItem[menu] = firstItem;
+                menuLastSelectedIndex[menu] = newIndex;
+            };
+
+            // Clear "not enough cash" message and restore original description when menu closes
+            menu.Closed += (s, e) =>
+            {
+                if (showNotEnoughCash && notEnoughCashItem != null)
+                {
+                    notEnoughCashItem.Description = notEnoughCashOriginalDesc;
+                    notEnoughCashItem = null;
+                    notEnoughCashOriginalDesc = null;
+                }
+                showNotEnoughCash = false;
+                notEnoughCashStartTime = 0;
+            };
+
             return menu;
         }
 
@@ -384,11 +972,56 @@ namespace ExtendedLSC
             // Draw custom description below scroll indicator (or below items if no scroll indicator)
             DrawCustomDescription(visibleMenu);
 
-            // Position adjustment controls (only when (activeDebugMode == DebugMode.MenuPosition) = true)
-            if ((activeDebugMode == DebugMode.MenuPosition))
-            {
-                AdjustMenuPosition();
-            }
+            // Draw vehicle stats bars below description (LSC style)
+            DrawVehicleStats(visibleMenu);
+
+            // Note: Menu position adjustment is handled in OnTick for MenuPosition debug mode
+            // with element-specific controls (see switch on selectedUIElement)
+        }
+
+        /// <summary>
+        /// Draw dark overlay with text for manual transmission key binding
+        /// </summary>
+        private void DrawMTBindingOverlay()
+        {
+            if (mtBindingState <= 0) return;
+
+            // Draw semi-transparent dark background covering most of screen
+            Function.Call(Hash.DRAW_RECT, 0.5f, 0.5f, 1.0f, 1.0f, 0, 0, 0, 200);
+
+            // Draw title text
+            string title = "MANUAL TRANSMISSION SETUP";
+            Function.Call(Hash.SET_TEXT_FONT, 4); // Pricedown font
+            Function.Call(Hash.SET_TEXT_SCALE, 0.0f, 0.8f);
+            Function.Call(Hash.SET_TEXT_COLOUR, 255, 255, 255, 255);
+            Function.Call(Hash.SET_TEXT_CENTRE, true);
+            Function.Call(Hash.SET_TEXT_OUTLINE);
+            Function.Call(Hash.BEGIN_TEXT_COMMAND_DISPLAY_TEXT, "STRING");
+            Function.Call(Hash.ADD_TEXT_COMPONENT_SUBSTRING_PLAYER_NAME, title);
+            Function.Call(Hash.END_TEXT_COMMAND_DISPLAY_TEXT, 0.5f, 0.35f);
+
+            // Draw instruction text
+            string instruction = mtBindingState == 1
+                ? "Press a key or button for SHIFT UP"
+                : "Press a key or button for SHIFT DOWN";
+
+            Function.Call(Hash.SET_TEXT_FONT, 0); // Chalet London
+            Function.Call(Hash.SET_TEXT_SCALE, 0.0f, 0.5f);
+            Function.Call(Hash.SET_TEXT_COLOUR, 255, 200, 0, 255); // Yellow
+            Function.Call(Hash.SET_TEXT_CENTRE, true);
+            Function.Call(Hash.BEGIN_TEXT_COMMAND_DISPLAY_TEXT, "STRING");
+            Function.Call(Hash.ADD_TEXT_COMPONENT_SUBSTRING_PLAYER_NAME, instruction);
+            Function.Call(Hash.END_TEXT_COMMAND_DISPLAY_TEXT, 0.5f, 0.45f);
+
+            // Draw hint text
+            string hint = "Press ESC / B to cancel";
+            Function.Call(Hash.SET_TEXT_FONT, 0);
+            Function.Call(Hash.SET_TEXT_SCALE, 0.0f, 0.35f);
+            Function.Call(Hash.SET_TEXT_COLOUR, 150, 150, 150, 255); // Gray
+            Function.Call(Hash.SET_TEXT_CENTRE, true);
+            Function.Call(Hash.BEGIN_TEXT_COMMAND_DISPLAY_TEXT, "STRING");
+            Function.Call(Hash.ADD_TEXT_COMPONENT_SUBSTRING_PLAYER_NAME, hint);
+            Function.Call(Hash.END_TEXT_COMMAND_DISPLAY_TEXT, 0.5f, 0.55f);
         }
 
         private void DrawScrollIndicators(NativeMenu menu)
@@ -438,20 +1071,26 @@ namespace ExtendedLSC
             // Calculate menu width in normalized coords
             float menuWidth = bannerSize.Width / lemonXBase;
 
+            // Apply scroll arrows offset and scale for independent positioning
+            float drawCenterX = menuCenterX + scrollArrowsOffsetX;
+            float drawIndicatorY = indicatorY + scrollArrowsOffsetY;
+            float drawWidth = menuWidth * scrollArrowsScaleW;
+            float drawHeight = 0.035f * scrollArrowsScaleH;
+
             // Draw background rect for scroll indicator (like Menyoo's scroller indicator rect)
-            Function.Call(Hash.DRAW_RECT, menuCenterX, indicatorY, menuWidth, 0.035f, 0, 0, 0, 200);
+            Function.Call(Hash.DRAW_RECT, drawCenterX, drawIndicatorY, drawWidth, drawHeight, 0, 0, 0, 200);
 
             // Get texture resolution for proper scaling (like Menyoo does)
             Vector3 textureRes = Function.Call<Vector3>(Hash.GET_TEXTURE_RESOLUTION, "CommonMenu", "shop_arrows_upANDdown");
-            float spriteW = textureRes.X / (1920f * 2f);
-            float spriteH = textureRes.Y / (1080f * 2f);
+            float spriteW = (textureRes.X / (1920f * 2f)) * arrowSpriteScale;
+            float spriteH = (textureRes.Y / (1080f * 2f)) * arrowSpriteScale;
 
             // Draw the up/down arrows sprite twice for bolder appearance
             Function.Call(Hash.DRAW_SPRITE,
                 "CommonMenu",
                 "shop_arrows_upANDdown",
-                menuCenterX,
-                indicatorY,
+                drawCenterX,
+                drawIndicatorY,
                 spriteW,
                 spriteH,
                 0f,
@@ -461,8 +1100,8 @@ namespace ExtendedLSC
             Function.Call(Hash.DRAW_SPRITE,
                 "CommonMenu",
                 "shop_arrows_upANDdown",
-                menuCenterX,
-                indicatorY,
+                drawCenterX,
+                drawIndicatorY,
                 spriteW,
                 spriteH,
                 0f,
@@ -496,13 +1135,13 @@ namespace ExtendedLSC
             var bannerSize = menu.Banner.Size;
 
             float subtitleHeight = 38f;
-            float itemHeight = 38f;
+            float itemHeight = 37.5f; // Slightly less than 38 to prevent drift on long lists
 
             // Menu right edge X position (normalized) - offset to keep sprite inside menu
             float menuRightX = (bannerPos.X + bannerSize.Width - 28f) / lemonXBase;
 
-            // First visible item Y position
-            float firstItemY = (bannerPos.Y + bannerSize.Height + subtitleHeight + itemHeight / 2f) / lemonYBase;
+            // First visible item Y position (use 38 for initial offset, 37.5 for per-item)
+            float firstItemY = (bannerPos.Y + bannerSize.Height + subtitleHeight + 38f / 2f) / lemonYBase;
 
             // Get garage icon sprite size
             Vector3 textureRes = Function.Call<Vector3>(Hash.GET_TEXTURE_RESOLUTION, "CommonMenu", "shop_garage_icon_a");
@@ -514,16 +1153,15 @@ namespace ExtendedLSC
             int maxVisible = menu.MaxItems;
             int selectedIndex = menu.SelectedIndex;
 
-            // Determine first visible index (LemonUI scrolls to keep selected item visible)
+            // Use tracked scroll position (matches LemonUI's internal firstItem)
             int firstVisibleIndex = 0;
-            if (totalItems > maxVisible)
+            if (menuFirstItem.TryGetValue(menu, out int tracked))
+                firstVisibleIndex = tracked;
+            else if (totalItems > maxVisible)
             {
-                // Approximate scroll position based on selected index
-                if (selectedIndex >= maxVisible)
-                {
-                    firstVisibleIndex = Math.Min(selectedIndex - maxVisible + 1, totalItems - maxVisible);
-                }
-                firstVisibleIndex = Math.Max(0, Math.Min(firstVisibleIndex, totalItems - maxVisible));
+                // Fallback: approximate if not tracked yet
+                firstVisibleIndex = Math.Max(0, selectedIndex - maxVisible + 1);
+                firstVisibleIndex = Math.Min(firstVisibleIndex, totalItems - maxVisible);
             }
 
             // Draw icons for each visible item based on ownership/installation status
@@ -600,14 +1238,42 @@ namespace ExtendedLSC
                 }
             }
 
-            // Get selected item title to look up description
             var selectedItem = menu.Items[menu.SelectedIndex];
-            string title = selectedItem.Title;
-            string description = GetDescriptionFromConfig(title);
 
-            // If showing "not enough cash" OR we have a normal description OR debugging description
-            bool isDebugEditingDesc = (activeDebugMode == DebugMode.TextSize) && textSizeDebugFieldIndex < activeDebugFields.Count && activeDebugFields[textSizeDebugFieldIndex] == "Description";
-            if (!showingNotEnoughCash && string.IsNullOrEmpty(description) && !isDebugEditingDesc) return;
+            // Handle "not enough cash" by setting item's Description - LemonUI draws it consistently
+            if (showingNotEnoughCash)
+            {
+                // Store original description if this is a new item
+                if (notEnoughCashItem != selectedItem)
+                {
+                    // Restore previous item's description if any
+                    if (notEnoughCashItem != null && notEnoughCashOriginalDesc != null)
+                    {
+                        notEnoughCashItem.Description = notEnoughCashOriginalDesc;
+                    }
+                    notEnoughCashItem = selectedItem;
+                    notEnoughCashOriginalDesc = selectedItem.Description;
+                }
+                selectedItem.Description = "Sorry - you cannot afford this item.";
+                return; // Let LemonUI handle the drawing
+            }
+            else if (notEnoughCashItem != null)
+            {
+                // Restore original description when error clears
+                notEnoughCashItem.Description = notEnoughCashOriginalDesc;
+                notEnoughCashItem = null;
+                notEnoughCashOriginalDesc = null;
+            }
+
+            // If item has built-in Description, LemonUI draws it - skip our custom drawing
+            bool hasNativeDescription = !string.IsNullOrEmpty(selectedItem.Description);
+            if (hasNativeDescription) return;
+
+            string description = GetDescriptionFromConfig(selectedItem.Title);
+
+            // If we have a MenuConfig description OR debugging description, draw our custom box
+            bool isDebugEditingDesc = (activeDebugMode == DebugMode.Resizer) && resizerFieldIndex < activeResizerFields.Count && activeResizerFields[resizerFieldIndex] == "Description Text";
+            if (string.IsNullOrEmpty(description) && !isDebugEditingDesc) return;
 
             // Get menu position for drawing
             float screenW = GTA.UI.Screen.Width;
@@ -648,9 +1314,19 @@ namespace ExtendedLSC
             float menuWidth = bannerSize.Width / lemonXBase;
             float menuCenterX = menuLeftX + menuWidth / 2f;
 
+            // Apply description offset and scale for independent positioning
+            float drawDescCenterX = menuCenterX + descriptionOffsetX;
+            float drawDescLeftX = menuLeftX + descriptionOffsetX;
+            float drawDescY = descY + descriptionOffsetY;
+            float drawDescWidth = menuWidth * descriptionScaleW;
+
+            // Calculate dynamic height based on text content
+            float drawDescHeight = GetDescriptionHeight(menu, menuWidth, menuLeftX);
+            // Fallback to standard single-line height (matches the calculated formula: padding + lineHeight)
+            if (drawDescHeight == 0f) drawDescHeight = (0.012f + 0.018f) * descriptionScaleH;
+
             // Draw description background
-            float descHeight = 0.045f; // Height for description box
-            Function.Call(Hash.DRAW_RECT, menuCenterX, descY + descHeight / 2f, menuWidth, descHeight, 0, 0, 0, 200);
+            Function.Call(Hash.DRAW_RECT, drawDescCenterX, drawDescY + drawDescHeight / 2f, drawDescWidth, drawDescHeight, 0, 0, 0, 200);
 
             // Determine text and color
             string displayText;
@@ -681,12 +1357,270 @@ namespace ExtendedLSC
             Function.Call(Hash.SET_TEXT_FONT, 0); // Chalet London
             Function.Call(Hash.SET_TEXT_SCALE, 0.0f, descriptionTextScale);
             Function.Call(Hash.SET_TEXT_COLOUR, textR, textG, textB, 255);
-            Function.Call(Hash.SET_TEXT_WRAP, menuLeftX + 0.005f, menuLeftX + menuWidth - 0.005f);
+            Function.Call(Hash.SET_TEXT_WRAP, drawDescLeftX + 0.005f, drawDescLeftX + drawDescWidth - 0.005f);
             Function.Call(Hash.SET_TEXT_LEADING, 0);
 
             Function.Call(Hash.BEGIN_TEXT_COMMAND_DISPLAY_TEXT, "STRING");
             Function.Call(Hash.ADD_TEXT_COMPONENT_SUBSTRING_PLAYER_NAME, displayText);
-            Function.Call(Hash.END_TEXT_COMMAND_DISPLAY_TEXT, menuLeftX + 0.005f, descY + 0.005f);
+            Function.Call(Hash.END_TEXT_COMMAND_DISPLAY_TEXT, drawDescLeftX + 0.005f, drawDescY + 0.005f);
+        }
+
+        /// <summary>
+        /// Get the actual height of the description box based on text content
+        /// </summary>
+        private float GetDescriptionHeight(NativeMenu menu, float menuWidth, float menuLeftX)
+        {
+            if (menu == null || menu.SelectedIndex < 0 || menu.SelectedIndex >= menu.Items.Count)
+                return 0.045f; // Default single line height
+
+            // Get the description text (checks item.Description first, then MenuConfig)
+            var selectedItem = menu.Items[menu.SelectedIndex];
+            string description = GetItemDescription(selectedItem);
+
+            // For "not enough cash", use standard single-line height (don't resize box)
+            if (showNotEnoughCash)
+            {
+                int elapsed = Game.GameTime - notEnoughCashStartTime;
+                if (elapsed < NOT_ENOUGH_CASH_DURATION)
+                {
+                    // Use standard single-line height for error message
+                    float errorLineHeight = 0.018f * descriptionScaleH;
+                    float errorPadding = 0.012f * descriptionScaleH;
+                    return errorPadding + errorLineHeight;
+                }
+            }
+
+            if (string.IsNullOrEmpty(description))
+                return 0f; // No description, no height
+
+            // Estimate line count based on text length and available width
+            // At descriptionTextScale ~0.35, roughly 38 chars fit per line in menu width
+            int charsPerLine = 38;
+            int lineCount = (int)Math.Ceiling((double)description.Length / charsPerLine);
+            lineCount = Math.Max(1, Math.Min(lineCount, 5)); // Clamp between 1-5 lines
+
+            // Calculate height: base padding + line height per line
+            float lineHeight = 0.018f * descriptionScaleH;
+            float padding = 0.012f * descriptionScaleH;
+            return padding + (lineHeight * lineCount);
+        }
+
+        /// <summary>
+        /// Draw vehicle performance stats bars below the description (LSC style)
+        /// </summary>
+        private void DrawVehicleStats(NativeMenu menu)
+        {
+            if (menu == null || !menu.Visible) return;
+            if (currentVehicle == null || !currentVehicle.Exists()) return;
+
+            // Get menu position for drawing
+            float screenW = GTA.UI.Screen.Width;
+            float screenH = GTA.UI.Screen.Height;
+            float aspectRatio = screenW / screenH;
+
+            float lemonXBase = 1080f * aspectRatio;
+            float lemonYBase = 1080f;
+
+            var bannerPos = menu.Banner.Position;
+            var bannerSize = menu.Banner.Size;
+
+            int totalItems = menu.Items.Count;
+            int maxVisible = menu.MaxItems;
+            bool hasScrollIndicator = totalItems > maxVisible;
+
+            // Calculate menu layout
+            float subtitleHeight = 38f;
+            float itemHeight = 38f;
+            float scrollIndicatorHeight = hasScrollIndicator ? 0.035f : 0f;
+
+            float menuTopY = (bannerPos.Y + bannerSize.Height + subtitleHeight) / lemonYBase;
+            float visibleItemsHeight = (itemHeight * Math.Min(totalItems, maxVisible)) / lemonYBase;
+
+            // Calculate Y position below description
+            // Menu dimensions (apply position offsets from debug mode)
+            float menuLeftX = bannerPos.X / lemonXBase + statsPanelOffsetX;
+            float menuWidth = bannerSize.Width / lemonXBase;
+            float menuCenterX = menuLeftX + menuWidth / 2f;
+
+            float descY = menuTopY + visibleItemsHeight;
+            if (hasScrollIndicator)
+                descY += 0.0173f + scrollIndicatorHeight / 2f + 0.01f;
+            else
+                descY += 0.01f;
+
+            // Get dynamic description height based on text content
+            float descHeight = GetDescriptionHeight(menu, menuWidth, menuLeftX - statsPanelOffsetX);
+
+            // Position stats below description if it exists, otherwise directly below menu/arrows
+            float statsStartY;
+            if (descHeight > 0f)
+            {
+                // Has description - position below it
+                statsStartY = descY + descHeight + descriptionOffsetY + 0.005f + statsPanelOffsetY;
+            }
+            else
+            {
+                // No description - position directly below menu items/arrows
+                statsStartY = descY + statsPanelOffsetY;
+            }
+
+            // Stats panel dimensions (use resizer debug values and scale)
+            float statPanelHeight = (statsRowHeight * 4 + statsPanelPadding) * statsPanelScaleH;
+            float statPanelWidth = menuWidth * statsPanelScaleW;
+
+            // Draw stats background panel
+            Function.Call(Hash.DRAW_RECT, menuCenterX, statsStartY + statPanelHeight / 2f, statPanelWidth, statPanelHeight, 0, 0, 0, 200);
+
+            // Get vehicle stats
+            float topSpeed = Function.Call<float>(Hash.GET_VEHICLE_ESTIMATED_MAX_SPEED, currentVehicle);
+            float acceleration = Function.Call<float>(Hash.GET_VEHICLE_ACCELERATION, currentVehicle);
+            float braking = Function.Call<float>(Hash.GET_VEHICLE_MAX_BRAKING, currentVehicle);
+            float traction = Function.Call<float>(Hash.GET_VEHICLE_MAX_TRACTION, currentVehicle);
+
+            // LSC stat bars use a visual scaling formula that doesn't directly reflect handling values
+            // The bars are known to be "unreliable" per the modding community
+            // We use empirically-calibrated maximums to match real LSC appearance
+            // Reference: https://gtamods.com/wiki/Handling.meta
+
+            // Native function return value ranges (approximate):
+            // GET_VEHICLE_ESTIMATED_MAX_SPEED: 30-50 m/s for most cars (supercars: 50-60)
+            // GET_VEHICLE_ACCELERATION: 0.25-0.45 (fInitialDriveForce from handling.meta)
+            // GET_VEHICLE_MAX_BRAKING: 0.8-3.0 (calculated from fBrakeForce * factors)
+            // GET_VEHICLE_MAX_TRACTION: 2.0-2.8 (fTractionCurveMax from handling.meta)
+
+            // Scaling formula: Use square root for compression (mimics game's visual scaling)
+            // This prevents supercars from maxing out all bars while showing progression
+            // Values are calibrated via Debug Menu > Stats Calibration
+            float topSpeedPct = (float)Math.Sqrt(Math.Min(1f, topSpeed / statsTopSpeedDiv)) * statsTopSpeedMult;
+            float accelPct = (float)Math.Sqrt(Math.Min(1f, acceleration / statsAccelDiv)) * statsAccelMult;
+            float brakingPct = (float)Math.Sqrt(Math.Min(1f, braking / statsBrakingDiv)) * statsBrakingMult;
+            float tractionPct = (float)Math.Sqrt(Math.Min(1f, traction / statsTractionDiv)) * statsTractionMult;
+
+            // Check if previewing a performance mod to show blue/red stat changes
+            float previewTopSpeedPct = -1f;
+            float previewAccelPct = -1f;
+            float previewBrakingPct = -1f;
+            float previewTractionPct = -1f;
+
+            // If we're previewing a mod, show the preview vs original
+            if (isPreviewingMod && previewModIndex >= 0 && hasStoredOriginalStats)
+            {
+                // Performance mod indices: Engine=11, Brakes=12, Transmission=13, Suspension=15, Armor=16, Turbo=18
+                bool isPerformanceMod = previewModIndex == 11 || previewModIndex == 12 ||
+                                         previewModIndex == 13 || previewModIndex == 15 ||
+                                         previewModIndex == 16 || previewModIndex == 18;
+
+                if (isPerformanceMod)
+                {
+                    // Current stats (with preview applied) become the preview percentages
+                    previewTopSpeedPct = topSpeedPct;
+                    previewAccelPct = accelPct;
+                    previewBrakingPct = brakingPct;
+                    previewTractionPct = tractionPct;
+
+                    // Use stored original stats as the base (same formula as above)
+                    topSpeedPct = (float)Math.Sqrt(Math.Min(1f, originalTopSpeed / statsTopSpeedDiv)) * statsTopSpeedMult;
+                    accelPct = (float)Math.Sqrt(Math.Min(1f, originalAcceleration / statsAccelDiv)) * statsAccelMult;
+                    brakingPct = (float)Math.Sqrt(Math.Min(1f, originalBraking / statsBrakingDiv)) * statsBrakingMult;
+                    tractionPct = (float)Math.Sqrt(Math.Min(1f, originalTraction / statsTractionDiv)) * statsTractionMult;
+                }
+            }
+
+            // Draw each stat row (apply width scale to internal elements)
+            float currentY = statsStartY + statsContentOffsetY;
+            float labelX = menuLeftX + statsTextLeftPadding;  // Adjustable left padding for text
+            float barStartX = menuLeftX + 0.095f * statsPanelScaleW + statsBarInset; // Bar starts after label, plus inset
+            float barWidth = (menuWidth - 0.105f) * statsPanelScaleW - (statsBarInset * 2); // Remaining width minus inset from both sides
+            float rowHeight = statsRowHeight * statsPanelScaleH;
+
+            DrawStatRow("Top Speed", topSpeedPct, labelX, barStartX, barWidth, currentY, statsBarOffsetY, previewTopSpeedPct);
+            currentY += rowHeight;
+            DrawStatRow("Acceleration", accelPct, labelX, barStartX, barWidth, currentY, statsBarOffsetY, previewAccelPct);
+            currentY += rowHeight;
+            DrawStatRow("Braking", brakingPct, labelX, barStartX, barWidth, currentY, statsBarOffsetY, previewBrakingPct);
+            currentY += rowHeight;
+            DrawStatRow("Traction", tractionPct, labelX, barStartX, barWidth, currentY, statsBarOffsetY, previewTractionPct);
+        }
+
+        /// <summary>
+        /// Draw a single stat row with label and segmented bar (supports partial segment fills)
+        /// </summary>
+        private void DrawStatRow(string label, float percentage, float labelX, float barStartX, float barWidth, float y, float barYOffset, float previewPercentage = -1f)
+        {
+            // Draw label text (use resizer debug value for scale)
+            Function.Call(Hash.SET_TEXT_FONT, 0); // Chalet London
+            Function.Call(Hash.SET_TEXT_SCALE, 0.0f, statsLabelScale);
+            Function.Call(Hash.SET_TEXT_COLOUR, 255, 255, 255, 255);
+            Function.Call(Hash.BEGIN_TEXT_COMMAND_DISPLAY_TEXT, "STRING");
+            Function.Call(Hash.ADD_TEXT_COMPONENT_SUBSTRING_PLAYER_NAME, label);
+            Function.Call(Hash.END_TEXT_COMMAND_DISPLAY_TEXT, labelX, y);
+
+            // Draw segmented bar (5 segments like real LSC, with partial fill support)
+            int totalSegments = 5;
+            float fillAmount = percentage * totalSegments; // e.g., 3.65 means 3 full + 65% of 4th
+            float previewFillAmount = previewPercentage >= 0 ? previewPercentage * totalSegments : -1f;
+
+            // Use resizer debug values for segment dimensions
+            float segmentWidth = barWidth / totalSegments;
+            float segmentY = y + 0.007f + barYOffset; // Center vertically with text, plus adjustable offset
+
+            for (int i = 0; i < totalSegments; i++)
+            {
+                float segLeftX = barStartX + (i * segmentWidth);
+                float segCenterX = segLeftX + segmentWidth / 2f;
+                float actualSegWidth = segmentWidth - statsSegmentGap;
+
+                // Calculate how much of this segment is filled (0.0 to 1.0)
+                float segmentFill = Math.Max(0f, Math.Min(1f, fillAmount - i));
+                float previewSegmentFill = previewFillAmount >= 0 ? Math.Max(0f, Math.Min(1f, previewFillAmount - i)) : -1f;
+
+                // Draw empty background first (gray)
+                Function.Call(Hash.DRAW_RECT, segCenterX, segmentY, actualSegWidth, statsSegmentHeight, 100, 100, 100, 200);
+
+                if (previewFillAmount >= 0)
+                {
+                    // Preview mode - show current fill, then overlay preview changes
+                    float currentFill = segmentFill;
+                    float newFill = previewSegmentFill;
+
+                    if (currentFill > 0)
+                    {
+                        // Draw current fill (white) - partial width from left
+                        float fillWidth = actualSegWidth * currentFill;
+                        float fillX = segLeftX + (statsSegmentGap / 2f) + fillWidth / 2f;
+                        Function.Call(Hash.DRAW_RECT, fillX, segmentY, fillWidth, statsSegmentHeight, 255, 255, 255, 255);
+                    }
+
+                    if (newFill > currentFill)
+                    {
+                        // Gaining - draw blue for the gain portion
+                        float gainStart = currentFill;
+                        float gainEnd = newFill;
+                        float gainWidth = actualSegWidth * (gainEnd - gainStart);
+                        float gainX = segLeftX + (statsSegmentGap / 2f) + (actualSegWidth * gainStart) + gainWidth / 2f;
+                        Function.Call(Hash.DRAW_RECT, gainX, segmentY, gainWidth, statsSegmentHeight, 0, 150, 255, 255);
+                    }
+                    else if (newFill < currentFill)
+                    {
+                        // Losing - draw red for the loss portion (replacing part of white)
+                        float lossStart = newFill;
+                        float lossEnd = currentFill;
+                        float lossWidth = actualSegWidth * (lossEnd - lossStart);
+                        float lossX = segLeftX + (statsSegmentGap / 2f) + (actualSegWidth * lossStart) + lossWidth / 2f;
+                        Function.Call(Hash.DRAW_RECT, lossX, segmentY, lossWidth, statsSegmentHeight, 255, 50, 50, 255);
+                    }
+                }
+                else
+                {
+                    // Normal mode - draw partial white fill
+                    if (segmentFill > 0)
+                    {
+                        float fillWidth = actualSegWidth * segmentFill;
+                        float fillX = segLeftX + (statsSegmentGap / 2f) + fillWidth / 2f;
+                        Function.Call(Hash.DRAW_RECT, fillX, segmentY, fillWidth, statsSegmentHeight, 255, 255, 255, 255);
+                    }
+                }
+            }
         }
 
         /// <summary>
@@ -1069,32 +2003,31 @@ namespace ExtendedLSC
                 AddSubmenuItem("Exhaust", menu);
             }
 
-            // Fenders (group: Left 8, Right 9)
+            // Extras (Side Course feature - toggle vehicle extras)
+            if (ModSettings.ExtendedCategories)
+            {
+                var extrasMenu = CreateExtrasMenu();
+                if (extrasMenu != null && extrasMenu.Items.Count > 0)
+                {
+                    AddSubmenuItem("Extras", extrasMenu);
+                }
+            }
+
+            // Fenders (index 8 - left fender, index 9 - right fender)
+            // Most vehicles only have left fender mods, show directly as "FENDERS"
             int leftFenderCount = GetModCount(8);
             int rightFenderCount = GetModCount(9);
-            if (leftFenderCount > 0 || rightFenderCount > 0)
+            if (leftFenderCount > 0)
             {
-                var fendersMenu = CreateMenu("Fenders");
-
-                if (leftFenderCount > 0)
-                {
-                    var leftMenu = CreateModMenuByIndex(8, leftFenderCount, "Left Fender");
-                    leftMenu.Closed += (s, e) => { if (!isNavigatingMenu) fendersMenu.Visible = true; };
-                    var leftItem = new NativeItem("Left Fender");
-                    leftItem.AltTitle = ">>";
-                    leftItem.Activated += (s, e) => { isNavigatingMenu = true; fendersMenu.Visible = false; leftMenu.Visible = true; isNavigatingMenu = false; };
-                    fendersMenu.Add(leftItem);
-                }
-                if (rightFenderCount > 0)
-                {
-                    var rightMenu = CreateModMenuByIndex(9, rightFenderCount, "Right Fender");
-                    rightMenu.Closed += (s, e) => { if (!isNavigatingMenu) fendersMenu.Visible = true; };
-                    var rightItem = new NativeItem("Right Fender");
-                    rightItem.AltTitle = ">>";
-                    rightItem.Activated += (s, e) => { isNavigatingMenu = true; fendersMenu.Visible = false; rightMenu.Visible = true; isNavigatingMenu = false; };
-                    fendersMenu.Add(rightItem);
-                }
-                AddSubmenuItem("Fenders", fendersMenu);
+                // Create fender menu directly with left fender mods (most common case)
+                var menu = CreateModMenuByIndex(8, leftFenderCount, "FENDERS");
+                AddSubmenuItem("Fender", menu);
+            }
+            // Right fender is rare - add as separate category if it exists
+            if (rightFenderCount > 0)
+            {
+                var menu = CreateModMenuByIndex(9, rightFenderCount, "FENDERS (RIGHT)");
+                AddSubmenuItem("Fender (Right)", menu);
             }
 
             // Grille (6)
@@ -1121,6 +2054,60 @@ namespace ExtendedLSC
             // Lights - full submenu structure like native LSC
             {
                 var lightsMenu = CreateMenu("Lights");
+
+                // Light Mode selector - cycles through different lighting states
+                // Based on Menyoo source: SET_VEHICLE_LIGHTS 3=on, 4=off
+                // SET_VEHICLE_INDICATOR_LIGHTS: index 0=right, 1=left
+                var lightModes = new List<string> { "Off", "Headlights", "High Beams", "Left Indicator", "Right Indicator", "Hazards", "Brake Lights", "Interior" };
+                var lightModeItem = new NativeListItem<string>("Light Mode", lightModes.ToArray());
+                lightModeItem.SelectedIndex = 0; // Start at Off
+
+                lightModeItem.ItemChanged += (s, e) =>
+                {
+                    if (currentVehicle == null || !currentVehicle.Exists()) return;
+
+                    // Track current mode for continuous application
+                    currentLightMode = e.Index;
+
+                    // Reset all lights first
+                    Function.Call(Hash.SET_VEHICLE_LIGHTS, currentVehicle, 4); // Off (Menyoo uses 4)
+                    Function.Call(Hash.SET_VEHICLE_FULLBEAM, currentVehicle, false);
+                    Function.Call(Hash.SET_VEHICLE_INDICATOR_LIGHTS, currentVehicle, 1, false); // Left off
+                    Function.Call(Hash.SET_VEHICLE_INDICATOR_LIGHTS, currentVehicle, 0, false); // Right off
+                    Function.Call(Hash.SET_VEHICLE_INTERIORLIGHT, currentVehicle, false);
+                    Function.Call(Hash.SET_VEHICLE_BRAKE_LIGHTS, currentVehicle, false);
+
+                    // Apply the selected mode (high beams/brake applied continuously in OnTick)
+                    switch (e.Index)
+                    {
+                        case 0: // Off
+                            Function.Call(Hash.SET_VEHICLE_LIGHTS, currentVehicle, 4);
+                            break;
+                        case 1: // Headlights
+                            Function.Call(Hash.SET_VEHICLE_LIGHTS, currentVehicle, 3); // On (Menyoo uses 3)
+                            break;
+                        case 2: // High Beams - applied every frame in OnTick
+                            Function.Call(Hash.SET_VEHICLE_LIGHTS, currentVehicle, 3);
+                            Function.Call(Hash.SET_VEHICLE_FULLBEAM, currentVehicle, true);
+                            break;
+                        case 3: // Left Indicator
+                            Function.Call(Hash.SET_VEHICLE_INDICATOR_LIGHTS, currentVehicle, 1, true);
+                            break;
+                        case 4: // Right Indicator
+                            Function.Call(Hash.SET_VEHICLE_INDICATOR_LIGHTS, currentVehicle, 0, true);
+                            break;
+                        case 5: // Hazards
+                            Function.Call(Hash.SET_VEHICLE_INDICATOR_LIGHTS, currentVehicle, 1, true);
+                            Function.Call(Hash.SET_VEHICLE_INDICATOR_LIGHTS, currentVehicle, 0, true);
+                            break;
+                        case 6: // Brake Lights - applied every frame in OnTick
+                            break;
+                        case 7: // Interior
+                            Function.Call(Hash.SET_VEHICLE_INTERIORLIGHT, currentVehicle, true);
+                            break;
+                    }
+                };
+                lightsMenu.Add(lightModeItem);
 
                 // Headlights submenu
                 headlightsMenu = CreateMenu("Headlights");
@@ -1172,6 +2159,31 @@ namespace ExtendedLSC
                 };
                 headlightsMenu.Add(xenonLightsItem);
 
+                // Headlight Color submenu (Side Course feature - requires xenon)
+                if (ModSettings.LightCustomization)
+                {
+                    var headlightColorMenu = CreateHeadlightColorMenu();
+                    headlightColorMenu.Closed += (s, e) => { if (!isNavigatingMenu) headlightsMenu.Visible = true; };
+
+                    var headlightColorNavItem = new NativeItem("Headlight Color");
+                    headlightColorNavItem.AltTitle = ">>";
+                    headlightColorNavItem.Description = "Requires Xenon Lights";
+                    headlightColorNavItem.Activated += (s, e) =>
+                    {
+                        // Check if xenon is installed
+                        if (!Function.Call<bool>(Hash.IS_TOGGLE_MOD_ON, currentVehicle, 22))
+                        {
+                            ShowNotification("~r~Install Xenon Lights first!");
+                            return;
+                        }
+                        isNavigatingMenu = true;
+                        headlightsMenu.Visible = false;
+                        headlightColorMenu.Visible = true;
+                        isNavigatingMenu = false;
+                    };
+                    headlightsMenu.Add(headlightColorNavItem);
+                }
+
                 var headlightsNavItem = new NativeItem("Headlights");
                 headlightsNavItem.AltTitle = ">>";
                 headlightsNavItem.Activated += (s, e) => { isNavigatingMenu = true; lightsMenu.Visible = false; headlightsMenu.Visible = true; isNavigatingMenu = false; };
@@ -1181,51 +2193,59 @@ namespace ExtendedLSC
                 var neonKitsMenu = CreateMenu("Neon Kits");
                 neonKitsMenu.Closed += (s, e) => { if (!isNavigatingMenu) lightsMenu.Visible = true; };
 
-                // Neon Layout submenu
-                var neonLayoutMenu = CreateMenu("Neon Layout");
+                // Neon Layout submenu - Individual side toggles (like Menyoo)
+                var neonLayoutMenu = CreateMenu("NEON LAYOUT");
                 neonLayoutMenu.Closed += (s, e) => { if (!isNavigatingMenu) neonKitsMenu.Visible = true; };
 
-                // Get current neon state using safe method
-                bool neonFront = GetNeonEnabled(2);
-                bool neonBack = GetNeonEnabled(3);
-                bool neonLeft = GetNeonEnabled(0);
-                bool neonRight = GetNeonEnabled(1);
-
-                var neonLayouts = new[] {
-                    ("None", false, false, false, false),
-                    ("Front", true, false, false, false),
-                    ("Back", false, true, false, false),
-                    ("Sides", false, false, true, true),
-                    ("Front and Back", true, true, false, false),
-                    ("Front and Sides", true, false, true, true),
-                    ("Back and Sides", false, true, true, true),
-                    ("Front, Back and Sides", true, true, true, true)
+                // Neon indices: 0=Left, 1=Right, 2=Front, 3=Back
+                var neonSides = new[] {
+                    (name: "Front", index: 2),
+                    (name: "Back", index: 3),
+                    (name: "Left", index: 0),
+                    (name: "Right", index: 1)
                 };
 
-                foreach (var (name, front, back, left, right) in neonLayouts)
+                foreach (var (sideName, sideIndex) in neonSides)
                 {
-                    bool isCurrentLayout = (front == neonFront && back == neonBack && left == neonLeft && right == neonRight);
-                    bool isNone = !front && !back && !left && !right;
-                    int layoutPrice = isNone ? 0 : 1500;
-                    var layoutItem = new NativeItem(name);
-                    if (isCurrentLayout)
+                    bool isEnabled = GetNeonEnabled(sideIndex);
+                    var sideItem = new NativeItem(sideName);
+
+                    // Show sprite if enabled, price if not
+                    if (isEnabled)
                     {
-                        layoutItem.AltTitle = "";
-                        itemOwnershipStatus[layoutItem] = STATUS_INSTALLED;
+                        sideItem.AltTitle = "";
+                        itemOwnershipStatus[sideItem] = STATUS_INSTALLED;
                     }
                     else
                     {
-                        layoutItem.AltTitle = isNone ? "Free" : "$1,500";
+                        sideItem.AltTitle = "$500";
                     }
-                    bool f = front, b = back, l = left, r = right;
-                    bool isCurrent = isCurrentLayout;
-                    int price = layoutPrice;
-                    layoutItem.Activated += (s, e) =>
+
+                    int idx = sideIndex; // Capture for closure
+                    string name = sideName;
+                    sideItem.Activated += (s, e) =>
                     {
-                        if (!isCurrent && !TryPurchase(price, false)) return;
-                        ApplyNeonLayout(f, b, l, r);
+                        bool currentState = GetNeonEnabled(idx);
+
+                        // Only charge when turning ON
+                        if (!currentState && !TryPurchase(500, false)) return;
+
+                        // Toggle the neon
+                        SetNeonEnabled(idx, !currentState);
+
+                        // Update the item display
+                        bool newState = !currentState;
+                        sideItem.AltTitle = newState ? "" : "$500";
+                        if (newState)
+                            itemOwnershipStatus[sideItem] = STATUS_INSTALLED;
+                        else
+                            itemOwnershipStatus.Remove(sideItem);
+
+                        if (activeDebugMode != DebugMode.None)
+                            ShowNotification($"~g~{name} neon {(newState ? "installed" : "removed")}!");
+                        MechanicSpeak();
                     };
-                    neonLayoutMenu.Add(layoutItem);
+                    neonLayoutMenu.Add(sideItem);
                 }
 
                 var neonLayoutNavItem = new NativeItem("Neon Layout");
@@ -1249,6 +2269,21 @@ namespace ExtendedLSC
                 neonKitsNavItem.Activated += (s, e) => { isNavigatingMenu = true; lightsMenu.Visible = false; neonKitsMenu.Visible = true; isNavigatingMenu = false; };
                 lightsMenu.Add(neonKitsNavItem);
 
+                // Turn off all lights when leaving the Lights menu
+                lightsMenu.Closed += (s, e) =>
+                {
+                    currentLightMode = 0; // Reset light mode tracking
+                    if (currentVehicle != null && currentVehicle.Exists())
+                    {
+                        Function.Call(Hash.SET_VEHICLE_LIGHTS, currentVehicle, 4); // Off
+                        Function.Call(Hash.SET_VEHICLE_FULLBEAM, currentVehicle, false);
+                        Function.Call(Hash.SET_VEHICLE_INDICATOR_LIGHTS, currentVehicle, 1, false); // Left off
+                        Function.Call(Hash.SET_VEHICLE_INDICATOR_LIGHTS, currentVehicle, 0, false); // Right off
+                        Function.Call(Hash.SET_VEHICLE_INTERIORLIGHT, currentVehicle, false);
+                        Function.Call(Hash.SET_VEHICLE_BRAKE_LIGHTS, currentVehicle, false);
+                    }
+                };
+
                 AddSubmenuItem("Lights", lightsMenu);
             }
 
@@ -1265,6 +2300,13 @@ namespace ExtendedLSC
             // Plate
             plateMenu = CreatePlateMenu();
             AddSubmenuItem("Plate", plateMenu);
+
+            // Packages (Side Course feature - save/load mod presets)
+            if (ModSettings.VehiclePackages)
+            {
+                var packagesMenu = CreatePackagesMenu();
+                AddSubmenuItem("Packages", packagesMenu);
+            }
 
             // Respray
             resprayMenu = BuildResprayMenu();
@@ -1309,6 +2351,10 @@ namespace ExtendedLSC
             if (GetModCount(13) > 0)
             {
                 var menu = CreateModMenuByIndex(13, GetModCount(13), "Transmission");
+
+                // Add Manual Transmission option at the end
+                AddManualTransmissionOption(menu);
+
                 AddSubmenuItem("Transmission", menu);
             }
 
@@ -1879,14 +2925,19 @@ namespace ExtendedLSC
         }
 
         /// <summary>
-        /// Get current scale value for debug field
+        /// Get the actual description to display for an item.
+        /// Checks item's built-in Description first, then falls back to MenuConfig.
         /// </summary>
-        private float GetCurrentDebugScale(string fieldName)
+        private string GetItemDescription(NativeItem item)
         {
-            if (fieldName == "Transaction (-$)") return transactionTextScale;
-            if (fieldName == "Description") return descriptionTextScale;
-            if (fieldName == "Sprites (Icons)") return spriteScale;
-            return 0f;
+            if (item == null) return null;
+
+            // First check the item's built-in Description property (set directly on item)
+            if (!string.IsNullOrEmpty(item.Description))
+                return item.Description;
+
+            // Fall back to MenuConfig lookup by title
+            return GetDescriptionFromConfig(item.Title);
         }
 
         /// <summary>
@@ -1895,13 +2946,18 @@ namespace ExtendedLSC
         private void ExitDebugMode()
         {
             // Log settings based on which mode was active
-            if (activeDebugMode == DebugMode.TextSize)
+            if (activeDebugMode == DebugMode.Resizer)
             {
-                Log($"=== TEXT SIZE SETTINGS ===");
+                Log($"=== RESIZER SETTINGS ===");
                 Log($"Transaction (-$) Scale: {transactionTextScale:F3}");
                 Log($"Description Scale: {descriptionTextScale:F3}");
                 Log($"Sprite Scale: {spriteScale:F3}");
-                Log($"==========================");
+                Log($"Stats Row Height: {statsRowHeight:F4}");
+                Log($"Stats Segment Height: {statsSegmentHeight:F4}");
+                Log($"Stats Segment Gap: {statsSegmentGap:F4}");
+                Log($"Stats Label Scale: {statsLabelScale:F3}");
+                Log($"Stats Panel Padding: {statsPanelPadding:F4}");
+                Log($"========================");
             }
             else if (activeDebugMode == DebugMode.InputTiming)
             {
@@ -1915,8 +2971,11 @@ namespace ExtendedLSC
             else if (activeDebugMode == DebugMode.MenuPosition)
             {
                 Log($"=== MENU POSITION SETTINGS ===");
-                Log($"Offset: {mainMenu.Offset}");
-                Log($"==============================");
+                Log($"Menu Offset: {mainMenu.Offset}");
+                Log($"Scroll Arrows Offset: X={scrollArrowsOffsetX:F4}, Y={scrollArrowsOffsetY:F4}");
+                Log($"Description Offset: X={descriptionOffsetX:F4}, Y={descriptionOffsetY:F4}");
+                Log($"Stats Panel Offset: X={statsPanelOffsetX:F4}, Y={statsPanelOffsetY:F4}");
+                Log($"===============================");
             }
 
             // Re-enable menu input if it was disabled
@@ -1929,6 +2988,7 @@ namespace ExtendedLSC
             }
 
             activeDebugMode = DebugMode.None;
+            debugGameInputMode = false;  // Reset game input mode
             ShowNotification("Debug Mode ~r~OFF");
         }
 
@@ -1938,12 +2998,22 @@ namespace ExtendedLSC
 
         private NativeMenu CreateModMenuByIndex(int modIndex, int count, string displayName)
         {
-            var menu = CreateMenu(displayName);
+            // Use SubMenuTitle from ModCategories if available
+            string menuTitle = displayName;
+            bool noStockOption = false;
+            if (ModCategories.AllCategories.TryGetValue(modIndex, out var category))
+            {
+                menuTitle = category.SubMenuTitle;
+                noStockOption = category.NoStockOption;
+            }
+
+            var menu = CreateMenu(menuTitle);
             modMenusByIndex[modIndex] = menu;
 
             int currentMod = Function.Call<int>(Hash.GET_VEHICLE_MOD, currentVehicle, modIndex);
             string vehicleName = currentVehicle.DisplayName;
             int idx = modIndex; // Capture for closure
+            bool hasStock = !noStockOption; // Capture for closure
 
             // Preview system: store original when menu opens
             menu.Shown += (s, e) =>
@@ -1953,6 +3023,17 @@ namespace ExtendedLSC
                     previewModIndex = idx;
                     previewOriginalValue = Function.Call<int>(Hash.GET_VEHICLE_MOD, currentVehicle, idx);
                     isPreviewingMod = true;
+
+                    // Store original stats for performance mod preview comparison
+                    // Performance mod indices: Engine=11, Brakes=12, Transmission=13, Suspension=15, Armor=16, Turbo=18
+                    if (idx == 11 || idx == 12 || idx == 13 || idx == 15 || idx == 16 || idx == 18)
+                    {
+                        originalTopSpeed = Function.Call<float>(Hash.GET_VEHICLE_ESTIMATED_MAX_SPEED, currentVehicle);
+                        originalAcceleration = Function.Call<float>(Hash.GET_VEHICLE_ACCELERATION, currentVehicle);
+                        originalBraking = Function.Call<float>(Hash.GET_VEHICLE_MAX_BRAKING, currentVehicle);
+                        originalTraction = Function.Call<float>(Hash.GET_VEHICLE_MAX_TRACTION, currentVehicle);
+                        hasStoredOriginalStats = true;
+                    }
                 }
             };
 
@@ -1966,6 +3047,7 @@ namespace ExtendedLSC
                     Function.Call(Hash.SET_VEHICLE_MOD, currentVehicle, idx, previewOriginalValue, false);
                     isPreviewingMod = false;
                     previewModIndex = -1;
+                    hasStoredOriginalStats = false;
                 }
             };
 
@@ -1976,38 +3058,41 @@ namespace ExtendedLSC
                 {
                     // Ensure mod kit is installed (required for SET_VEHICLE_MOD to work)
                     Function.Call(Hash.SET_VEHICLE_MOD_KIT, currentVehicle, 0);
-                    // Index 0 = Stock (-1), Index 1+ = mod value (index - 1)
-                    int previewValue = e.Index == 0 ? -1 : e.Index - 1;
+                    // If no stock option: Index 0 = mod 0, Index 1 = mod 1, etc.
+                    // If has stock: Index 0 = Stock (-1), Index 1+ = mod value (index - 1)
+                    int previewValue = hasStock ? (e.Index == 0 ? -1 : e.Index - 1) : e.Index;
                     Function.Call(Hash.SET_VEHICLE_MOD, currentVehicle, idx, previewValue, false);
                 }
             };
 
-            // Stock/None option - different labels for different mod types
-            string stockLabel;
-            switch (modIndex)
+            // Stock/None option - skip for performance mods that don't have stock
+            if (!noStockOption)
             {
-                case 16: stockLabel = "None"; break;           // Armor
-                case 12: stockLabel = "Stock Brakes"; break;   // Brakes
-                default: stockLabel = "Stock"; break;
+                string stockLabel;
+                switch (modIndex)
+                {
+                    case 16: stockLabel = "None"; break;           // Armor
+                    default: stockLabel = "Stock"; break;
+                }
+                var stockItem = new NativeItem(stockLabel);
+                if (currentMod == -1)
+                {
+                    stockItem.AltTitle = "";
+                    itemOwnershipStatus[stockItem] = STATUS_INSTALLED;
+                }
+                else
+                {
+                    stockItem.AltTitle = "Free";
+                }
+                stockItem.Activated += (s, e) =>
+                {
+                    // Purchasing stock - clear preview state first
+                    isPreviewingMod = false;
+                    previewModIndex = -1;
+                    ApplyModByIndex(idx, -1);
+                };
+                menu.Add(stockItem);
             }
-            var stockItem = new NativeItem(stockLabel);
-            if (currentMod == -1)
-            {
-                stockItem.AltTitle = "";
-                itemOwnershipStatus[stockItem] = STATUS_INSTALLED;
-            }
-            else
-            {
-                stockItem.AltTitle = "Free";
-            }
-            stockItem.Activated += (s, e) =>
-            {
-                // Purchasing stock - clear preview state first
-                isPreviewingMod = false;
-                previewModIndex = -1;
-                ApplyModByIndex(idx, -1);
-            };
-            menu.Add(stockItem);
 
             // Mod options
             for (int i = 0; i < count; i++)
@@ -2105,9 +3190,499 @@ namespace ExtendedLSC
             return menu;
         }
 
+        /// <summary>
+        /// Create menu for toggling vehicle extras (Side Course feature)
+        /// Vehicle extras are additional parts that can be shown/hidden (0-14)
+        /// </summary>
+        private NativeMenu CreateExtrasMenu()
+        {
+            var menu = CreateMenu("EXTRAS");
+
+            if (currentVehicle == null || !currentVehicle.Exists())
+                return menu;
+
+            // Check each extra slot (0-14) to see if vehicle has it
+            int extrasFound = 0;
+            for (int i = 0; i < 15; i++)
+            {
+                // Check if this extra exists on the vehicle
+                // GET_VEHICLE_MOD_KIT returns -1 if extra doesn't exist
+                bool extraExists = Function.Call<bool>(Hash.DOES_EXTRA_EXIST, currentVehicle, i);
+
+                if (extraExists)
+                {
+                    extrasFound++;
+                    int extraIndex = i; // Capture for closure
+
+                    // Get current state
+                    bool isEnabled = Function.Call<bool>(Hash.IS_VEHICLE_EXTRA_TURNED_ON, currentVehicle, extraIndex);
+
+                    var item = new NativeItem($"Extra {extraIndex}");
+                    item.AltTitle = isEnabled ? "~g~ON" : "~r~OFF";
+
+                    item.Activated += (s, e) =>
+                    {
+                        // Toggle the extra
+                        bool currentState = Function.Call<bool>(Hash.IS_VEHICLE_EXTRA_TURNED_ON, currentVehicle, extraIndex);
+                        Function.Call(Hash.SET_VEHICLE_EXTRA, currentVehicle, extraIndex, currentState); // true = OFF, false = ON (inverted!)
+
+                        // Update display
+                        bool newState = Function.Call<bool>(Hash.IS_VEHICLE_EXTRA_TURNED_ON, currentVehicle, extraIndex);
+                        item.AltTitle = newState ? "~g~ON" : "~r~OFF";
+
+                        if (activeDebugMode != DebugMode.None)
+                            ShowNotification($"~g~Extra {extraIndex} {(newState ? "enabled" : "disabled")}!");
+                    };
+
+                    menu.Add(item);
+                }
+            }
+
+            if (extrasFound == 0)
+            {
+                var noExtrasItem = new NativeItem("No extras available");
+                noExtrasItem.Enabled = false;
+                menu.Add(noExtrasItem);
+            }
+
+            return menu;
+        }
+
+        /// <summary>
+        /// Create menu for selecting xenon headlight color (Side Course feature)
+        /// Colors 0-12 are available when xenon lights are installed
+        /// </summary>
+        private NativeMenu CreateHeadlightColorMenu()
+        {
+            var menu = CreateMenu("HEADLIGHT COLOR");
+
+            // Xenon headlight color names (indices 0-12)
+            var colors = new[]
+            {
+                (0, "Default White"),
+                (1, "White"),
+                (2, "Blue"),
+                (3, "Electric Blue"),
+                (4, "Mint Green"),
+                (5, "Lime Green"),
+                (6, "Yellow"),
+                (7, "Golden Shower"),
+                (8, "Orange"),
+                (9, "Red"),
+                (10, "Pony Pink"),
+                (11, "Hot Pink"),
+                (12, "Purple")
+            };
+
+            // Get current color
+            int currentColor = Function.Call<int>(Hash.GET_VEHICLE_XENON_LIGHT_COLOR_INDEX, currentVehicle);
+
+            foreach (var (colorIndex, colorName) in colors)
+            {
+                var item = new NativeItem(colorName);
+                int idx = colorIndex; // Capture for closure
+
+                if (currentColor == colorIndex)
+                {
+                    item.AltTitle = "";
+                    itemOwnershipStatus[item] = STATUS_INSTALLED;
+                }
+                else
+                {
+                    item.AltTitle = colorIndex == 0 ? "Free" : "$250";
+                }
+
+                item.Activated += (s, e) =>
+                {
+                    // Check if xenon is installed
+                    if (!Function.Call<bool>(Hash.IS_TOGGLE_MOD_ON, currentVehicle, 22))
+                    {
+                        ShowNotification("~r~Install Xenon Lights first!");
+                        return;
+                    }
+
+                    // Purchase if not free and not already installed
+                    if (idx > 0 && currentColor != idx)
+                    {
+                        if (!TryPurchase(250, false)) return;
+                    }
+
+                    // Apply color
+                    Function.Call(Hash.SET_VEHICLE_XENON_LIGHT_COLOR_INDEX, currentVehicle, idx);
+                    if (activeDebugMode != DebugMode.None)
+                        ShowNotification($"~g~{colorName} headlights installed!");
+
+                    // Update menu items
+                    RefreshHeadlightColorMenu(menu, idx);
+                };
+
+                menu.Add(item);
+            }
+
+            // Turn on headlights when menu opens so user can see colors
+            menu.Shown += (s, e) =>
+            {
+                if (currentVehicle != null && currentVehicle.Exists())
+                {
+                    // Force headlights on (2 = always on)
+                    Function.Call(Hash.SET_VEHICLE_LIGHTS, currentVehicle, 2);
+                }
+            };
+
+            // Preview on selection change
+            menu.SelectedIndexChanged += (s, e) =>
+            {
+                if (currentVehicle != null && currentVehicle.Exists() &&
+                    Function.Call<bool>(Hash.IS_TOGGLE_MOD_ON, currentVehicle, 22))
+                {
+                    Function.Call(Hash.SET_VEHICLE_XENON_LIGHT_COLOR_INDEX, currentVehicle, e.Index);
+                }
+            };
+
+            // Store original color for revert on close
+            int originalColor = currentColor;
+            menu.Closed += (s, e) =>
+            {
+                // Turn headlights back to normal mode (0 = auto)
+                if (currentVehicle != null && currentVehicle.Exists())
+                {
+                    Function.Call(Hash.SET_VEHICLE_LIGHTS, currentVehicle, 0);
+                }
+            };
+
+            return menu;
+        }
+
+        /// <summary>
+        /// Refresh headlight color menu after purchase
+        /// </summary>
+        private void RefreshHeadlightColorMenu(NativeMenu menu, int newColorIndex)
+        {
+            for (int i = 0; i < menu.Items.Count; i++)
+            {
+                var item = menu.Items[i] as NativeItem;
+                if (item == null) continue;
+
+                itemOwnershipStatus.Remove(item);
+
+                if (i == newColorIndex)
+                {
+                    item.AltTitle = "";
+                    itemOwnershipStatus[item] = STATUS_INSTALLED;
+                }
+                else
+                {
+                    item.AltTitle = i == 0 ? "Free" : "$250";
+                }
+            }
+        }
+
+        #region Vehicle Packages (Side Course)
+
+        private string PackagesDirectory => Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ExtendedLSC", "Packages");
+
+        /// <summary>
+        /// Create menu for saving/loading vehicle mod packages (Side Course feature)
+        /// </summary>
+        private NativeMenu CreatePackagesMenu()
+        {
+            var menu = CreateMenu("PACKAGES");
+
+            // Save current mods option
+            var saveItem = new NativeItem("Save Current Mods");
+            saveItem.Description = "Save all current modifications to a package file";
+            saveItem.Activated += (s, e) =>
+            {
+                SaveVehiclePackage();
+            };
+            menu.Add(saveItem);
+
+            menu.Add(new NativeSeparatorItem());
+
+            // Load saved packages
+            LoadPackageItems(menu);
+
+            return menu;
+        }
+
+        /// <summary>
+        /// Load package files and add them to the menu
+        /// </summary>
+        private void LoadPackageItems(NativeMenu menu)
+        {
+            try
+            {
+                if (!Directory.Exists(PackagesDirectory))
+                {
+                    var noPackagesItem = new NativeItem("No saved packages");
+                    noPackagesItem.Enabled = false;
+                    menu.Add(noPackagesItem);
+                    return;
+                }
+
+                string vehicleModel = currentVehicle?.Model.ToString() ?? "";
+                string[] packageFiles = Directory.GetFiles(PackagesDirectory, "*.json");
+
+                int packagesFound = 0;
+                foreach (string file in packageFiles)
+                {
+                    string fileName = Path.GetFileNameWithoutExtension(file);
+
+                    // Package format: VehicleModel_PackageName.json
+                    // Only show packages for this vehicle model (or universal packages starting with "All_")
+                    if (!fileName.StartsWith(vehicleModel + "_") && !fileName.StartsWith("All_"))
+                        continue;
+
+                    packagesFound++;
+                    string displayName = fileName.Contains("_") ? fileName.Substring(fileName.IndexOf("_") + 1) : fileName;
+                    string filePath = file; // Capture for closure
+
+                    var packageItem = new NativeItem(displayName);
+                    packageItem.Description = $"Load {displayName} package";
+                    packageItem.AltTitle = ">>";
+                    packageItem.Activated += (s, e) =>
+                    {
+                        LoadVehiclePackage(filePath);
+                    };
+                    menu.Add(packageItem);
+                }
+
+                if (packagesFound == 0)
+                {
+                    var noPackagesItem = new NativeItem("No packages for this vehicle");
+                    noPackagesItem.Enabled = false;
+                    menu.Add(noPackagesItem);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"Error loading packages: {ex.Message}");
+                var errorItem = new NativeItem("Error loading packages");
+                errorItem.Enabled = false;
+                menu.Add(errorItem);
+            }
+        }
+
+        /// <summary>
+        /// Save current vehicle mods to a package file
+        /// </summary>
+        private void SaveVehiclePackage()
+        {
+            if (currentVehicle == null || !currentVehicle.Exists())
+            {
+                ShowNotification("~r~No vehicle to save!");
+                return;
+            }
+
+            try
+            {
+                // Create packages directory if needed
+                if (!Directory.Exists(PackagesDirectory))
+                    Directory.CreateDirectory(PackagesDirectory);
+
+                string vehicleModel = currentVehicle.Model.ToString();
+                string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                string fileName = $"{vehicleModel}_{timestamp}.json";
+                string filePath = Path.Combine(PackagesDirectory, fileName);
+
+                // Collect current mods
+                var package = new System.Text.StringBuilder();
+                package.AppendLine("{");
+                package.AppendLine($"  \"vehicle\": \"{vehicleModel}\",");
+                package.AppendLine($"  \"created\": \"{DateTime.Now:yyyy-MM-dd HH:mm:ss}\",");
+                package.AppendLine("  \"mods\": {");
+
+                // Save all mod slots (0-48)
+                bool first = true;
+                for (int modIndex = 0; modIndex <= 48; modIndex++)
+                {
+                    int modValue = Function.Call<int>(Hash.GET_VEHICLE_MOD, currentVehicle, modIndex);
+                    if (modValue >= 0) // Only save if mod is installed
+                    {
+                        if (!first) package.AppendLine(",");
+                        package.Append($"    \"{modIndex}\": {modValue}");
+                        first = false;
+                    }
+                }
+                package.AppendLine();
+                package.AppendLine("  },");
+
+                // Save colors
+                int primary, secondary;
+                unsafe
+                {
+                    Function.Call(Hash.GET_VEHICLE_COLOURS, currentVehicle, &primary, &secondary);
+                }
+                package.AppendLine($"  \"primaryColor\": {primary},");
+                package.AppendLine($"  \"secondaryColor\": {secondary},");
+
+                // Save wheel type
+                int wheelType = Function.Call<int>(Hash.GET_VEHICLE_WHEEL_TYPE, currentVehicle);
+                package.AppendLine($"  \"wheelType\": {wheelType},");
+
+                // Save turbo
+                bool hasTurbo = Function.Call<bool>(Hash.IS_TOGGLE_MOD_ON, currentVehicle, 18);
+                package.AppendLine($"  \"turbo\": {hasTurbo.ToString().ToLower()},");
+
+                // Save xenon
+                bool hasXenon = Function.Call<bool>(Hash.IS_TOGGLE_MOD_ON, currentVehicle, 22);
+                package.AppendLine($"  \"xenon\": {hasXenon.ToString().ToLower()}");
+
+                package.AppendLine("}");
+
+                File.WriteAllText(filePath, package.ToString());
+                ShowNotification($"~g~Package saved: {timestamp}");
+                Log($"Package saved to: {filePath}");
+            }
+            catch (Exception ex)
+            {
+                ShowNotification("~r~Failed to save package!");
+                Log($"Error saving package: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Load and apply a vehicle package
+        /// </summary>
+        private void LoadVehiclePackage(string filePath)
+        {
+            if (currentVehicle == null || !currentVehicle.Exists())
+            {
+                ShowNotification("~r~No vehicle!");
+                return;
+            }
+
+            try
+            {
+                string json = File.ReadAllText(filePath);
+
+                // Simple JSON parsing (avoid external dependencies)
+                // Parse mods section
+                int modsStart = json.IndexOf("\"mods\":");
+                if (modsStart >= 0)
+                {
+                    int modsObjStart = json.IndexOf("{", modsStart);
+                    int modsObjEnd = json.IndexOf("}", modsObjStart);
+                    string modsSection = json.Substring(modsObjStart + 1, modsObjEnd - modsObjStart - 1);
+
+                    // Ensure mod kit is installed
+                    Function.Call(Hash.SET_VEHICLE_MOD_KIT, currentVehicle, 0);
+
+                    // Parse each mod
+                    string[] modEntries = modsSection.Split(',');
+                    foreach (string entry in modEntries)
+                    {
+                        string trimmed = entry.Trim().Trim('"');
+                        if (string.IsNullOrEmpty(trimmed)) continue;
+
+                        int colonIndex = trimmed.IndexOf("\":");
+                        if (colonIndex > 0)
+                        {
+                            string modIndexStr = trimmed.Substring(0, colonIndex).Trim().Trim('"');
+                            string modValueStr = trimmed.Substring(colonIndex + 2).Trim();
+
+                            if (int.TryParse(modIndexStr, out int modIndex) && int.TryParse(modValueStr, out int modValue))
+                            {
+                                Function.Call(Hash.SET_VEHICLE_MOD, currentVehicle, modIndex, modValue, false);
+                            }
+                        }
+                    }
+                }
+
+                // Parse turbo
+                if (json.Contains("\"turbo\": true"))
+                {
+                    Function.Call(Hash.TOGGLE_VEHICLE_MOD, currentVehicle, 18, true);
+                }
+
+                // Parse xenon
+                if (json.Contains("\"xenon\": true"))
+                {
+                    Function.Call(Hash.TOGGLE_VEHICLE_MOD, currentVehicle, 22, true);
+                }
+
+                ShowNotification("~g~Package loaded!");
+                Log($"Package loaded from: {filePath}");
+            }
+            catch (Exception ex)
+            {
+                ShowNotification("~r~Failed to load package!");
+                Log($"Error loading package: {ex.Message}");
+            }
+        }
+
+        #endregion
+
+        #region Manual Transmission Integration (ELSC Built-in)
+
+        /// <summary>
+        /// Add Manual Transmission option to a transmission menu
+        /// Simple: select to enable and bind keys, select again to disable
+        /// </summary>
+        private void AddManualTransmissionOption(NativeMenu menu)
+        {
+            if (!ModSettings.ManualTransmission) return;
+            if (currentVehicle == null || !currentVehicle.Exists()) return;
+
+            // Check if ELSC MT is available
+            if (!ELSCTransmission.IsAvailable)
+            {
+                var notAvailableItem = new NativeItem("Manual Transmission");
+                notAvailableItem.AltTitle = "Unavailable";
+                notAvailableItem.Description = "Manual transmission requires memory access. Check log for details.";
+                notAvailableItem.Enabled = false;
+                menu.Add(notAvailableItem);
+                return;
+            }
+
+            // Check if MT was previously purchased for this vehicle
+            bool isOwned = VehicleSaveData.IsManualTransmissionOwned(currentVehicle.DisplayName);
+
+            // If owned but not currently enabled, auto-enable it
+            if (isOwned && !elscTransmission.IsEnabled)
+            {
+                elscTransmission.SetVehicle(currentVehicle);
+                elscTransmission.Enable();
+            }
+
+            var mtItem = new NativeItem("Manual Transmission");
+            mtItem.AltTitle = elscTransmission.IsEnabled ? "" : "$0"; // Empty when installed - sprite shows instead
+            mtItem.Description = elscTransmission.IsEnabled
+                ? $"Shift Up: {ModSettings.ShiftUpKey} | Shift Down: {ModSettings.ShiftDownKey} | Select to disable"
+                : "Select to enable and configure shift buttons";
+            if (elscTransmission.IsEnabled)
+                itemOwnershipStatus[mtItem] = STATUS_INSTALLED;
+
+            mtItem.Activated += (s, e) =>
+            {
+                if (elscTransmission.IsEnabled)
+                {
+                    // Disable manual transmission and save state
+                    elscTransmission.Disable();
+                    VehicleSaveData.SetManualTransmissionOwned(currentVehicle.DisplayName, false);
+                    VehicleSaveData.Save();
+                    mtItem.AltTitle = "$0";
+                    mtItem.Description = "Select to enable and configure shift buttons";
+                    itemOwnershipStatus.Remove(mtItem);
+                    ShowNotification("~y~Manual Transmission disabled");
+                }
+                else
+                {
+                    // Start key binding sequence - store item reference for updating later
+                    mtBindingState = 1;
+                    mtBindingItem = mtItem;
+                }
+            };
+            menu.Add(mtItem);
+        }
+
+        #endregion
+
         private NativeMenu CreateLiveryMenu(int count, bool useNativeLivery)
         {
-            var menu = CreateMenu("Livery");
+            var menu = CreateMenu("LIVERY");
+            bool isNative = useNativeLivery;
+            string vehicleName = currentVehicle.DisplayName;
 
             // Get current livery based on system used
             int currentLivery;
@@ -2120,17 +3695,64 @@ namespace ExtendedLSC
                 currentLivery = Function.Call<int>(Hash.GET_VEHICLE_MOD, currentVehicle, 48);
             }
 
+            // Store original livery for preview revert
+            int originalLivery = currentLivery;
+
+            // Preview system: revert to original when menu closes
+            menu.Closed += (s, e) =>
+            {
+                if (currentVehicle != null && currentVehicle.Exists())
+                {
+                    if (isNative)
+                        Function.Call(Hash.SET_VEHICLE_LIVERY, currentVehicle, originalLivery);
+                    else
+                    {
+                        Function.Call(Hash.SET_VEHICLE_MOD_KIT, currentVehicle, 0);
+                        Function.Call(Hash.SET_VEHICLE_MOD, currentVehicle, 48, originalLivery, false);
+                    }
+                }
+            };
+
+            // Preview system: preview livery on selection change
+            menu.SelectedIndexChanged += (s, e) =>
+            {
+                if (currentVehicle != null && currentVehicle.Exists())
+                {
+                    // Index 0 = None (-1), Index 1+ = livery (index - 1)
+                    int previewLivery = e.Index == 0 ? -1 : e.Index - 1;
+                    if (isNative)
+                        Function.Call(Hash.SET_VEHICLE_LIVERY, currentVehicle, previewLivery);
+                    else
+                    {
+                        Function.Call(Hash.SET_VEHICLE_MOD_KIT, currentVehicle, 0);
+                        Function.Call(Hash.SET_VEHICLE_MOD, currentVehicle, 48, previewLivery, false);
+                    }
+                }
+            };
+
             // None/Stock option
             var noneItem = new NativeItem("None");
-            noneItem.AltTitle = currentLivery == -1 ? "~g~Applied" : "Free";
-            bool isNative = useNativeLivery;
-            noneItem.Activated += (s, e) => ApplyLivery(-1, isNative);
+            if (currentLivery == -1)
+            {
+                noneItem.AltTitle = "";
+                itemOwnershipStatus[noneItem] = STATUS_INSTALLED;
+            }
+            else
+            {
+                noneItem.AltTitle = "Free";
+            }
+            noneItem.Activated += (s, e) =>
+            {
+                originalLivery = -1; // Update original so close doesn't revert
+                ApplyLivery(-1, isNative);
+            };
             menu.Add(noneItem);
 
             for (int i = 0; i < count; i++)
             {
-                int price = 500 + (i * 250);
-                bool isApplied = currentLivery == i;
+                int price = ModPricing.GetModPriceByIndex(48, i);
+                bool isInstalled = currentLivery == i;
+                bool isOwned = VehicleSaveData.IsModOwned(vehicleName, 48, i);
 
                 // Try to get livery name from game
                 string liveryName = $"Livery {i + 1}";
@@ -2146,21 +3768,88 @@ namespace ExtendedLSC
                 }
 
                 var item = new NativeItem(liveryName);
-                item.AltTitle = isApplied ? "~g~Applied" : $"${price:N0}";
+
+                if (isInstalled)
+                {
+                    item.AltTitle = "";
+                    itemOwnershipStatus[item] = STATUS_INSTALLED;
+                }
+                else if (isOwned)
+                {
+                    item.AltTitle = "";
+                    itemOwnershipStatus[item] = STATUS_OWNED;
+                }
+                else
+                {
+                    item.AltTitle = $"${price:N0}";
+                }
 
                 int liveryIndex = i;
                 int liveryPrice = price;
-                bool alreadyApplied = isApplied;
                 item.Activated += (s, e) =>
                 {
-                    if (!alreadyApplied && !TryPurchase(liveryPrice, false)) return;
+                    bool alreadyOwned = VehicleSaveData.IsModOwned(vehicleName, 48, liveryIndex);
+                    if (!alreadyOwned && !TryPurchase(liveryPrice, false)) return;
+                    if (!alreadyOwned) VehicleSaveData.SetModOwned(vehicleName, 48, liveryIndex);
+                    originalLivery = liveryIndex; // Update original so close doesn't revert
                     ApplyLivery(liveryIndex, isNative);
+                    RefreshLiveryMenuStatus(liveryIndex);
                 };
                 menu.Add(item);
             }
 
             return menu;
         }
+
+        /// <summary>
+        /// Refresh the livery menu ownership status after applying a livery
+        /// </summary>
+        private void RefreshLiveryMenuStatus(int newInstalledIndex)
+        {
+            // Find the livery menu in the menu pool
+            foreach (var obj in menuPool)
+            {
+                if (obj is NativeMenu menu && menu.Name == "LIVERY")
+                {
+                    string vehicleName = currentVehicle?.DisplayName ?? "";
+
+                    for (int i = 0; i < menu.Items.Count; i++)
+                    {
+                        var item = menu.Items[i] as NativeItem;
+                        if (item == null) continue;
+
+                        int itemValue = i - 1; // None is at index 0 with value -1
+                        bool isNowInstalled = (itemValue == newInstalledIndex);
+                        bool isOwned = itemValue >= 0 && VehicleSaveData.IsModOwned(vehicleName, 48, itemValue);
+
+                        itemOwnershipStatus.Remove(item);
+
+                        if (isNowInstalled)
+                        {
+                            item.AltTitle = "";
+                            itemOwnershipStatus[item] = STATUS_INSTALLED;
+                        }
+                        else if (isOwned)
+                        {
+                            item.AltTitle = "";
+                            itemOwnershipStatus[item] = STATUS_OWNED;
+                        }
+                        else
+                        {
+                            int price = ModPricing.GetModPriceByIndex(48, itemValue);
+                            item.AltTitle = itemValue == -1 ? "Free" : $"${price:N0}";
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Color preview state
+        private bool isPreviewingColor = false;
+        private int originalPrimaryColor = -1;
+        private int originalSecondaryColor = -1;
+        private int originalPearlescent = -1;
 
         private NativeMenu CreateColorMenu(bool isPrimary)
         {
@@ -2179,22 +3868,151 @@ namespace ExtendedLSC
             foreach (var (categoryName, colors, paintType, basePrice) in categories)
             {
                 var categoryMenu = CreateMenu(categoryName);
-                categoryMenu.Closed += (s, e) => { if (!isNavigatingMenu) menu.Visible = true; };
+                bool capturedIsPrimary = isPrimary;
+                int capturedPaintType = paintType;
+                var capturedColors = colors;
+
+                // Store original color when menu opens and preview selected color
+                categoryMenu.Shown += (s, e) =>
+                {
+                    if (currentVehicle != null && currentVehicle.Exists())
+                    {
+                        unsafe
+                        {
+                            int p, sec;
+                            Function.Call(Hash.GET_VEHICLE_COLOURS, currentVehicle, &p, &sec);
+                            originalPrimaryColor = p;
+                            originalSecondaryColor = sec;
+                            int pearl, wheel;
+                            Function.Call(Hash.GET_VEHICLE_EXTRA_COLOURS, currentVehicle, &pearl, &wheel);
+                            originalPearlescent = pearl;
+                        }
+                        isPreviewingColor = true;
+
+                        // Preview the currently selected color (not always index 0)
+                        int selectedIdx = categoryMenu.SelectedIndex;
+                        if (selectedIdx >= 0 && selectedIdx < capturedColors.Length)
+                        {
+                            var selectedColor = capturedColors[selectedIdx];
+                            if (capturedIsPrimary)
+                            {
+                                currentVehicle.Mods.PrimaryColor = (VehicleColor)selectedColor.ColorIndex;
+                                if (selectedColor.PearlescentSpec > 0)
+                                    currentVehicle.Mods.PearlescentColor = (VehicleColor)selectedColor.PearlescentSpec;
+                            }
+                            else
+                            {
+                                currentVehicle.Mods.SecondaryColor = (VehicleColor)selectedColor.ColorIndex;
+                            }
+                        }
+                    }
+                };
+
+                // Revert to original when menu closes
+                categoryMenu.Closed += (s, e) =>
+                {
+                    if (isPreviewingColor && currentVehicle != null && currentVehicle.Exists())
+                    {
+                        // Restore original colors
+                        Function.Call(Hash.SET_VEHICLE_COLOURS, currentVehicle, originalPrimaryColor, originalSecondaryColor);
+                        Function.Call(Hash.SET_VEHICLE_EXTRA_COLOURS, currentVehicle, originalPearlescent, 0);
+                        isPreviewingColor = false;
+                    }
+                    if (!isNavigatingMenu) menu.Visible = true;
+                };
+
+                // Preview color on selection change
+                categoryMenu.SelectedIndexChanged += (s, e) =>
+                {
+                    if (currentVehicle != null && currentVehicle.Exists() && e.Index >= 0 && e.Index < capturedColors.Length)
+                    {
+                        var color = capturedColors[e.Index];
+                        // Preview using direct color set (like Menyoo does)
+                        // SET_VEHICLE_MOD_COLOR_1's 3rd param is paint INDEX in category, not raw color ID
+                        // So we use SET_VEHICLE_COLOURS for raw color IDs
+                        if (capturedIsPrimary)
+                        {
+                            currentVehicle.Mods.PrimaryColor = (VehicleColor)color.ColorIndex;
+                            if (color.PearlescentSpec > 0)
+                                currentVehicle.Mods.PearlescentColor = (VehicleColor)color.PearlescentSpec;
+                        }
+                        else
+                        {
+                            currentVehicle.Mods.SecondaryColor = (VehicleColor)color.ColorIndex;
+                        }
+                    }
+                };
+
+                // Track items for ownership sprite
+                string priceText = $"${basePrice}";
+                var colorItems = new List<(NativeItem item, VehicleColors.ColorInfo color)>();
 
                 foreach (var color in colors)
                 {
                     var item = new NativeItem(color.DisplayName);
-                    item.AltTitle = $"${basePrice}";
+                    item.AltTitle = priceText;
                     var capturedColor = color;
-                    int capturedPaintType = paintType;
                     int capturedPrice = basePrice;
                     item.Activated += (s, e) =>
                     {
                         if (!TryPurchase(capturedPrice, false)) return;
-                        ApplyPaintColor(capturedColor.ColorIndex, capturedColor.PearlescentSpec, capturedPaintType, isPrimary);
+                        isPreviewingColor = false;
+                        ApplyPaintColor(capturedColor.ColorIndex, capturedColor.PearlescentSpec, capturedPaintType, capturedIsPrimary);
+
+                        // Update sprite - mark this as installed, clear others
+                        foreach (var (otherItem, _) in colorItems)
+                        {
+                            itemOwnershipStatus.Remove(otherItem);
+                            otherItem.AltTitle = priceText;
+                        }
+                        itemOwnershipStatus[item] = STATUS_INSTALLED;
+                        item.AltTitle = "";
                     };
                     categoryMenu.Add(item);
+                    colorItems.Add((item, color));
                 }
+
+                var capturedColorItems = colorItems;
+                string capturedPriceText = priceText;
+
+                // Update sprite when menu opens based on current vehicle color
+                categoryMenu.Shown += (s, e) =>
+                {
+                    if (currentVehicle == null || !currentVehicle.Exists()) return;
+
+                    int currentPaintType, currentColorIndex;
+                    unsafe
+                    {
+                        int pt, ci, pl;
+                        if (capturedIsPrimary)
+                            Function.Call(Hash.GET_VEHICLE_MOD_COLOR_1, currentVehicle, &pt, &ci, &pl);
+                        else
+                            Function.Call(Hash.GET_VEHICLE_MOD_COLOR_2, currentVehicle, &pt, &ci);
+                        currentPaintType = pt;
+                        currentColorIndex = ci;
+                    }
+
+                    // Restore prices and clear sprites
+                    foreach (var (item, _) in capturedColorItems)
+                    {
+                        itemOwnershipStatus.Remove(item);
+                        item.AltTitle = capturedPriceText;
+                    }
+
+                    // Mark current as installed (hide price, show sprite)
+                    if (currentPaintType == capturedPaintType)
+                    {
+                        foreach (var (item, color) in capturedColorItems)
+                        {
+                            if (color.ColorIndex == currentColorIndex)
+                            {
+                                itemOwnershipStatus[item] = STATUS_INSTALLED;
+                                item.AltTitle = "";
+                                break;
+                            }
+                        }
+                    }
+                };
 
                 var navItem = new NativeItem(categoryName);
                 navItem.AltTitle = ">>";
@@ -2210,19 +4028,129 @@ namespace ExtendedLSC
         private NativeMenu CreatePearlescentMenu()
         {
             var menu = CreateMenu("Pearlescent");
+            var pearlColors = VehicleColors.PearlescentColors;
 
-            foreach (var color in VehicleColors.PearlescentColors)
+            // Store original pearlescent when menu opens and preview selected color
+            menu.Shown += (s, e) =>
+            {
+                if (currentVehicle != null && currentVehicle.Exists())
+                {
+                    int wheel;
+                    unsafe
+                    {
+                        int pearl, w;
+                        Function.Call(Hash.GET_VEHICLE_EXTRA_COLOURS, currentVehicle, &pearl, &w);
+                        originalPearlescent = pearl;
+                        wheel = w;
+                    }
+                    isPreviewingColor = true;
+
+                    // Preview the currently selected pearlescent color (not always index 0)
+                    int selectedIdx = menu.SelectedIndex;
+                    if (selectedIdx >= 0 && selectedIdx < pearlColors.Length)
+                    {
+                        Function.Call(Hash.SET_VEHICLE_EXTRA_COLOURS, currentVehicle, pearlColors[selectedIdx].ColorIndex, wheel);
+                    }
+                }
+            };
+
+            // Revert to original when menu closes
+            menu.Closed += (s, e) =>
+            {
+                if (isPreviewingColor && currentVehicle != null && currentVehicle.Exists())
+                {
+                    int wheel;
+                    unsafe
+                    {
+                        int p, w;
+                        Function.Call(Hash.GET_VEHICLE_EXTRA_COLOURS, currentVehicle, &p, &w);
+                        wheel = w;
+                    }
+                    Function.Call(Hash.SET_VEHICLE_EXTRA_COLOURS, currentVehicle, originalPearlescent, wheel);
+                    isPreviewingColor = false;
+                }
+            };
+
+            // Preview pearlescent on selection change
+            menu.SelectedIndexChanged += (s, e) =>
+            {
+                if (currentVehicle != null && currentVehicle.Exists() && e.Index >= 0 && e.Index < pearlColors.Length)
+                {
+                    int wheel;
+                    unsafe
+                    {
+                        int p, w;
+                        Function.Call(Hash.GET_VEHICLE_EXTRA_COLOURS, currentVehicle, &p, &w);
+                        wheel = w;
+                    }
+                    Function.Call(Hash.SET_VEHICLE_EXTRA_COLOURS, currentVehicle, pearlColors[e.Index].ColorIndex, wheel);
+                }
+            };
+
+            // Track items for ownership sprite
+            string pearlPriceText = $"${ModPricing.PearlescentPrice}";
+            var pearlItems = new List<(NativeItem item, int colorIndex)>();
+
+            foreach (var color in pearlColors)
             {
                 var item = new NativeItem(color.DisplayName);
-                item.AltTitle = $"${ModPricing.PearlescentPrice}";
+                item.AltTitle = pearlPriceText;
                 int colorId = color.ColorIndex;
                 item.Activated += (s, e) =>
                 {
                     if (!TryPurchase(ModPricing.PearlescentPrice, false)) return;
+                    isPreviewingColor = false;
                     ApplyPearlescent(colorId);
+
+                    foreach (var (otherItem, _) in pearlItems)
+                    {
+                        itemOwnershipStatus.Remove(otherItem);
+                        otherItem.AltTitle = pearlPriceText;
+                    }
+                    itemOwnershipStatus[item] = STATUS_INSTALLED;
+                    item.AltTitle = "";
                 };
                 menu.Add(item);
+                pearlItems.Add((item, colorId));
             }
+
+            var capturedPearlItems = pearlItems;
+            menu.Shown += (s, e) =>
+            {
+                if (currentVehicle == null || !currentVehicle.Exists()) return;
+
+                // Get current paint type and pearlescent
+                int currentPaintType, currentPearl;
+                unsafe
+                {
+                    int pt, ci, pl, w;
+                    Function.Call(Hash.GET_VEHICLE_MOD_COLOR_1, currentVehicle, &pt, &ci, &pl);
+                    Function.Call(Hash.GET_VEHICLE_EXTRA_COLOURS, currentVehicle, &pl, &w);
+                    currentPaintType = pt;
+                    currentPearl = pl;
+                }
+
+                // Reset all items
+                foreach (var (item, colorIndex) in capturedPearlItems)
+                {
+                    itemOwnershipStatus.Remove(item);
+                    item.AltTitle = pearlPriceText;
+                }
+
+                // Only show installed sprite if paint type supports pearlescent (Metallic=1 or Pearl=2)
+                if (currentPaintType == 1 || currentPaintType == 2)
+                {
+                    foreach (var (item, colorIndex) in capturedPearlItems)
+                    {
+                        if (colorIndex == currentPearl)
+                        {
+                            itemOwnershipStatus[item] = STATUS_INSTALLED;
+                            item.AltTitle = "";
+                            break;
+                        }
+                    }
+                }
+            };
 
             return menu;
         }
@@ -2230,19 +4158,117 @@ namespace ExtendedLSC
         private NativeMenu CreateWheelColorMenu()
         {
             var menu = CreateMenu("Wheel Color");
+            var wheelColors = VehicleColors.WheelColors;
+            int originalWheelColor = 0;
 
-            foreach (var color in VehicleColors.WheelColors)
+            // Store original wheel color when menu opens and preview selected color
+            menu.Shown += (s, e) =>
+            {
+                if (currentVehicle != null && currentVehicle.Exists())
+                {
+                    int pearl;
+                    unsafe
+                    {
+                        int p, wheel;
+                        Function.Call(Hash.GET_VEHICLE_EXTRA_COLOURS, currentVehicle, &p, &wheel);
+                        originalWheelColor = wheel;
+                        pearl = p;
+                    }
+                    isPreviewingColor = true;
+
+                    // Preview the currently selected wheel color (not always index 0)
+                    int selectedIdx = menu.SelectedIndex;
+                    if (selectedIdx >= 0 && selectedIdx < wheelColors.Length)
+                    {
+                        Function.Call(Hash.SET_VEHICLE_EXTRA_COLOURS, currentVehicle, pearl, wheelColors[selectedIdx].ColorIndex);
+                    }
+                }
+            };
+
+            // Revert to original when menu closes
+            menu.Closed += (s, e) =>
+            {
+                if (isPreviewingColor && currentVehicle != null && currentVehicle.Exists())
+                {
+                    int pearl;
+                    unsafe
+                    {
+                        int p, w;
+                        Function.Call(Hash.GET_VEHICLE_EXTRA_COLOURS, currentVehicle, &p, &w);
+                        pearl = p;
+                    }
+                    Function.Call(Hash.SET_VEHICLE_EXTRA_COLOURS, currentVehicle, pearl, originalWheelColor);
+                    isPreviewingColor = false;
+                }
+            };
+
+            // Preview wheel color on selection change
+            menu.SelectedIndexChanged += (s, e) =>
+            {
+                if (currentVehicle != null && currentVehicle.Exists() && e.Index >= 0 && e.Index < wheelColors.Length)
+                {
+                    int pearl;
+                    unsafe
+                    {
+                        int p, w;
+                        Function.Call(Hash.GET_VEHICLE_EXTRA_COLOURS, currentVehicle, &p, &w);
+                        pearl = p;
+                    }
+                    Function.Call(Hash.SET_VEHICLE_EXTRA_COLOURS, currentVehicle, pearl, wheelColors[e.Index].ColorIndex);
+                }
+            };
+
+            // Track items for ownership sprite
+            string wheelPriceText = $"${ModPricing.WheelColorPrice}";
+            var wheelColorItems = new List<(NativeItem item, int colorIndex)>();
+
+            foreach (var color in wheelColors)
             {
                 var item = new NativeItem(color.DisplayName);
-                item.AltTitle = $"${ModPricing.WheelColorPrice}";
+                item.AltTitle = wheelPriceText;
                 int colorId = color.ColorIndex;
                 item.Activated += (s, e) =>
                 {
                     if (!TryPurchase(ModPricing.WheelColorPrice, false)) return;
+                    isPreviewingColor = false;
                     ApplyWheelColor(colorId);
+
+                    foreach (var (otherItem, _) in wheelColorItems)
+                    {
+                        itemOwnershipStatus.Remove(otherItem);
+                        otherItem.AltTitle = wheelPriceText;
+                    }
+                    itemOwnershipStatus[item] = STATUS_INSTALLED;
+                    item.AltTitle = "";
                 };
                 menu.Add(item);
+                wheelColorItems.Add((item, colorId));
             }
+
+            var capturedWheelColorItems = wheelColorItems;
+            menu.Shown += (s, e) =>
+            {
+                if (currentVehicle == null || !currentVehicle.Exists()) return;
+
+                int currentWheelColor;
+                unsafe
+                {
+                    int p, w;
+                    Function.Call(Hash.GET_VEHICLE_EXTRA_COLOURS, currentVehicle, &p, &w);
+                    currentWheelColor = w;
+                }
+
+                foreach (var (item, colorIndex) in capturedWheelColorItems)
+                {
+                    itemOwnershipStatus.Remove(item);
+                    item.AltTitle = wheelPriceText;
+                    if (colorIndex == currentWheelColor)
+                    {
+                        itemOwnershipStatus[item] = STATUS_INSTALLED;
+                        item.AltTitle = "";
+                    }
+                }
+            };
 
             return menu;
         }
@@ -2272,31 +4298,6 @@ namespace ExtendedLSC
                 {
                     if (!TryPurchase(500, false)) return;
                     ApplyTireSmoke(cr, cg, cb);
-                };
-                menu.Add(item);
-            }
-
-            return menu;
-        }
-
-        private NativeMenu CreateHeadlightColorMenu()
-        {
-            var menu = CreateMenu("Headlight Color");
-
-            string[] colors = { "Default", "White", "Blue", "Electric Blue", "Mint Green", "Lime Green",
-                               "Yellow", "Golden Shower", "Orange", "Red", "Pony Pink", "Hot Pink", "Purple" };
-
-            for (int i = 0; i < colors.Length; i++)
-            {
-                var item = new NativeItem(colors[i]);
-                int price = i == 0 ? 0 : 250;
-                item.AltTitle = price == 0 ? "Free" : "$250";
-                int colorIndex = i - 1; // -1 for default
-                int capturedPrice = price;
-                item.Activated += (s, e) =>
-                {
-                    if (!TryPurchase(capturedPrice, false)) return;
-                    ApplyHeadlightColor(colorIndex);
                 };
                 menu.Add(item);
             }
@@ -2548,7 +4549,8 @@ namespace ExtendedLSC
             // Ensure mod kit is installed (required for SET_VEHICLE_MOD to work)
             Function.Call(Hash.SET_VEHICLE_MOD_KIT, currentVehicle, 0);
             Function.Call(Hash.SET_VEHICLE_MOD, currentVehicle, modIndex, valueIndex, false);
-            ShowNotification($"~g~{ModCategories.GetDisplayName(modIndex)} installed!");
+            if (activeDebugMode != DebugMode.None)
+                ShowNotification($"~g~{ModCategories.GetDisplayName(modIndex)} installed!");
             MechanicSpeak();
             Log($"Applied mod index {modIndex} value {valueIndex}");
 
@@ -2565,14 +4567,22 @@ namespace ExtendedLSC
 
             string vehicleName = currentVehicle?.DisplayName ?? "";
 
+            // Check if this mod type has no stock option (performance mods)
+            bool noStockOption = false;
+            if (ModCategories.AllCategories.TryGetValue(modIndex, out var category))
+            {
+                noStockOption = category.NoStockOption;
+            }
+
             // Iterate through menu items and update their status
-            // Item 0 is always "Stock" with value -1, rest are mods with values 0, 1, 2, etc.
+            // If has stock: Item 0 is "Stock" with value -1, rest are mods with values 0, 1, 2, etc.
+            // If no stock: Item 0 is mod 0, Item 1 is mod 1, etc.
             for (int i = 0; i < menu.Items.Count; i++)
             {
                 var item = menu.Items[i] as NativeItem;
                 if (item == null) continue;
 
-                int itemValue = i - 1; // Stock is at index 0 with value -1
+                int itemValue = noStockOption ? i : i - 1;
 
                 bool isNowInstalled = (itemValue == newInstalledValue);
                 bool isOwned = itemValue >= 0 && VehicleSaveData.IsModOwned(vehicleName, modIndex, itemValue);
@@ -2827,7 +4837,8 @@ namespace ExtendedLSC
             else
                 Function.Call(Hash.SET_VEHICLE_COLOURS, currentVehicle, primary, colorIndex);
 
-            ShowNotification($"~g~{(isPrimary ? "Primary" : "Secondary")} color applied!");
+            if (activeDebugMode != DebugMode.None)
+                ShowNotification($"~g~{(isPrimary ? "Primary" : "Secondary")} color applied!");
             MechanicSpeak();
         }
 
@@ -2838,16 +4849,17 @@ namespace ExtendedLSC
         {
             if (currentVehicle == null) return;
 
-            // Paint types: 0=Normal, 1=Metallic, 2=Pearl, 3=Matte, 4=Metal, 5=Chrome
+            // Use direct color setting (like Menyoo does) instead of SET_VEHICLE_MOD_COLOR_1
+            // The raw color index already encodes the paint type in carcols.meta
             if (isPrimary)
             {
-                // SET_VEHICLE_MOD_COLOR_1: vehicle, paintType, color, pearlescent
-                Function.Call(Hash.SET_VEHICLE_MOD_COLOR_1, currentVehicle, paintType, colorIndex, pearlescentSpec);
+                currentVehicle.Mods.PrimaryColor = (VehicleColor)colorIndex;
+                if (pearlescentSpec > 0)
+                    currentVehicle.Mods.PearlescentColor = (VehicleColor)pearlescentSpec;
             }
             else
             {
-                // SET_VEHICLE_MOD_COLOR_2: vehicle, paintType, color
-                Function.Call(Hash.SET_VEHICLE_MOD_COLOR_2, currentVehicle, paintType, colorIndex);
+                currentVehicle.Mods.SecondaryColor = (VehicleColor)colorIndex;
             }
 
             string paintTypeName = paintType switch
@@ -2860,7 +4872,8 @@ namespace ExtendedLSC
                 5 => "Chrome",
                 _ => ""
             };
-            ShowNotification($"~g~{paintTypeName} {(isPrimary ? "primary" : "secondary")} color applied!");
+            if (activeDebugMode != DebugMode.None)
+                ShowNotification($"~g~{paintTypeName} {(isPrimary ? "primary" : "secondary")} color applied!");
             MechanicSpeak();
         }
 
@@ -2921,7 +4934,8 @@ namespace ExtendedLSC
             bool isOn = Function.Call<bool>((Hash)0x8C4B92553E4571EC, currentVehicle, position);
             Function.Call((Hash)0x2AA720E4287BF269, currentVehicle, position, !isOn);
 
-            ShowNotification($"~g~Neon {(!isOn ? "enabled" : "disabled")}!");
+            if (activeDebugMode != DebugMode.None)
+                ShowNotification($"~g~Neon {(!isOn ? "enabled" : "disabled")}!");
             MechanicSpeak();
         }
 
@@ -3269,9 +5283,84 @@ namespace ExtendedLSC
                 return;
             }
 
+            // Manual transmission key binding mode - block input and draw overlay
+            if (mtBindingState > 0)
+            {
+                Game.DisableAllControlsThisFrame();
+                menuPool.Process();
+                DrawCustomBanner();
+                DrawMTBindingOverlay();
+                CheckControllerButtonBinding();
+                return; // Skip normal input processing
+            }
+
+            // Reset B button block flag each frame
+            debugBlockBButton = false;
+
+            // R3 toggle for game input mode (allows opening real LSC menu for comparison)
+            // This check must happen BEFORE any debug mode handling
+            if (activeDebugMode != DebugMode.None)
+            {
+                // When in game input mode, block our controls FIRST before anything else processes them
+                if (debugGameInputMode)
+                {
+                    // Block B button completely - set flag AND disable control
+                    debugBlockBButton = true;
+                    Game.DisableControlThisFrame(GTA.Control.FrontendCancel);
+
+                    // B button is blocked in game input mode (ScriptRRight conflicts with B, so we only use FrontendRs for R3)
+
+                    // Hide all our menus completely so they don't react to any input
+                    foreach (var obj in menuPool)
+                    {
+                        if (obj is NativeMenu menu)
+                        {
+                            menu.Visible = false;
+                            menu.AcceptsInput = false;
+                        }
+                    }
+
+                    // Only R3 can exit game input mode (FrontendRs only - ScriptRRight conflicts with B button)
+                    if (Game.IsControlJustPressed(GTA.Control.FrontendRs))
+                    {
+                        debugGameInputMode = false;
+                        // Restore menu visibility and input
+                        if (mainMenu != null)
+                        {
+                            mainMenu.Visible = true;
+                            mainMenu.AcceptsInput = true;
+                        }
+                        ShowNotification("~g~DEBUG MODE~w~ - Unlocked via R3");
+                        // Don't return - let the code continue to process the debug mode and draw UI
+                        // But skip the enter check below by falling through
+                    }
+                    else
+                    {
+                        // Still in game input mode - draw indicator and return
+                        DrawDebugText("GAME INPUT MODE", 0.5f, 0.02f, 255, 255, 0);
+                        DrawDebugText("Press R3 to return to debug", 0.5f, 0.045f, 200, 200, 200);
+                        return;
+                    }
+                }
+                else
+                {
+                    // R3 (right stick click) enters game input mode (FrontendRs only - ScriptRRight conflicts with B button)
+                    // Only check this if we weren't already in game input mode (to avoid re-entering immediately after exiting)
+                    if (Game.IsControlJustPressed(GTA.Control.FrontendRs))
+                    {
+                        debugGameInputMode = true;
+                        debugBlockBButton = true;  // Also block B this frame when entering
+                        ShowNotification("~y~GAME INPUT MODE~w~ - Locked via R3");
+                    }
+                }
+            }
+
             // Debug Menu - tool selector (F7 to open)
             if (activeDebugMode == DebugMode.Menu)
             {
+                // Skip all processing if in game input mode (should have returned earlier, but safety check)
+                if (debugGameInputMode) return;
+
                 // Disable menu input
                 foreach (var obj in menuPool)
                 {
@@ -3284,8 +5373,8 @@ namespace ExtendedLSC
                 Game.DisableControlThisFrame(GTA.Control.VehicleBrake);
                 Game.DisableControlThisFrame(GTA.Control.VehicleMoveLeftRight);
 
-                // B exits debug menu
-                if (Game.IsControlJustPressed(GTA.Control.FrontendCancel))
+                // B exits debug menu (only if not in game input mode)
+                if (!debugGameInputMode && !debugBlockBButton && Game.IsControlJustPressed(GTA.Control.FrontendCancel))
                 {
                     ExitDebugMode();
                     return;
@@ -3303,11 +5392,12 @@ namespace ExtendedLSC
                 {
                     switch (debugMenuSelection)
                     {
-                        case 0: activeDebugMode = DebugMode.TextSize; break;
+                        case 0: activeDebugMode = DebugMode.Resizer; break;
                         case 1: activeDebugMode = DebugMode.SpriteBrowser; spriteBrowserPage = 0; break;
-                        case 2: activeDebugMode = DebugMode.MenuPosition; break;
+                        case 2: activeDebugMode = DebugMode.MenuPosition; selectedUIElement = UIElement.Menu; break;
                         case 3: activeDebugMode = DebugMode.InputTiming; break;
-                        case 4: ExitDebugMode(); return;
+                        case 4: activeDebugMode = DebugMode.StatsCalibration; break;
+                        case 5: ExitDebugMode(); return;
                     }
                     ShowNotification($"~g~{debugMenuOptions[debugMenuSelection]}~w~ mode active");
                 }
@@ -3326,55 +5416,19 @@ namespace ExtendedLSC
                 return;
             }
 
-            // Text size debug mode
-            if (activeDebugMode == DebugMode.TextSize)
+            // Resizer debug mode - scale text, sprites, and UI elements
+            if (activeDebugMode == DebugMode.Resizer)
             {
-                // Disable input on all menus in the pool
+                // Skip all processing if in game input mode (should have returned earlier, but safety check)
+                if (debugGameInputMode) return;
+
+                // Disable all input on menus and vehicle
                 foreach (var obj in menuPool)
                 {
                     if (obj is NativeMenu menu)
                         menu.AcceptsInput = false;
                 }
-
-                // Build list of available fields based on what's visible
-                activeDebugFields.Clear();
-                var visibleMenu = GetVisibleMenu();
-                activeDebugFields.Add("Transaction (-$)");
-
-                if (visibleMenu != null && visibleMenu.SelectedIndex >= 0 && visibleMenu.SelectedIndex < visibleMenu.Items.Count)
-                {
-                    var selectedItem = visibleMenu.Items[visibleMenu.SelectedIndex];
-                    string desc = GetDescriptionFromConfig(selectedItem.Title);
-                    if (!string.IsNullOrEmpty(desc))
-                        activeDebugFields.Add("Description");
-                }
-
-                if (visibleMenu != null && itemOwnershipStatus.Count > 0)
-                {
-                    foreach (var item in visibleMenu.Items)
-                    {
-                        if (item is NativeItem ni && itemOwnershipStatus.ContainsKey(ni))
-                        {
-                            activeDebugFields.Add("Sprites (Icons)");
-                            break;
-                        }
-                    }
-                }
-
-                if (textSizeDebugFieldIndex >= activeDebugFields.Count)
-                    textSizeDebugFieldIndex = 0;
-
-                string currentFieldName = activeDebugFields.Count > 0 ? activeDebugFields[textSizeDebugFieldIndex] : "None";
-
-                // B button goes back to debug menu
-                if (Game.IsControlJustPressed(GTA.Control.FrontendCancel))
-                {
-                    activeDebugMode = DebugMode.Menu;
-                    return;
-                }
                 Game.DisableControlThisFrame(GTA.Control.FrontendCancel);
-
-                // Block all vehicle movement while in debug mode
                 Game.DisableControlThisFrame(GTA.Control.VehicleAccelerate);
                 Game.DisableControlThisFrame(GTA.Control.VehicleBrake);
                 Game.DisableControlThisFrame(GTA.Control.VehicleMoveLeftRight);
@@ -3382,89 +5436,151 @@ namespace ExtendedLSC
                 Game.DisableControlThisFrame(GTA.Control.VehicleHandbrake);
                 Game.DisableControlThisFrame(GTA.Control.VehicleExit);
 
-                // Read D-pad input
-                bool dpadLeft = Game.IsControlJustPressed(GTA.Control.FrontendLeft);
-                bool dpadRight = Game.IsControlJustPressed(GTA.Control.FrontendRight);
-                bool dpadUp = Game.IsControlJustPressed(GTA.Control.FrontendUp);
-                bool dpadDown = Game.IsControlJustPressed(GTA.Control.FrontendDown);
+                // Build list of available fields based on what's visible
+                activeResizerFields.Clear();
+                var visibleMenu = GetVisibleMenu();
 
-                // Handle D-pad input for field cycling and scale adjustment
-                float scaleStep = 0.02f;
-                if (dpadLeft && activeDebugFields.Count > 0)
+                // Always available
+                activeResizerFields.Add("Transaction Text");
+                activeResizerFields.Add("Sprite Scale");
+                activeResizerFields.Add("Arrow Sprite");
+
+                // Description available if menu has description
+                if (visibleMenu != null && visibleMenu.SelectedIndex >= 0 && visibleMenu.SelectedIndex < visibleMenu.Items.Count)
                 {
-                    textSizeDebugFieldIndex = (textSizeDebugFieldIndex - 1 + activeDebugFields.Count) % activeDebugFields.Count;
-                    ShowNotification($"Editing: ~y~{activeDebugFields[textSizeDebugFieldIndex]}");
-                }
-                if (dpadRight && activeDebugFields.Count > 0)
-                {
-                    textSizeDebugFieldIndex = (textSizeDebugFieldIndex + 1) % activeDebugFields.Count;
-                    ShowNotification($"Editing: ~y~{activeDebugFields[textSizeDebugFieldIndex]}");
-                }
-                if (dpadUp && activeDebugFields.Count > 0)
-                {
-                    if (currentFieldName == "Transaction (-$)") transactionTextScale += scaleStep;
-                    else if (currentFieldName == "Description") descriptionTextScale += scaleStep;
-                    else if (currentFieldName == "Sprites (Icons)") spriteScale += 0.1f;
-                    float cs = GetCurrentDebugScale(currentFieldName);
-                    Log($"{currentFieldName}: {cs:F3}");
-                }
-                if (dpadDown && activeDebugFields.Count > 0)
-                {
-                    if (currentFieldName == "Transaction (-$)") transactionTextScale = Math.Max(0.1f, transactionTextScale - scaleStep);
-                    else if (currentFieldName == "Description") descriptionTextScale = Math.Max(0.1f, descriptionTextScale - scaleStep);
-                    else if (currentFieldName == "Sprites (Icons)") spriteScale = Math.Max(0.5f, spriteScale - 0.1f);
-                    float cs = GetCurrentDebugScale(currentFieldName);
-                    Log($"{currentFieldName}: {cs:F3}");
+                    activeResizerFields.Add("Description Text");
                 }
 
-                // Draw menu (AcceptsInput=false so no navigation)
+                // Stats bar options always available when stats are shown
+                if (currentVehicle != null && currentVehicle.Exists())
+                {
+                    activeResizerFields.Add("Stats Row Height");
+                    activeResizerFields.Add("Stats Bar Height");
+                    activeResizerFields.Add("Stats Bar Gap");
+                    activeResizerFields.Add("Stats Label Scale");
+                    activeResizerFields.Add("Stats Padding");
+                    activeResizerFields.Add("Stats Content Y");
+                    activeResizerFields.Add("Stats Bar Inset");
+                    activeResizerFields.Add("Stats Text Left");
+                    activeResizerFields.Add("Stats Bar Y");
+                }
+
+                if (resizerFieldIndex >= activeResizerFields.Count)
+                    resizerFieldIndex = 0;
+
+                string currentFieldName = activeResizerFields.Count > 0 ? activeResizerFields[resizerFieldIndex] : "None";
+
+                // B button goes back to debug menu (only if not in game input mode)
+                if (!debugGameInputMode && !debugBlockBButton && Game.IsControlJustPressed(GTA.Control.FrontendCancel))
+                {
+                    activeDebugMode = DebugMode.Menu;
+                    return;
+                }
+
+                // U/D to cycle fields, L/R to adjust
+                if (Game.IsControlJustPressed(GTA.Control.FrontendUp))
+                    resizerFieldIndex = (resizerFieldIndex - 1 + activeResizerFields.Count) % activeResizerFields.Count;
+                if (Game.IsControlJustPressed(GTA.Control.FrontendDown))
+                    resizerFieldIndex = (resizerFieldIndex + 1) % activeResizerFields.Count;
+
+                // L/R to adjust values
+                float step = 0.001f;
+                float bigStep = 0.01f;
+                bool left = Game.IsControlJustPressed(GTA.Control.FrontendLeft);
+                bool right = Game.IsControlJustPressed(GTA.Control.FrontendRight);
+
+                if (left || right)
+                {
+                    float dir = right ? 1f : -1f;
+                    switch (currentFieldName)
+                    {
+                        case "Transaction Text": transactionTextScale = Math.Max(0.1f, transactionTextScale + dir * bigStep); break;
+                        case "Sprite Scale": spriteScale = Math.Max(0.5f, spriteScale + dir * 0.1f); break;
+                        case "Arrow Sprite": arrowSpriteScale = Math.Max(0.1f, arrowSpriteScale + dir * 0.1f); break;
+                        case "Description Text": descriptionTextScale = Math.Max(0.1f, descriptionTextScale + dir * bigStep); break;
+                        case "Stats Row Height": statsRowHeight = Math.Max(0.01f, statsRowHeight + dir * step); break;
+                        case "Stats Bar Height": statsSegmentHeight = Math.Max(0.005f, statsSegmentHeight + dir * step); break;
+                        case "Stats Bar Gap": statsSegmentGap = Math.Max(0.001f, statsSegmentGap + dir * step); break;
+                        case "Stats Label Scale": statsLabelScale = Math.Max(0.1f, statsLabelScale + dir * bigStep); break;
+                        case "Stats Padding": statsPanelPadding = Math.Max(0.005f, statsPanelPadding + dir * step); break;
+                        case "Stats Content Y": statsContentOffsetY += dir * step; break;
+                        case "Stats Bar Inset": statsBarInset = Math.Max(0f, statsBarInset + dir * step); break;
+                        case "Stats Text Left": statsTextLeftPadding = Math.Max(0f, statsTextLeftPadding + dir * step); break;
+                        case "Stats Bar Y": statsBarOffsetY += dir * step; break;
+                    }
+                }
+
+                // X to log current values
+                if (Game.IsControlJustPressed(GTA.Control.FrontendX))
+                {
+                    LogResizerValues();
+                    ShowNotification("~g~Resizer values logged");
+                }
+
+                // Draw everything
                 menuPool.Process();
                 DrawCustomBanner();
 
-                // Show cash HUD
-                Function.Call((Hash)0x96DEC8D5430208B7, true); // DISPLAY_CASH
-
-                // Draw transaction text - yellow when editing that field
-                bool editingTransaction = currentFieldName == "Transaction (-$)";
+                // Draw yellow highlight around element being resized
+                if (resizerFieldIndex < activeResizerFields.Count)
                 {
-                    string text = "-$1,234";
-                    Function.Call(Hash.SET_TEXT_FONT, 7); // Pricedown
-                    Function.Call(Hash.SET_TEXT_SCALE, 0.0f, transactionTextScale);
-                    Function.Call(Hash.SET_TEXT_COLOUR, editingTransaction ? 255 : 224, editingTransaction ? 255 : 64, editingTransaction ? 0 : 64, 255);
-                    Function.Call(Hash.SET_TEXT_RIGHT_JUSTIFY, true);
-                    Function.Call(Hash.SET_TEXT_WRAP, 0.0f, 0.985f);
-                    Function.Call(Hash.BEGIN_TEXT_COMMAND_DISPLAY_TEXT, "STRING");
-                    Function.Call(Hash.ADD_TEXT_COMPONENT_SUBSTRING_PLAYER_NAME, text);
-                    Function.Call(Hash.END_TEXT_COMMAND_DISPLAY_TEXT, 0.985f, 0.06f);
+                    string currentField = activeResizerFields[resizerFieldIndex];
+                    if (currentField.StartsWith("Stats"))
+                    {
+                        DrawElementHighlight(UIElement.StatsPanel);
+                    }
+                    else if (currentField == "Description Text")
+                    {
+                        DrawElementHighlight(UIElement.Description);
+                    }
+                    else if (currentField == "Arrow Sprite")
+                    {
+                        DrawElementHighlight(UIElement.ScrollArrows);
+                    }
                 }
 
-                // Draw ticks (sprites) - they'll be tinted based on current edit mode
-                if (visibleMenu != null)
+                // Draw debug panel on right side
+                float rightX = 0.72f;
+                float startY = 0.12f;
+                float lineHeight = 0.022f;
+                float panelWidth = 0.26f;
+                float panelHeight = lineHeight * (activeResizerFields.Count + 2) + 0.02f;
+
+                Function.Call(Hash.DRAW_RECT, rightX + panelWidth / 2f - 0.01f, startY + panelHeight / 2f - 0.01f, panelWidth, panelHeight, 0, 0, 0, 200);
+
+                DrawDebugText("RESIZER", rightX, startY, 255, 255, 0);
+                DrawDebugText("U/D=field, L/R=adjust, X=log, B=back", rightX, startY + lineHeight, 180, 180, 180);
+
+                for (int i = 0; i < activeResizerFields.Count; i++)
                 {
-                    DrawTicks(visibleMenu);
-                    DrawCustomDescription(visibleMenu);
+                    string field = activeResizerFields[i];
+                    float value = GetResizerValue(field);
+                    string prefix = (i == resizerFieldIndex) ? "> " : "  ";
+                    string text = $"{prefix}{field}: {value:F3}";
+                    // Selected item in bright yellow
+                    int r = (i == resizerFieldIndex) ? 255 : 200;
+                    int g = (i == resizerFieldIndex) ? 255 : 200;
+                    int b = (i == resizerFieldIndex) ? 0 : 200;
+                    DrawDebugText(text, rightX, startY + lineHeight * (2 + i), r, g, b);
                 }
 
-                // Draw debug overlay showing current field and scale
-                float currentScale = GetCurrentDebugScale(currentFieldName);
-                string debugText = $"~y~Editing: {currentFieldName}~w~  Scale: {currentScale:F2}  (D-Pad: L/R=field, U/D=size, B=exit)";
-                GTA.UI.Screen.ShowSubtitle(debugText, 1);
-
-                // Skip normal input handling
                 return;
             }
 
             // Sprite Browser debug mode
             if (activeDebugMode == DebugMode.SpriteBrowser)
             {
+                // Skip all processing if in game input mode (should have returned earlier, but safety check)
+                if (debugGameInputMode) return;
+
                 foreach (var obj in menuPool)
                 {
                     if (obj is NativeMenu menu)
                         menu.AcceptsInput = false;
                 }
 
-                // B goes back to debug menu
-                if (Game.IsControlJustPressed(GTA.Control.FrontendCancel))
+                // B goes back to debug menu (only if not in game input mode)
+                if (!debugGameInputMode && !debugBlockBButton && Game.IsControlJustPressed(GTA.Control.FrontendCancel))
                 {
                     activeDebugMode = DebugMode.Menu;
                     return;
@@ -3509,47 +5625,228 @@ namespace ExtendedLSC
             // Menu Position debug mode
             if (activeDebugMode == DebugMode.MenuPosition)
             {
+                // Skip all processing if in game input mode (should have returned earlier, but safety check)
+                if (debugGameInputMode) return;
+
+                // Disable all input
                 foreach (var obj in menuPool)
                 {
                     if (obj is NativeMenu menu)
                         menu.AcceptsInput = false;
                 }
+                Game.DisableControlThisFrame(GTA.Control.FrontendCancel);
+                Game.DisableControlThisFrame(GTA.Control.VehicleAccelerate);
+                Game.DisableControlThisFrame(GTA.Control.VehicleBrake);
+                Game.DisableControlThisFrame(GTA.Control.VehicleMoveLeftRight);
+                Game.DisableControlThisFrame(GTA.Control.VehicleMoveUpDown);
+                Game.DisableControlThisFrame(GTA.Control.VehicleHandbrake);
+                Game.DisableControlThisFrame(GTA.Control.VehicleExit);
 
-                // B goes back to debug menu
-                if (Game.IsControlJustPressed(GTA.Control.FrontendCancel))
+                // B goes back to debug menu (only if not in game input mode)
+                if (!debugGameInputMode && !debugBlockBButton && Game.IsControlJustPressed(GTA.Control.FrontendCancel))
                 {
+                    LogMenuPositionValues();
                     activeDebugMode = DebugMode.Menu;
                     return;
                 }
-                Game.DisableControlThisFrame(GTA.Control.FrontendCancel);
 
-                // D-pad to move menu
-                var offset = mainMenu.Offset;
-                float step = 5f;
-                if (Game.IsControlPressed(GTA.Control.FrontendUp)) offset.Y -= step;
-                if (Game.IsControlPressed(GTA.Control.FrontendDown)) offset.Y += step;
-                if (Game.IsControlPressed(GTA.Control.FrontendLeft)) offset.X -= step;
-                if (Game.IsControlPressed(GTA.Control.FrontendRight)) offset.X += step;
-                mainMenu.Offset = offset;
+                // LB/RB to cycle through UI elements
+                if (Game.IsControlJustPressed(GTA.Control.FrontendLb))
+                    selectedUIElement = (UIElement)(((int)selectedUIElement - 1 + uiElementNames.Length) % uiElementNames.Length);
+                if (Game.IsControlJustPressed(GTA.Control.FrontendRb))
+                    selectedUIElement = (UIElement)(((int)selectedUIElement + 1) % uiElementNames.Length);
+
+                // Y to toggle position/scale mode
+                if (Game.IsControlJustPressed(GTA.Control.FrontendY))
+                {
+                    menuPositionScaleMode = !menuPositionScaleMode;
+                    ShowNotification(menuPositionScaleMode ? "~y~SCALE MODE" : "~g~POSITION MODE");
+                }
+
+                // Right stick Y-axis to adjust speed (up = faster, down = slower)
+                // Control 2 = Right Stick Y in input group 0
+                // Use GET_DISABLED_CONTROL_NORMAL to read even when controls are disabled
+                float rsY = Function.Call<float>(Hash.GET_DISABLED_CONTROL_NORMAL, 0, 2);
+
+                if (Math.Abs(rsY) > 0.3f)
+                {
+                    // rsY is negative when pushing up, positive when pushing down
+                    if (rsY < -0.3f) // Pushing up = faster
+                        menuPositionSpeed = Math.Min(5f, menuPositionSpeed + 0.02f);
+                    else if (rsY > 0.3f) // Pushing down = slower
+                        menuPositionSpeed = Math.Max(0.1f, menuPositionSpeed - 0.02f);
+                }
+
+                // L3 to toggle uniform scaling (both axes together)
+                if (Game.IsControlJustPressed(GTA.Control.ScriptRLeft) || Game.IsControlJustPressed(GTA.Control.FrontendLs))
+                {
+                    menuPositionUniformScale = !menuPositionUniformScale;
+                    ShowNotification(menuPositionUniformScale ? "~g~UNIFORM SCALE (both axes)" : "~y~INDEPENDENT SCALE (per axis)");
+                }
+
+                // D-pad to move/scale selected element
+                float baseStep = 0.001f * menuPositionSpeed;
+                float scaleStep = 0.01f * menuPositionSpeed;
+                float menuStep = 5f * menuPositionSpeed;  // Menu uses pixel-based offset
+                bool up = Game.IsControlPressed(GTA.Control.FrontendUp);
+                bool down = Game.IsControlPressed(GTA.Control.FrontendDown);
+                bool left = Game.IsControlPressed(GTA.Control.FrontendLeft);
+                bool right = Game.IsControlPressed(GTA.Control.FrontendRight);
+
+                if (menuPositionScaleMode)
+                {
+                    // Scale mode: uniform = all directions scale both, independent = up/down=H, left/right=W
+                    float scaleChange = 0f;
+                    if (menuPositionUniformScale)
+                    {
+                        // Any direction scales both axes
+                        if (up || left) scaleChange = -scaleStep;
+                        if (down || right) scaleChange = scaleStep;
+                    }
+
+                    switch (selectedUIElement)
+                    {
+                        case UIElement.Menu:
+                            // Menu doesn't have scale (it's LemonUI controlled)
+                            break;
+                        case UIElement.ScrollArrows:
+                            if (menuPositionUniformScale)
+                            {
+                                scrollArrowsScaleW += scaleChange;
+                                scrollArrowsScaleH += scaleChange;
+                            }
+                            else
+                            {
+                                if (up) scrollArrowsScaleH -= scaleStep;
+                                if (down) scrollArrowsScaleH += scaleStep;
+                                if (left) scrollArrowsScaleW -= scaleStep;
+                                if (right) scrollArrowsScaleW += scaleStep;
+                            }
+                            break;
+                        case UIElement.Description:
+                            if (menuPositionUniformScale)
+                            {
+                                descriptionScaleW += scaleChange;
+                                descriptionScaleH += scaleChange;
+                            }
+                            else
+                            {
+                                if (up) descriptionScaleH -= scaleStep;
+                                if (down) descriptionScaleH += scaleStep;
+                                if (left) descriptionScaleW -= scaleStep;
+                                if (right) descriptionScaleW += scaleStep;
+                            }
+                            break;
+                        case UIElement.StatsPanel:
+                            if (menuPositionUniformScale)
+                            {
+                                statsPanelScaleW += scaleChange;
+                                statsPanelScaleH += scaleChange;
+                            }
+                            else
+                            {
+                                if (up) statsPanelScaleH -= scaleStep;
+                                if (down) statsPanelScaleH += scaleStep;
+                                if (left) statsPanelScaleW -= scaleStep;
+                                if (right) statsPanelScaleW += scaleStep;
+                            }
+                            break;
+                    }
+                }
+                else
+                {
+                    // Position mode
+                    switch (selectedUIElement)
+                    {
+                        case UIElement.Menu:
+                            var offset = mainMenu.Offset;
+                            if (up) offset.Y -= menuStep;
+                            if (down) offset.Y += menuStep;
+                            if (left) offset.X -= menuStep;
+                            if (right) offset.X += menuStep;
+                            mainMenu.Offset = offset;
+                            break;
+                        case UIElement.ScrollArrows:
+                            if (up) scrollArrowsOffsetY -= baseStep;
+                            if (down) scrollArrowsOffsetY += baseStep;
+                            if (left) scrollArrowsOffsetX -= baseStep;
+                            if (right) scrollArrowsOffsetX += baseStep;
+                            break;
+                        case UIElement.Description:
+                            if (up) descriptionOffsetY -= baseStep;
+                            if (down) descriptionOffsetY += baseStep;
+                            if (left) descriptionOffsetX -= baseStep;
+                            if (right) descriptionOffsetX += baseStep;
+                            break;
+                        case UIElement.StatsPanel:
+                            if (up) statsPanelOffsetY -= baseStep;
+                            if (down) statsPanelOffsetY += baseStep;
+                            if (left) statsPanelOffsetX -= baseStep;
+                            if (right) statsPanelOffsetX += baseStep;
+                            break;
+                    }
+                }
+
+                // X to log
+                if (Game.IsControlJustPressed(GTA.Control.FrontendX))
+                {
+                    LogMenuPositionValues();
+                    ShowNotification("~g~Position values logged");
+                }
 
                 menuPool.Process();
                 DrawCustomBanner();
 
-                GTA.UI.Screen.ShowSubtitle($"~y~Menu Position~w~ - D-Pad to move | Offset: ({offset.X:F0}, {offset.Y:F0}) | B=back", 1);
+                // Draw yellow highlight around selected element
+                DrawElementHighlight(selectedUIElement);
+
+                // Draw debug panel
+                float rightX = 0.72f;
+                float startY = 0.12f;
+                float lineHeight = 0.022f;
+
+                Function.Call(Hash.DRAW_RECT, rightX + 0.12f, startY + 0.13f, 0.26f, 0.28f, 0, 0, 0, 200);
+
+                string modeStr = menuPositionScaleMode ? "SCALE" : "POSITION";
+                string uniformStr = menuPositionUniformScale ? "Uniform" : "Independent";
+                DrawDebugText($"MENU {modeStr} (Y=toggle)", rightX, startY, 255, 255, 0);
+                DrawDebugText($"Speed: {menuPositionSpeed:F2}x (RS up/down)", rightX, startY + lineHeight, 180, 180, 180);
+                if (menuPositionScaleMode)
+                    DrawDebugText($"Axis: {uniformStr} (L3=toggle)", rightX, startY + lineHeight * 2, 180, 180, 180);
+                else
+                    DrawDebugText("LB/RB=element, D-Pad=move", rightX, startY + lineHeight * 2, 150, 150, 150);
+                DrawDebugText("X=log, B=back", rightX, startY + lineHeight * 3, 150, 150, 150);
+
+                for (int i = 0; i < uiElementNames.Length; i++)
+                {
+                    string prefix = (i == (int)selectedUIElement) ? "> " : "  ";
+                    string offsetStr = GetElementOffsetString((UIElement)i);
+                    string scaleStr = GetElementScaleString((UIElement)i);
+                    string text = $"{prefix}{uiElementNames[i]}: {offsetStr}";
+                    if (i > 0) text += $" | {scaleStr}";  // Menu doesn't have scale
+                    int r = (i == (int)selectedUIElement) ? 255 : 200;
+                    int g = (i == (int)selectedUIElement) ? 255 : 200;
+                    int b = (i == (int)selectedUIElement) ? 0 : 200;
+                    DrawDebugText(text, rightX, startY + lineHeight * (4 + i), r, g, b);
+                }
+
                 return;
             }
 
             // Input Timing debug mode
             if (activeDebugMode == DebugMode.InputTiming)
             {
+                // Skip all processing if in game input mode (should have returned earlier, but safety check)
+                if (debugGameInputMode) return;
+
                 foreach (var obj in menuPool)
                 {
                     if (obj is NativeMenu menu)
                         menu.AcceptsInput = false;
                 }
 
-                // B goes back to debug menu
-                if (Game.IsControlJustPressed(GTA.Control.FrontendCancel))
+                // B goes back to debug menu (only if not in game input mode)
+                if (!debugGameInputMode && !debugBlockBButton && Game.IsControlJustPressed(GTA.Control.FrontendCancel))
                 {
                     activeDebugMode = DebugMode.Menu;
                     return;
@@ -3598,8 +5895,129 @@ namespace ExtendedLSC
                 return;
             }
 
+            // Stats Calibration debug mode
+            if (activeDebugMode == DebugMode.StatsCalibration)
+            {
+                // Skip all processing if in game input mode (should have returned earlier, but safety check)
+                if (debugGameInputMode) return;
+
+                foreach (var obj in menuPool)
+                {
+                    if (obj is NativeMenu menu)
+                        menu.AcceptsInput = false;
+                }
+
+                // B goes back to debug menu (only if not in game input mode)
+                if (!debugGameInputMode && !debugBlockBButton && Game.IsControlJustPressed(GTA.Control.FrontendCancel))
+                {
+                    // Log final values before exiting
+                    LogStatsCalibrationValues();
+                    activeDebugMode = DebugMode.Menu;
+                    return;
+                }
+                Game.DisableControlThisFrame(GTA.Control.FrontendCancel);
+
+                // U/D to cycle settings (8 total: 4 stats x 2 values each)
+                if (Game.IsControlJustPressed(GTA.Control.FrontendUp))
+                    statsCalibrationSetting = (statsCalibrationSetting - 1 + 8) % 8;
+                if (Game.IsControlJustPressed(GTA.Control.FrontendDown))
+                    statsCalibrationSetting = (statsCalibrationSetting + 1) % 8;
+
+                // L/R to adjust values
+                float divStep = 1f;
+                float multStep = 0.01f;
+                bool isDiv = (statsCalibrationSetting % 2 == 0);  // Even = divisor, Odd = multiplier
+
+                if (Game.IsControlJustPressed(GTA.Control.FrontendLeft))
+                {
+                    switch (statsCalibrationSetting)
+                    {
+                        case 0: statsTopSpeedDiv = Math.Max(1f, statsTopSpeedDiv - divStep); break;
+                        case 1: statsTopSpeedMult = Math.Max(0.1f, statsTopSpeedMult - multStep); break;
+                        case 2: statsAccelDiv = Math.Max(0.01f, statsAccelDiv - 0.01f); break;
+                        case 3: statsAccelMult = Math.Max(0.1f, statsAccelMult - multStep); break;
+                        case 4: statsBrakingDiv = Math.Max(0.1f, statsBrakingDiv - 0.1f); break;
+                        case 5: statsBrakingMult = Math.Max(0.1f, statsBrakingMult - multStep); break;
+                        case 6: statsTractionDiv = Math.Max(0.1f, statsTractionDiv - 0.1f); break;
+                        case 7: statsTractionMult = Math.Max(0.1f, statsTractionMult - multStep); break;
+                    }
+                }
+                if (Game.IsControlJustPressed(GTA.Control.FrontendRight))
+                {
+                    switch (statsCalibrationSetting)
+                    {
+                        case 0: statsTopSpeedDiv += divStep; break;
+                        case 1: statsTopSpeedMult = Math.Min(1f, statsTopSpeedMult + multStep); break;
+                        case 2: statsAccelDiv += 0.01f; break;
+                        case 3: statsAccelMult = Math.Min(1f, statsAccelMult + multStep); break;
+                        case 4: statsBrakingDiv += 0.1f; break;
+                        case 5: statsBrakingMult = Math.Min(1f, statsBrakingMult + multStep); break;
+                        case 6: statsTractionDiv += 0.1f; break;
+                        case 7: statsTractionMult = Math.Min(1f, statsTractionMult + multStep); break;
+                    }
+                }
+
+                // X button to log current values
+                if (Game.IsControlJustPressed(GTA.Control.FrontendX))
+                {
+                    LogStatsCalibrationValues();
+                    ShowNotification("~g~Stats values logged to console");
+                }
+
+                menuPool.Process();
+                DrawCustomBanner();
+
+                // Get current raw values for display
+                float rawTopSpeed = 0f, rawAccel = 0f, rawBraking = 0f, rawTraction = 0f;
+                if (currentVehicle != null && currentVehicle.Exists())
+                {
+                    rawTopSpeed = Function.Call<float>(Hash.GET_VEHICLE_ESTIMATED_MAX_SPEED, currentVehicle);
+                    rawAccel = Function.Call<float>(Hash.GET_VEHICLE_ACCELERATION, currentVehicle);
+                    rawBraking = Function.Call<float>(Hash.GET_VEHICLE_MAX_BRAKING, currentVehicle);
+                    rawTraction = Function.Call<float>(Hash.GET_VEHICLE_MAX_TRACTION, currentVehicle);
+                }
+
+                // Draw debug panel on right side of screen using native text (avoids subtitle flashing)
+                float rightX = 0.75f;  // Right side of screen
+                float startY = 0.15f;
+                float lineHeight = 0.025f;
+                float panelWidth = 0.22f;
+                float panelHeight = lineHeight * 12 + 0.02f;
+
+                // Draw background panel
+                Function.Call(Hash.DRAW_RECT, rightX + panelWidth / 2f - 0.01f, startY + panelHeight / 2f - 0.01f, panelWidth, panelHeight, 0, 0, 0, 180);
+
+                // Draw title
+                DrawDebugText("STATS CALIBRATION", rightX, startY, 255, 255, 0);
+                DrawDebugText("U/D=setting, L/R=adjust, X=log, B=back", rightX, startY + lineHeight, 200, 200, 200);
+                DrawDebugText($"Raw: Spd={rawTopSpeed:F1} Acc={rawAccel:F3} Brk={rawBraking:F2} Trc={rawTraction:F2}", rightX, startY + lineHeight * 2, 180, 180, 180);
+
+                float[] values = { statsTopSpeedDiv, statsTopSpeedMult, statsAccelDiv, statsAccelMult, statsBrakingDiv, statsBrakingMult, statsTractionDiv, statsTractionMult };
+                for (int i = 0; i < 8; i++)
+                {
+                    string format = (i % 2 == 0) ? "F1" : "F2";
+                    if (i == 2 || i == 3) format = "F2";
+                    string prefix = (i == statsCalibrationSetting) ? "> " : "  ";
+                    string text = prefix + statsCalibrationNames[i] + ": " + values[i].ToString(format);
+                    int r = (i == statsCalibrationSetting) ? 100 : 255;
+                    int g = 255;
+                    int b = (i == statsCalibrationSetting) ? 100 : 255;
+                    DrawDebugText(text, rightX, startY + lineHeight * (3 + i), r, g, b);
+                }
+                return;
+            }
+
             // Debug: Log controller input (only when not editing)
             DebugLogControllerInput();
+
+            // Handle button mapping for manual transmission (runs even in menu)
+            HandleButtonMapping();
+
+            // Update manual transmission when driving (not in menu)
+            if (!isMenuActive)
+            {
+                UpdateManualTransmission();
+            }
 
             // Handle custom menu input with native GTA-style acceleration
             HandleMenuInput();
@@ -3613,9 +6031,21 @@ namespace ExtendedLSC
             DrawSpriteBrowser();
 
             // Keep handbrake on while menu is active (allows rev with just RT)
+            // Keep handbrake on while menu is active (allows rev with just RT)
             if (isMenuActive && currentVehicle != null && currentVehicle.Exists() && !isWalkAroundActive)
             {
                 Function.Call(Hash.SET_VEHICLE_HANDBRAKE, currentVehicle, true);
+
+                // Continuously apply lights that get reset by game each frame
+                if (currentLightMode == 2) // High Beams
+                {
+                    Function.Call(Hash.SET_VEHICLE_LIGHTS, currentVehicle, 3);
+                    Function.Call(Hash.SET_VEHICLE_FULLBEAM, currentVehicle, true);
+                }
+                else if (currentLightMode == 6) // Brake Lights
+                {
+                    Function.Call(Hash.SET_VEHICLE_BRAKE_LIGHTS, currentVehicle, true);
+                }
 
                 // Show RPM when revving (outside camera mode)
                 if (ModSettings.ShowRPMWhileRevving)
@@ -3644,8 +6074,8 @@ namespace ExtendedLSC
             if (cameraModeCooldown > 0)
                 cameraModeCooldown--;
 
-            // Controller input for walk-around (Y button) - only when menu is open
-            if (isMenuActive && !isWalkAroundActive && cameraModeCooldown == 0)
+            // Controller input for walk-around (Y button) - only when menu is open and custom camera enabled
+            if (ModSettings.CustomCamera && isMenuActive && !isWalkAroundActive && cameraModeCooldown == 0)
             {
                 if (Game.IsControlJustPressed(GTA.Control.VehicleExit)) // Y button
                 {
@@ -3733,12 +6163,53 @@ namespace ExtendedLSC
 
         private void OnKeyDown(object sender, KeyEventArgs e)
         {
+            // Manual transmission key binding capture
+            if (mtBindingState > 0)
+            {
+                // Cancel on Escape
+                if (e.KeyCode == Keys.Escape)
+                {
+                    mtBindingState = 0;
+                    mtBindingItem = null;
+                    ShowNotification("~r~Manual Transmission setup cancelled");
+                    return;
+                }
+
+                // Don't allow binding Enter/Return (used to activate menu items)
+                if (e.KeyCode == Keys.Enter || e.KeyCode == Keys.Return)
+                {
+                    return;
+                }
+
+                if (mtBindingState == 1)
+                {
+                    // Binding shift up
+                    ModSettings.ShiftUpKey = e.KeyCode;
+                    mtBindingState = 2;
+                }
+                else if (mtBindingState == 2)
+                {
+                    // Binding shift down - complete the setup
+                    ModSettings.ShiftDownKey = e.KeyCode;
+                    ModSettings.Save();
+                    FinishMTBinding();
+                }
+                return;
+            }
+
             if (e.KeyCode == menuKey && !isMenuActive)
             {
                 TryOpenMenu();
             }
 
+            // Manual transmission shifting (when not in menu)
+            if (!isMenuActive)
+            {
+                HandleManualTransmissionKeyPress(e.KeyCode);
+            }
+
             // Debug Menu (F7 to open/close) - unified debug tool selector
+            // F7 resets values to defaults and exits, B just exits keeping current values
             if (e.KeyCode == Keys.F7 && isMenuActive)
             {
                 if (activeDebugMode == DebugMode.None)
@@ -3746,11 +6217,20 @@ namespace ExtendedLSC
                     // Open debug menu
                     activeDebugMode = DebugMode.Menu;
                     debugMenuSelection = 0;
-                    ShowNotification("~y~Debug Menu~w~ - D-Pad U/D: select, A: confirm, B: exit");
+                    ShowNotification("~y~Debug Menu~w~ - D-Pad: navigate, A: confirm, B: exit, F7: reset & exit");
                 }
                 else
                 {
-                    // Exit any debug mode
+                    // Reset all debug values to defaults
+                    transactionTextScale = 0.5f;
+                    descriptionTextScale = 0.35f;
+                    spriteScale = 1.8f;
+                    inputInitialDelay = 82;
+                    inputSlowRepeat = 255;
+                    inputFastRepeat = 83;
+                    inputAccelThreshold = 3;
+
+                    ShowNotification("~y~Debug values reset to defaults");
                     ExitDebugMode();
                 }
             }
@@ -3802,6 +6282,9 @@ namespace ExtendedLSC
 
         private void CloseMenu()
         {
+            // Don't actually close if we're just hiding for game input mode comparison
+            if (debugGameInputMode) return;
+
             // Exit camera mode if active
             if (isWalkAroundActive)
             {
@@ -4540,6 +7023,238 @@ namespace ExtendedLSC
         }
 
         /// <summary>
+        /// Draw debug text at a screen position (used for debug overlays that need to avoid subtitle conflicts)
+        /// </summary>
+        private void DrawDebugText(string text, float x, float y, int r = 255, int g = 255, int b = 255)
+        {
+            Function.Call(Hash.SET_TEXT_FONT, 0);
+            Function.Call(Hash.SET_TEXT_SCALE, 0.0f, 0.3f);
+            Function.Call(Hash.SET_TEXT_COLOUR, r, g, b, 255);
+            Function.Call(Hash.SET_TEXT_DROPSHADOW, 1, 0, 0, 0, 255);
+            Function.Call(Hash.BEGIN_TEXT_COMMAND_DISPLAY_TEXT, "STRING");
+            Function.Call(Hash.ADD_TEXT_COMPONENT_SUBSTRING_PLAYER_NAME, text);
+            Function.Call(Hash.END_TEXT_COMMAND_DISPLAY_TEXT, x, y);
+        }
+
+        /// <summary>
+        /// Draw a 50% transparent yellow overlay on a UI element
+        /// </summary>
+        private void DrawElementHighlight(UIElement element)
+        {
+            var visibleMenu = GetVisibleMenu();
+            if (visibleMenu == null) return;
+
+            float screenW = GTA.UI.Screen.Width;
+            float screenH = GTA.UI.Screen.Height;
+            float aspectRatio = screenW / screenH;
+            float lemonXBase = 1080f * aspectRatio;
+            float lemonYBase = 1080f;
+
+            var bannerPos = visibleMenu.Banner.Position;
+            var bannerSize = visibleMenu.Banner.Size;
+
+            float menuLeftX = bannerPos.X / lemonXBase;
+            float menuTopY = bannerPos.Y / lemonYBase;
+            float menuWidth = bannerSize.Width / lemonXBase;
+            float bannerHeight = bannerSize.Height / lemonYBase;
+
+            int totalItems = visibleMenu.Items.Count;
+            int maxVisible = visibleMenu.MaxItems;
+            bool hasScrollIndicator = totalItems > maxVisible;
+
+            float subtitleHeight = 38f / lemonYBase;
+            float itemHeight = 38f / lemonYBase;
+            float visibleItemsHeight = itemHeight * Math.Min(totalItems, maxVisible);
+            float scrollIndicatorHeight = hasScrollIndicator ? 0.035f : 0f;
+
+            // 50% transparent yellow (128 alpha out of 255)
+            int yellow_r = 255, yellow_g = 255, yellow_b = 0, yellow_a = 128;
+
+            switch (element)
+            {
+                case UIElement.Menu:
+                    // Highlight entire menu with yellow overlay
+                    float menuTotalHeight = bannerHeight + subtitleHeight + visibleItemsHeight + (hasScrollIndicator ? scrollIndicatorHeight : 0f) + 0.05f;
+                    DrawHighlightOverlay(menuLeftX, menuTopY, menuWidth, menuTotalHeight, yellow_r, yellow_g, yellow_b, yellow_a);
+                    break;
+
+                case UIElement.ScrollArrows:
+                    if (hasScrollIndicator)
+                    {
+                        float arrowY = menuTopY + bannerHeight + subtitleHeight + visibleItemsHeight + scrollArrowsOffsetY;
+                        float arrowX = menuLeftX + scrollArrowsOffsetX;
+                        float arrowW = menuWidth * scrollArrowsScaleW;
+                        float arrowH = scrollIndicatorHeight * scrollArrowsScaleH;
+                        DrawHighlightOverlay(arrowX, arrowY, arrowW, arrowH, yellow_r, yellow_g, yellow_b, yellow_a);
+                    }
+                    break;
+
+                case UIElement.Description:
+                    float descY = menuTopY + bannerHeight + subtitleHeight + visibleItemsHeight + descriptionOffsetY;
+                    if (hasScrollIndicator) descY += scrollIndicatorHeight + 0.01f;
+                    float descX = menuLeftX + descriptionOffsetX;
+                    float descW = menuWidth * descriptionScaleW;
+                    float descH = GetDescriptionHeight(visibleMenu, menuWidth, menuLeftX);
+                    if (descH == 0f) descH = 0.045f * descriptionScaleH;
+                    DrawHighlightOverlay(descX, descY, descW, descH, yellow_r, yellow_g, yellow_b, yellow_a);
+                    break;
+
+                case UIElement.StatsPanel:
+                    float statsDescY = menuTopY + bannerHeight + subtitleHeight + visibleItemsHeight;
+                    if (hasScrollIndicator) statsDescY += scrollIndicatorHeight + 0.01f;
+                    float dynDescH = GetDescriptionHeight(visibleMenu, menuWidth, menuLeftX);
+                    if (dynDescH == 0f) dynDescH = 0.045f * descriptionScaleH;
+                    float statsY = statsDescY + dynDescH + descriptionOffsetY + 0.005f + statsPanelOffsetY;
+                    float statsX = menuLeftX + statsPanelOffsetX;
+                    float statsPanelW = menuWidth * statsPanelScaleW;
+                    float statsPanelH = (statsRowHeight * 4 + statsPanelPadding) * statsPanelScaleH;
+                    DrawHighlightOverlay(statsX, statsY, statsPanelW, statsPanelH, yellow_r, yellow_g, yellow_b, yellow_a);
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// Draw a filled semi-transparent rectangle overlay
+        /// </summary>
+        private void DrawHighlightOverlay(float x, float y, float width, float height, int r, int g, int b, int a)
+        {
+            float centerX = x + width / 2f;
+            float centerY = y + height / 2f;
+            Function.Call(Hash.DRAW_RECT, centerX, centerY, width, height, r, g, b, a);
+        }
+
+        /// <summary>
+        /// Get current value for a resizer field
+        /// </summary>
+        private float GetResizerValue(string fieldName)
+        {
+            switch (fieldName)
+            {
+                case "Transaction Text": return transactionTextScale;
+                case "Sprite Scale": return spriteScale;
+                case "Arrow Sprite": return arrowSpriteScale;
+                case "Description Text": return descriptionTextScale;
+                case "Stats Row Height": return statsRowHeight;
+                case "Stats Bar Height": return statsSegmentHeight;
+                case "Stats Bar Gap": return statsSegmentGap;
+                case "Stats Label Scale": return statsLabelScale;
+                case "Stats Padding": return statsPanelPadding;
+                case "Stats Content Y": return statsContentOffsetY;
+                case "Stats Bar Inset": return statsBarInset;
+                case "Stats Text Left": return statsTextLeftPadding;
+                case "Stats Bar Y": return statsBarOffsetY;
+                default: return 0f;
+            }
+        }
+
+        /// <summary>
+        /// Log all resizer values to debug log
+        /// </summary>
+        private void LogResizerValues()
+        {
+            string log = "\n========== RESIZER VALUES ==========\n";
+            log += $"transactionTextScale = {transactionTextScale:F3}f;\n";
+            log += $"descriptionTextScale = {descriptionTextScale:F3}f;\n";
+            log += $"spriteScale = {spriteScale:F2}f;\n";
+            log += $"arrowSpriteScale = {arrowSpriteScale:F2}f;\n";
+            log += $"statsRowHeight = {statsRowHeight:F4}f;\n";
+            log += $"statsSegmentHeight = {statsSegmentHeight:F4}f;\n";
+            log += $"statsSegmentGap = {statsSegmentGap:F4}f;\n";
+            log += $"statsLabelScale = {statsLabelScale:F3}f;\n";
+            log += $"statsPanelPadding = {statsPanelPadding:F4}f;\n";
+            log += $"statsContentOffsetY = {statsContentOffsetY:F4}f;\n";
+            log += $"statsBarInset = {statsBarInset:F4}f;\n";
+            log += $"statsTextLeftPadding = {statsTextLeftPadding:F4}f;\n";
+            log += $"statsBarOffsetY = {statsBarOffsetY:F4}f;\n";
+            log += "=====================================\n";
+
+            System.IO.File.AppendAllText("scripts/ExtendedLSC_debug.log", log);
+        }
+
+        /// <summary>
+        /// Get offset string for a UI element
+        /// </summary>
+        private string GetElementOffsetString(UIElement element)
+        {
+            switch (element)
+            {
+                case UIElement.Menu: return $"({mainMenu.Offset.X:F0}, {mainMenu.Offset.Y:F0})";
+                case UIElement.ScrollArrows: return $"({scrollArrowsOffsetX:F3}, {scrollArrowsOffsetY:F3})";
+                case UIElement.Description: return $"({descriptionOffsetX:F3}, {descriptionOffsetY:F3})";
+                case UIElement.StatsPanel: return $"({statsPanelOffsetX:F3}, {statsPanelOffsetY:F3})";
+                default: return "(0, 0)";
+            }
+        }
+
+        private string GetElementScaleString(UIElement element)
+        {
+            switch (element)
+            {
+                case UIElement.Menu: return "N/A";
+                case UIElement.ScrollArrows: return $"W:{scrollArrowsScaleW:F2} H:{scrollArrowsScaleH:F2}";
+                case UIElement.Description: return $"W:{descriptionScaleW:F2} H:{descriptionScaleH:F2}";
+                case UIElement.StatsPanel: return $"W:{statsPanelScaleW:F2} H:{statsPanelScaleH:F2}";
+                default: return "N/A";
+            }
+        }
+
+        /// <summary>
+        /// Log all menu position values to debug log
+        /// </summary>
+        private void LogMenuPositionValues()
+        {
+            string log = "\n========== MENU POSITION VALUES ==========\n";
+            log += $"// Menu (LemonUI pixel offset)\n";
+            log += $"mainMenu.Offset = new PointF({mainMenu.Offset.X:F0}f, {mainMenu.Offset.Y:F0}f);\n\n";
+            log += $"// Scroll Arrows (normalized screen coords)\n";
+            log += $"scrollArrowsOffsetX = {scrollArrowsOffsetX:F4}f;\n";
+            log += $"scrollArrowsOffsetY = {scrollArrowsOffsetY:F4}f;\n";
+            log += $"scrollArrowsScaleW = {scrollArrowsScaleW:F2}f;\n";
+            log += $"scrollArrowsScaleH = {scrollArrowsScaleH:F2}f;\n\n";
+            log += $"// Description (normalized screen coords)\n";
+            log += $"descriptionOffsetX = {descriptionOffsetX:F4}f;\n";
+            log += $"descriptionOffsetY = {descriptionOffsetY:F4}f;\n";
+            log += $"descriptionScaleW = {descriptionScaleW:F2}f;\n";
+            log += $"descriptionScaleH = {descriptionScaleH:F2}f;\n\n";
+            log += $"// Stats Panel (normalized screen coords)\n";
+            log += $"statsPanelOffsetX = {statsPanelOffsetX:F4}f;\n";
+            log += $"statsPanelOffsetY = {statsPanelOffsetY:F4}f;\n";
+            log += $"statsPanelScaleW = {statsPanelScaleW:F2}f;\n";
+            log += $"statsPanelScaleH = {statsPanelScaleH:F2}f;\n";
+            log += "===========================================\n";
+
+            System.IO.File.AppendAllText("scripts/ExtendedLSC_debug.log", log);
+        }
+
+        /// <summary>
+        /// Log stats calibration values for copy/paste into code
+        /// </summary>
+        private void LogStatsCalibrationValues()
+        {
+            float rawTopSpeed = 0f, rawAccel = 0f, rawBraking = 0f, rawTraction = 0f;
+            if (currentVehicle != null && currentVehicle.Exists())
+            {
+                rawTopSpeed = Function.Call<float>(Hash.GET_VEHICLE_ESTIMATED_MAX_SPEED, currentVehicle);
+                rawAccel = Function.Call<float>(Hash.GET_VEHICLE_ACCELERATION, currentVehicle);
+                rawBraking = Function.Call<float>(Hash.GET_VEHICLE_MAX_BRAKING, currentVehicle);
+                rawTraction = Function.Call<float>(Hash.GET_VEHICLE_MAX_TRACTION, currentVehicle);
+            }
+
+            string log = "\n========== STATS CALIBRATION VALUES ==========\n";
+            log += $"Vehicle: {currentVehicle?.DisplayName ?? "None"}\n";
+            log += $"Raw Values: TopSpeed={rawTopSpeed:F2}, Accel={rawAccel:F4}, Braking={rawBraking:F3}, Traction={rawTraction:F3}\n\n";
+            log += "// Copy these values to DrawVehicleStats:\n";
+            log += $"float topSpeedPct = (float)Math.Sqrt(Math.Min(1f, topSpeed / {statsTopSpeedDiv:F1}f)) * {statsTopSpeedMult:F2}f;\n";
+            log += $"float accelPct = (float)Math.Sqrt(Math.Min(1f, acceleration / {statsAccelDiv:F2}f)) * {statsAccelMult:F2}f;\n";
+            log += $"float brakingPct = (float)Math.Sqrt(Math.Min(1f, braking / {statsBrakingDiv:F1}f)) * {statsBrakingMult:F2}f;\n";
+            log += $"float tractionPct = (float)Math.Sqrt(Math.Min(1f, traction / {statsTractionDiv:F1}f)) * {statsTractionMult:F2}f;\n";
+            log += "===============================================\n";
+
+            System.IO.File.AppendAllText("scripts/ExtendedLSC_debug.log", log);
+            GTA.UI.Notification.Show("~g~Stats calibration logged to ExtendedLSC_debug.log");
+        }
+
+        /// <summary>
         /// Get the player's current cash
         /// </summary>
         private int GetPlayerCash()
@@ -4876,6 +7591,238 @@ namespace ExtendedLSC
                 Log($"[INPUT] Cover (RB) control PRESSED");
             if (contextPressed && Game.IsControlJustPressed(GTA.Control.Context))
                 Log($"[INPUT] Context control PRESSED");
+        }
+
+        #endregion
+
+        #region Manual Transmission Methods
+
+        // =========================================================================
+        // ELSC Built-in Manual Transmission
+        // Our own implementation using direct memory access - no external dependencies
+        // =========================================================================
+
+        /// <summary>
+        /// Check if manual transmission is available (ELSC built-in)
+        /// </summary>
+        private bool HasManualTransmission(Vehicle vehicle) => ELSCTransmission.IsAvailable;
+
+        /// <summary>
+        /// Enable manual transmission for current vehicle
+        /// </summary>
+        private bool PurchaseManualTransmission(Vehicle vehicle)
+        {
+            if (!ELSCTransmission.IsAvailable) return false;
+            elscTransmission.SetVehicle(vehicle);
+            elscTransmission.Enable();
+            return true;
+        }
+
+        /// <summary>
+        /// Update manual transmission state each tick
+        /// </summary>
+        private void UpdateManualTransmission()
+        {
+            Ped player = Game.Player.Character;
+            if (player == null || !player.IsInVehicle())
+            {
+                if (elscTransmission.IsEnabled)
+                {
+                    elscTransmission.Disable();
+                    lastTransmissionVehicle = null;
+                }
+                return;
+            }
+
+            Vehicle vehicle = player.CurrentVehicle;
+            if (vehicle == null || !vehicle.Exists()) return;
+
+            // Check if vehicle changed
+            if (vehicle != lastTransmissionVehicle)
+            {
+                lastTransmissionVehicle = vehicle;
+
+                // Check if this vehicle has MT purchased - auto-enable if so
+                if (VehicleSaveData.IsManualTransmissionOwned(vehicle.DisplayName))
+                {
+                    elscTransmission.SetVehicle(vehicle);
+                    elscTransmission.Enable();
+                }
+                else if (elscTransmission.IsEnabled)
+                {
+                    // Vehicle doesn't have MT - disable
+                    elscTransmission.Disable();
+                }
+            }
+
+            // Update transmission state
+            if (elscTransmission.IsEnabled)
+            {
+                elscTransmission.Update();
+
+                // Draw HUD
+                transmissionHUD?.Draw(vehicle);
+            }
+        }
+
+        /// <summary>
+        /// Handle keyboard input for manual transmission
+        /// </summary>
+        private void HandleManualTransmissionKeyPress(Keys key)
+        {
+            if (!elscTransmission.IsEnabled) return;
+
+            // Use configurable key bindings from ModSettings
+            if (key == ModSettings.ShiftUpKey)
+            {
+                elscTransmission.ShiftUp();
+            }
+            else if (key == ModSettings.ShiftDownKey)
+            {
+                elscTransmission.ShiftDown();
+            }
+            else if (key == ModSettings.NeutralKey)
+            {
+                elscTransmission.ToggleNeutral();
+            }
+        }
+
+        /// <summary>
+        /// Check for controller button presses during MT key binding setup
+        /// </summary>
+        private void CheckControllerButtonBinding()
+        {
+            // Common controller buttons to check
+            var buttonsToCheck = new (GTA.Control control, string name)[]
+            {
+                (GTA.Control.FrontendAccept, "A"),
+                (GTA.Control.FrontendCancel, "B"),
+                (GTA.Control.FrontendX, "X"),
+                (GTA.Control.FrontendY, "Y"),
+                (GTA.Control.FrontendLb, "LB"),
+                (GTA.Control.FrontendRb, "RB"),
+                (GTA.Control.FrontendLt, "LT"),
+                (GTA.Control.FrontendRt, "RT"),
+                (GTA.Control.FrontendUp, "D-Up"),
+                (GTA.Control.FrontendDown, "D-Down"),
+                (GTA.Control.FrontendLeft, "D-Left"),
+                (GTA.Control.FrontendRight, "D-Right"),
+                (GTA.Control.FrontendLs, "L3"),
+                (GTA.Control.FrontendRs, "R3"),
+            };
+
+            // Check for B button to cancel
+            if (Game.IsControlJustPressed(GTA.Control.FrontendCancel))
+            {
+                mtBindingState = 0;
+                mtBindingItem = null;
+                ShowNotification("~r~Manual Transmission setup cancelled");
+                return;
+            }
+
+            foreach (var (control, name) in buttonsToCheck)
+            {
+                // Skip B button - it's used for cancel
+                if (control == GTA.Control.FrontendCancel) continue;
+
+                if (Game.IsControlJustPressed(control))
+                {
+                    int controlIndex = (int)control;
+
+                    if (mtBindingState == 1)
+                    {
+                        // Binding shift up
+                        ModSettings.ShiftUpButton = controlIndex;
+                        mtBindingState = 2;
+                    }
+                    else if (mtBindingState == 2)
+                    {
+                        // Binding shift down - complete the setup
+                        ModSettings.ShiftDownButton = controlIndex;
+                        ModSettings.Save();
+                        FinishMTBinding();
+                    }
+                    return;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Complete the manual transmission binding and update the menu item
+        /// </summary>
+        private void FinishMTBinding()
+        {
+            // Enable manual transmission
+            elscTransmission.SetVehicle(currentVehicle);
+            elscTransmission.Enable();
+
+            // Save to vehicle data so it persists across script reloads
+            if (currentVehicle != null && currentVehicle.Exists())
+            {
+                VehicleSaveData.SetManualTransmissionOwned(currentVehicle.DisplayName, true);
+                VehicleSaveData.Save();
+            }
+
+            // Update the menu item in place
+            if (mtBindingItem != null)
+            {
+                mtBindingItem.AltTitle = ""; // Empty - sprite shows instead
+                mtBindingItem.Description = $"Shift Up: {ModSettings.ShiftUpKey} | Shift Down: {ModSettings.ShiftDownKey} | Select to disable";
+                itemOwnershipStatus[mtBindingItem] = STATUS_INSTALLED;
+            }
+
+            mtBindingState = 0;
+            mtBindingItem = null;
+
+            ShowNotification("~g~Manual Transmission installed!");
+        }
+
+        /// <summary>
+        /// Get display name for a GTA control index
+        /// </summary>
+        private string GetControlName(int controlIndex)
+        {
+            return controlIndex switch
+            {
+                201 => "A",
+                202 => "B",
+                203 => "X",
+                204 => "Y",
+                205 => "LB",
+                206 => "RB",
+                207 => "LT",
+                208 => "RT",
+                187 => "D-Up",
+                188 => "D-Down",
+                189 => "D-Left",
+                190 => "D-Right",
+                216 => "L3",
+                217 => "R3",
+                _ => $"Button {controlIndex}"
+            };
+        }
+
+        /// <summary>
+        /// Handle controller input for manual transmission
+        /// </summary>
+        private void HandleButtonMapping()
+        {
+            if (!elscTransmission.IsEnabled) return;
+
+            // Use configured buttons (when not in menu)
+            if (!isMenuActive)
+            {
+                // Check shift up button
+                if (Game.IsControlJustPressed((GTA.Control)ModSettings.ShiftUpButton))
+                {
+                    elscTransmission.ShiftUp();
+                }
+                // Check shift down button
+                if (Game.IsControlJustPressed((GTA.Control)ModSettings.ShiftDownButton))
+                {
+                    elscTransmission.ShiftDown();
+                }
+            }
         }
 
         #endregion

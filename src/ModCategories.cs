@@ -18,19 +18,23 @@ namespace ExtendedLSC
         {
             public int Index { get; set; }
             public string DisplayName { get; set; }
+            public string SubMenuTitle { get; set; } // Title shown when submenu opens (if different from DisplayName)
             public string Description { get; set; }
             public bool IsBennys { get; set; }
             public bool IsToggle { get; set; }
             public bool IsSpecial { get; set; } // For Repair, Respray, Plate, Wheels
+            public bool NoStockOption { get; set; } // True for performance mods that don't show "Stock"
 
             public ModCategory(int index, string displayName, string description, bool isBennys = false, bool isToggle = false)
             {
                 Index = index;
                 DisplayName = displayName;
+                SubMenuTitle = displayName.ToUpper(); // Default to uppercase display name
                 Description = description;
                 IsBennys = isBennys;
                 IsToggle = isToggle;
                 IsSpecial = false;
+                NoStockOption = false;
             }
         }
 
@@ -43,14 +47,14 @@ namespace ExtendedLSC
         public static readonly ModCategory Frame = new ModCategory(5, "Roll Cage", "Roll cage and chassis options");
         public static readonly ModCategory Grille = new ModCategory(6, "Grille", "Front grille options");
         public static readonly ModCategory Hood = new ModCategory(7, "Hood", "Hood and bonnet options");
-        public static readonly ModCategory Fender = new ModCategory(8, "Fender", "Fender options");
-        public static readonly ModCategory RightFender = new ModCategory(9, "Fender (Right)", "Right fender options");
+        public static readonly ModCategory Fender = new ModCategory(8, "Fender", "Fender options") { SubMenuTitle = "FENDERS" };
+        public static readonly ModCategory RightFender = new ModCategory(9, "Fender (Right)", "Right fender options") { SubMenuTitle = "FENDERS (RIGHT)" };
         public static readonly ModCategory Roof = new ModCategory(10, "Roof", "Roof options");
-        public static readonly ModCategory Engine = new ModCategory(11, "Engine", "Engine performance upgrades");
-        public static readonly ModCategory Brakes = new ModCategory(12, "Brakes", "Brake performance upgrades");
-        public static readonly ModCategory Transmission = new ModCategory(13, "Transmission", "Transmission upgrades");
+        public static readonly ModCategory Engine = new ModCategory(11, "Engine", "Engine performance upgrades") { SubMenuTitle = "ENGINE TUNES", NoStockOption = true };
+        public static readonly ModCategory Brakes = new ModCategory(12, "Brakes", "Brake performance upgrades") { SubMenuTitle = "BRAKES", NoStockOption = true };
+        public static readonly ModCategory Transmission = new ModCategory(13, "Transmission", "Transmission upgrades") { SubMenuTitle = "TRANSMISSION", NoStockOption = true };
         public static readonly ModCategory Horn = new ModCategory(14, "Horn", "Horn sound options");
-        public static readonly ModCategory Suspension = new ModCategory(15, "Suspension", "Suspension upgrades");
+        public static readonly ModCategory Suspension = new ModCategory(15, "Suspension", "Suspension upgrades") { SubMenuTitle = "SUSPENSION", NoStockOption = true };
         public static readonly ModCategory Armor = new ModCategory(16, "Armor", "Vehicle armor upgrades");
         public static readonly ModCategory Turbo = new ModCategory(18, "Turbo", "Turbo tuning", false, true);
         public static readonly ModCategory XenonLights = new ModCategory(22, "Lights", "Xenon headlight upgrade", false, true);

@@ -43,6 +43,7 @@ namespace ExtendedLSC
             public bool HasTurbo { get; set; } = false;
             public bool HasXenon { get; set; } = false;
             public bool HasBulletproofTires { get; set; } = false;
+            public bool HasManualTransmission { get; set; } = false;
 
             // Custom config-based items: Key = category path (e.g. "Wheels/Tires/Tire Smoke"), Value = list of purchased item values
             public Dictionary<string, List<int>> PurchasedCustomItems { get; set; } = new Dictionary<string, List<int>>();
@@ -158,6 +159,24 @@ namespace ExtendedLSC
             if (_saveData == null) Load();
             vehicleName = vehicleName.ToLowerInvariant();
             EnsureVehicle(vehicleName).HasBulletproofTires = true;
+            _isDirty = true;
+        }
+
+        /// <summary>
+        /// Check if manual transmission has been purchased
+        /// </summary>
+        public static bool IsManualTransmissionOwned(string vehicleName)
+        {
+            if (_saveData == null) Load();
+            vehicleName = vehicleName.ToLowerInvariant();
+            return _saveData.Vehicles.TryGetValue(vehicleName, out var data) && data.HasManualTransmission;
+        }
+
+        public static void SetManualTransmissionOwned(string vehicleName, bool owned = true)
+        {
+            if (_saveData == null) Load();
+            vehicleName = vehicleName.ToLowerInvariant();
+            EnsureVehicle(vehicleName).HasManualTransmission = owned;
             _isDirty = true;
         }
 
