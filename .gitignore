@@ -10,3 +10,11 @@ obj/
 # Debug
 *.log
 integrated_mods/
+
+# Local backup copies
+ExtendedLSC-backup-*/
+ExtendedLSC_backup_/
+
+# Native ASI build artifacts (ASI is unused; source kept for reference)
+native/**/build/
+native/ScriptHookV_SDK/

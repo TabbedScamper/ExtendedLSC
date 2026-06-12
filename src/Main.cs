@@ -12,6 +12,7 @@ using LemonUI;
 using LemonUI.Menus;
 using LemonUI.Elements;
 using ExtendedLSC.ManualTransmission;
+using ExtendedLSC.WheelFitment;
 
 namespace ExtendedLSC
 {
@@ -469,6 +470,16 @@ namespace ExtendedLSC
         private TransmissionHUD transmissionHUD;
         private Vehicle lastTransmissionVehicle = null;
 
+        // ELSC Wheel Fitment (VStancer-style wheel adjustments)
+        private WheelFitment.WheelFitment wheelFitment = new WheelFitment.WheelFitment();
+        private Vehicle lastFitmentVehicle = null;
+        private bool _fitmentInitAllowed = true; // Disable if crashes occur
+        // Auto-applies saved stances to specific cars within range (even when not driving them).
+        private WheelFitment.VehicleStanceManager stanceManager = new WheelFitment.VehicleStanceManager();
+        private bool _stanceMgrInit = false;
+        // NFS-style drag gauge HUD (+ white-screen UI preview harness for design iteration).
+        private ManualTransmission.DragHUD dragHUD = new ManualTransmission.DragHUD();
+
         // Manual transmission key binding setup state
         private int mtBindingState = 0; // 0=none, 1=waiting for shift up, 2=waiting for shift down
         private NativeItem mtBindingItem = null; // Reference to the menu item to update after binding
@@ -562,6 +573,7 @@ namespace ExtendedLSC
         private int currentPresetIndex = -1;  // -1 = free roam
         private bool isInPresetMode = false;
         private bool isNavigatingMenu = false;  // Flag to prevent CloseMenu during menu navigation
+        private NativeMenu wheelFitmentParent = null; // Parent (Wheels) menu to restore when the fitment menu closes
         private List<ModCameraPreset> availablePresets = new List<ModCameraPreset>();
 
         // Custom menu input handling (native GTA-style acceleration)
@@ -744,6 +756,23 @@ namespace ExtendedLSC
             ELSCTransmission.Initialize();
             transmissionHUD = new TransmissionHUD(elscTransmission);
             Log($"[ELSC MT] Built-in transmission available: {ELSCTransmission.IsAvailable}");
+
+            // Initialize ELSC's wheel fitment system
+            WheelBones.Log = Log;
+            WheelFitment.WheelFitment.Log = Log;
+            Log($"[ELSC Fitment] Wheel fitment system ready");
+
+            // Per-specific-car stance manager (auto-applies saved stances to cars in range, even parked).
+            // The player's CURRENT car is excluded — it's managed live by `wheelFitment`.
+            ManualTransmission.DragHUD.Log = Log;
+            dragHUD.Initialize();
+            WheelFitment.VehicleStanceManager.Log = Log;
+            stanceManager.ExcludeVehicle = () =>
+            {
+                var pp = Game.Player.Character;
+                return (pp != null && pp.Exists() && pp.IsInVehicle()) ? pp.CurrentVehicle : null;
+            };
+            try { stanceManager.Initialize(); _stanceMgrInit = true; } catch (Exception ex) { Log($"[Stance] init failed: {ex.Message}"); }
 
             // Build static menus
             BuildMainMenu();
@@ -2507,7 +2536,416 @@ namespace ExtendedLSC
             tiresNavItem.Activated += (s, e) => { isNavigatingMenu = true; menu.Visible = false; tiresMenu.Visible = true; isNavigatingMenu = false; };
             menu.Add(tiresNavItem);
 
+            // Wheel Fitment submenu (VStancer-style adjustments)
+            GTA.UI.Notification.Show($"~b~DEBUG~w~: VStancerIntegration={ModSettings.VStancerIntegration}");
+            if (ModSettings.VStancerIntegration)
+            {
+                GTA.UI.Notification.Show("~g~Building Wheel Fitment menu...");
+                wheelFitmentParent = menu;   // so BuildWheelFitmentMenu can restore this parent on close
+                var fitmentMenu = BuildWheelFitmentMenu();
+                if (fitmentMenu != null)
+                {
+                    // NOTE: the parent-restore Closed handler is wired INSIDE BuildWheelFitmentMenu (using
+                    // wheelFitmentParent) so that rebuilt instances (Reset/Purchase) restore the parent too.
+                    var fitmentNavItem = new NativeItem("Wheel Fitment");
+                    fitmentNavItem.AltTitle = ">>";
+                    fitmentNavItem.Description = "Adjust camber, track width, and ride height";
+                    fitmentNavItem.Activated += (s, e) => { isNavigatingMenu = true; menu.Visible = false; fitmentMenu.Visible = true; isNavigatingMenu = false; };
+                    menu.Add(fitmentNavItem);
+                    GTA.UI.Notification.Show("~g~Wheel Fitment menu added!");
+                }
+                else
+                {
+                    GTA.UI.Notification.Show("~r~BuildWheelFitmentMenu returned null!");
+                }
+            }
+
             return menu;
+        }
+
+        private NativeMenu BuildWheelFitmentMenu()
+        {
+            if (currentVehicle == null || !currentVehicle.Exists()) return null;
+
+            var menu = CreateMenu("Wheel Fitment");
+
+            // Restore the parent (Wheels) menu when this menu closes. Wired here — not at the call site —
+            // so EVERY built instance (including the ones rebuilt by Reset/Purchase) navigates back
+            // correctly instead of vanishing and locking up.
+            menu.Closed += (s, e) => { if (!isNavigatingMenu && wheelFitmentParent != null) wheelFitmentParent.Visible = true; };
+
+            // Initialize fitment for current vehicle
+            if (!wheelFitment.IsInitialized || lastFitmentVehicle != currentVehicle)
+            {
+                wheelFitment.Initialize(currentVehicle);
+                lastFitmentVehicle = currentVehicle;
+
+                // Load saved fitment if owned
+                string vehName = currentVehicle.DisplayName;
+                if (VehicleSaveData.IsWheelFitmentOwned(vehName))
+                {
+                    var saved = VehicleSaveData.GetFitmentData(vehName);
+                    wheelFitment.FrontCamber = saved.FrontCamber;
+                    wheelFitment.RearCamber = saved.RearCamber;
+                    wheelFitment.FrontTrackWidth = saved.FrontTrackWidth;
+                    wheelFitment.RearTrackWidth = saved.RearTrackWidth;
+                    wheelFitment.FrontHeight = saved.FrontHeight;
+                    wheelFitment.RearHeight = saved.RearHeight;
+                }
+            }
+
+            // Check if fitment is already owned
+            bool isOwned = VehicleSaveData.IsWheelFitmentOwned(currentVehicle.DisplayName);
+            int fitmentPrice = 2500; // Base price for fitment service
+
+            // Purchase/Status item
+            var purchaseItem = new NativeItem(isOwned ? "Fitment Service" : "Purchase Fitment", isOwned ? "Installed" : $"${fitmentPrice:N0}");
+            purchaseItem.Description = isOwned ? "Adjust your wheel fitment below" : "Purchase to enable wheel fitment adjustments";
+            if (!isOwned)
+            {
+                purchaseItem.Activated += (s, e) =>
+                {
+                    int playerMoney = Game.Player.Money;
+                    if (playerMoney >= fitmentPrice)
+                    {
+                        Game.Player.Money -= fitmentPrice;
+                        VehicleSaveData.SetWheelFitmentOwned(currentVehicle.DisplayName, true);
+                        VehicleSaveData.Save();
+                        transactionAmount = fitmentPrice;
+                        transactionStartTime = Game.GameTime;
+                        GTA.UI.Notification.Show("Wheel Fitment service purchased!");
+                        // Rebuild menu to show sliders
+                        isNavigatingMenu = true;
+                        menu.Visible = false;
+                        var newMenu = BuildWheelFitmentMenu();
+                        newMenu.Visible = true;
+                        isNavigatingMenu = false;
+                    }
+                    else
+                    {
+                        GTA.UI.Notification.Show("~r~Not enough money!");
+                    }
+                };
+            }
+            menu.Add(purchaseItem);
+
+            // Only show adjustment options if owned
+            if (isOwned)
+            {
+                menu.Add(new NativeItem("") { Enabled = false }); // Spacer
+
+                if (ModSettings.WheelFitmentProMode)
+                {
+                // ============ PRO MODE: raw per-axle controls ============
+                // Front Camber slider
+                var frontCamberValues = new List<float>();
+                for (float v = WheelFitment.WheelFitment.MIN_CAMBER; v <= WheelFitment.WheelFitment.MAX_CAMBER + 0.001f; v += 0.01f)
+                    frontCamberValues.Add((float)Math.Round(v, 2));
+                int fcIdx = frontCamberValues.FindIndex(v => Math.Abs(v - wheelFitment.FrontCamber) < 0.005f);
+                if (fcIdx < 0) fcIdx = frontCamberValues.Count / 2;
+                var frontCamberItem = new NativeListItem<float>("Front Camber", frontCamberValues.ToArray()) { SelectedIndex = fcIdx };
+                frontCamberItem.ItemChanged += (s, e) => {
+                    wheelFitment.FrontCamber = e.Object;
+                    GTA.UI.Notification.Show($"~y~Front Camber~w~: {e.Object:F2} rad ({WheelFitment.WheelFitment.ToDegrees(e.Object):F1}°)");
+                };
+                frontCamberItem.Description = $"Tilt front wheels ({WheelFitment.WheelFitment.ToDegrees(WheelFitment.WheelFitment.MIN_CAMBER):F0}° to {WheelFitment.WheelFitment.ToDegrees(WheelFitment.WheelFitment.MAX_CAMBER):F0}°)";
+                menu.Add(frontCamberItem);
+
+                // Rear Camber slider
+                var rearCamberValues = new List<float>();
+                for (float v = WheelFitment.WheelFitment.MIN_CAMBER; v <= WheelFitment.WheelFitment.MAX_CAMBER + 0.001f; v += 0.01f)
+                    rearCamberValues.Add((float)Math.Round(v, 2));
+                int rcIdx = rearCamberValues.FindIndex(v => Math.Abs(v - wheelFitment.RearCamber) < 0.005f);
+                if (rcIdx < 0) rcIdx = rearCamberValues.Count / 2;
+                var rearCamberItem = new NativeListItem<float>("Rear Camber", rearCamberValues.ToArray()) { SelectedIndex = rcIdx };
+                rearCamberItem.ItemChanged += (s, e) => { wheelFitment.RearCamber = e.Object; };
+                rearCamberItem.Description = $"Tilt rear wheels ({WheelFitment.WheelFitment.ToDegrees(WheelFitment.WheelFitment.MIN_CAMBER):F0}° to {WheelFitment.WheelFitment.ToDegrees(WheelFitment.WheelFitment.MAX_CAMBER):F0}°)";
+                menu.Add(rearCamberItem);
+
+                // Front Track Width slider
+                var frontTrackValues = new List<float>();
+                for (float v = WheelFitment.WheelFitment.MIN_TRACK_WIDTH; v <= WheelFitment.WheelFitment.MAX_TRACK_WIDTH + 0.001f; v += 0.01f)
+                    frontTrackValues.Add((float)Math.Round(v, 2));
+                int ftIdx = frontTrackValues.FindIndex(v => Math.Abs(v - wheelFitment.FrontTrackWidth) < 0.005f);
+                if (ftIdx < 0) ftIdx = frontTrackValues.FindIndex(v => Math.Abs(v) < 0.005f);
+                var frontTrackItem = new NativeListItem<float>("Front Track Width", frontTrackValues.ToArray()) { SelectedIndex = ftIdx };
+                frontTrackItem.ItemChanged += (s, e) => {
+                    wheelFitment.FrontTrackWidth = e.Object;
+                    GTA.UI.Notification.Show($"~y~Front Track~w~: {e.Object:F2}m");
+                };
+                frontTrackItem.Description = "Widen or narrow front wheels";
+                menu.Add(frontTrackItem);
+
+                // Rear Track Width slider
+                var rearTrackValues = new List<float>();
+                for (float v = WheelFitment.WheelFitment.MIN_TRACK_WIDTH; v <= WheelFitment.WheelFitment.MAX_TRACK_WIDTH + 0.001f; v += 0.01f)
+                    rearTrackValues.Add((float)Math.Round(v, 2));
+                int rtIdx = rearTrackValues.FindIndex(v => Math.Abs(v - wheelFitment.RearTrackWidth) < 0.005f);
+                if (rtIdx < 0) rtIdx = rearTrackValues.FindIndex(v => Math.Abs(v) < 0.005f);
+                var rearTrackItem = new NativeListItem<float>("Rear Track Width", rearTrackValues.ToArray()) { SelectedIndex = rtIdx };
+                rearTrackItem.ItemChanged += (s, e) => { wheelFitment.RearTrackWidth = e.Object; };
+                rearTrackItem.Description = "Widen or narrow rear wheels";
+                menu.Add(rearTrackItem);
+
+                // Front Height slider
+                var frontHeightValues = new List<float>();
+                for (float v = WheelFitment.WheelFitment.MIN_HEIGHT; v <= WheelFitment.WheelFitment.MAX_HEIGHT + 0.001f; v += 0.01f)
+                    frontHeightValues.Add((float)Math.Round(v, 2));
+                int fhIdx = frontHeightValues.FindIndex(v => Math.Abs(v - wheelFitment.FrontHeight) < 0.005f);
+                if (fhIdx < 0) fhIdx = frontHeightValues.FindIndex(v => Math.Abs(v) < 0.005f);
+                var frontHeightItem = new NativeListItem<float>("Front Height", frontHeightValues.ToArray()) { SelectedIndex = fhIdx };
+                frontHeightItem.ItemChanged += (s, e) => { wheelFitment.FrontHeight = e.Object; };
+                frontHeightItem.Description = "Raise or lower front suspension";
+                menu.Add(frontHeightItem);
+
+                // Rear Height slider
+                var rearHeightValues = new List<float>();
+                for (float v = WheelFitment.WheelFitment.MIN_HEIGHT; v <= WheelFitment.WheelFitment.MAX_HEIGHT + 0.001f; v += 0.01f)
+                    rearHeightValues.Add((float)Math.Round(v, 2));
+                int rhIdx = rearHeightValues.FindIndex(v => Math.Abs(v - wheelFitment.RearHeight) < 0.005f);
+                if (rhIdx < 0) rhIdx = rearHeightValues.FindIndex(v => Math.Abs(v) < 0.005f);
+                var rearHeightItem = new NativeListItem<float>("Rear Height", rearHeightValues.ToArray()) { SelectedIndex = rhIdx };
+                rearHeightItem.ItemChanged += (s, e) => { wheelFitment.RearHeight = e.Object; };
+                rearHeightItem.Description = "Raise or lower rear suspension";
+                menu.Add(rearHeightItem);
+
+                // ---- Visual wheel size/width (reverse-engineered + verified, build 3788) ----
+                if (wheelFitment.HasVisualWheels)
+                {
+                    var visSizeValues = new List<float>();
+                    for (float v = WheelFitment.WheelFitment.MIN_VISUAL; v <= WheelFitment.WheelFitment.MAX_VISUAL + 0.001f; v += 0.05f)
+                        visSizeValues.Add((float)Math.Round(v, 2));
+                    int vsIdx = visSizeValues.FindIndex(v => Math.Abs(v - wheelFitment.VisualSize) < 0.025f);
+                    if (vsIdx < 0) vsIdx = visSizeValues.FindIndex(v => Math.Abs(v - 1f) < 0.025f);
+                    var visSizeItem = new NativeListItem<float>("Wheel Size", visSizeValues.ToArray()) { SelectedIndex = vsIdx };
+                    visSizeItem.ItemChanged += (s, e) => {
+                        wheelFitment.VisualSize = e.Object;
+                        GTA.UI.Notification.Show($"~y~Wheel Size~w~: {e.Object:F2}x");
+                    };
+                    visSizeItem.Description = "Bigger/smaller wheels (visual + collision)";
+                    menu.Add(visSizeItem);
+
+                    var visWidthValues = new List<float>();
+                    for (float v = WheelFitment.WheelFitment.MIN_VISUAL; v <= WheelFitment.WheelFitment.MAX_VISUAL + 0.001f; v += 0.05f)
+                        visWidthValues.Add((float)Math.Round(v, 2));
+                    int vwIdx = visWidthValues.FindIndex(v => Math.Abs(v - wheelFitment.VisualWidth) < 0.025f);
+                    if (vwIdx < 0) vwIdx = visWidthValues.FindIndex(v => Math.Abs(v - 1f) < 0.025f);
+                    var visWidthItem = new NativeListItem<float>("Wheel Width", visWidthValues.ToArray()) { SelectedIndex = vwIdx };
+                    visWidthItem.ItemChanged += (s, e) => {
+                        wheelFitment.VisualWidth = e.Object;
+                        GTA.UI.Notification.Show($"~y~Wheel Width~w~: {e.Object:F2}x");
+                    };
+                    visWidthItem.Description = "Wider/narrower wheels (visual + collision)";
+                    menu.Add(visWidthItem);
+                }
+                else
+                {
+                    var noVisualItem = new NativeItem("Wheel Size / Width", "Fit custom wheels") { Enabled = false };
+                    noVisualItem.Description = "Install aftermarket wheels (LSC) to adjust visual size/width";
+                    menu.Add(noVisualItem);
+                }
+                }
+                else
+                {
+                    // ============ SIMPLE MODE: real-world units, one slider per concept ============
+                    BuildSimpleFitmentItems(menu);
+                }
+
+                // Pro Mode toggle (persisted to INI)
+                var proItem = new NativeCheckboxItem("Pro Mode", "Unlock per-axle camber, track width and height controls", ModSettings.WheelFitmentProMode);
+                proItem.CheckboxChanged += (s, e) =>
+                {
+                    ModSettings.WheelFitmentProMode = proItem.Checked;
+                    ModSettings.Save();
+                    // Rebuild so the item set matches the mode
+                    isNavigatingMenu = true;
+                    menu.Visible = false;
+                    var newMenu = BuildWheelFitmentMenu();
+                    newMenu.Visible = true;
+                    isNavigatingMenu = false;
+                };
+                menu.Add(proItem);
+
+                menu.Add(new NativeItem("") { Enabled = false }); // Spacer
+
+                // Save button
+                var saveItem = new NativeItem("Save Fitment");
+                saveItem.Description = "Save current fitment settings";
+                saveItem.Activated += (s, e) =>
+                {
+                    SaveCurrentFitment();
+                    GTA.UI.Notification.Show("Fitment saved!");
+                };
+                menu.Add(saveItem);
+
+                // Reset button
+                var resetItem = new NativeItem("Reset to Stock");
+                resetItem.Description = "Reset all fitment to factory settings";
+                resetItem.Activated += (s, e) =>
+                {
+                    wheelFitment.Reset();
+                    SaveCurrentFitment();
+                    GTA.UI.Notification.Show("Fitment reset to stock");
+                    // Rebuild menu to update slider positions
+                    isNavigatingMenu = true;
+                    menu.Visible = false;
+                    var newMenu = BuildWheelFitmentMenu();
+                    newMenu.Visible = true;
+                    isNavigatingMenu = false;
+                };
+                menu.Add(resetItem);
+
+            }
+
+            return menu;
+        }
+
+        /// <summary>
+        /// Simple-mode fitment items: real-world units (inches / degrees / cm), one slider per concept,
+        /// applied to all wheels. Auto-adapt (big wheels lift the body) and easing make it feel natural.
+        /// </summary>
+        private void BuildSimpleFitmentItems(NativeMenu menu)
+        {
+            // ---- Wheel Size (inches — the render size field is the wheel's diameter in meters) ----
+            if (wheelFitment.HasVisualWheels)
+            {
+                // Range capped at THIS vehicle's stability budget (suspension travel) — the largest
+                // size that rides cleanly with matching collision. Varies per car: trucks allow more.
+                float maxMult = wheelFitment.MaxSizeMult;
+                var sizeMults = new List<float>();
+                var sizeLabels = new List<string>();
+                for (float m = 0.7f; m <= maxMult + 0.001f; m += 0.05f)
+                {
+                    float mult = (float)Math.Round(Math.Min(m, maxMult), 3);
+                    if (sizeMults.Count > 0 && mult <= sizeMults[sizeMults.Count - 1]) break;
+                    sizeMults.Add(mult);
+                    float inches = wheelFitment.BaseVisualDiameter * mult / 0.0254f;
+                    sizeLabels.Add(Math.Abs(mult - 1f) < 0.001f ? $"{inches:F1}\" (stock)" : $"{inches:F1}\"");
+                }
+                int sIdx = 0;
+                for (int i = 0; i < sizeMults.Count; i++)
+                    if (Math.Abs(sizeMults[i] - wheelFitment.VisualSize) < 0.026f) { sIdx = i; break; }
+                var sizeItem = new NativeListItem<string>("Wheel Size", sizeLabels.ToArray()) { SelectedIndex = sIdx };
+                sizeItem.Description = "Overall wheel diameter. Oversized wheels lift the body automatically.";
+                sizeItem.ItemChanged += (s, e) => { wheelFitment.VisualSize = sizeMults[e.Index]; };
+                menu.Add(sizeItem);
+
+                // ---- Tire Width (%) ----
+                var widthMults = new List<float>();
+                var widthLabels = new List<string>();
+                for (float m = 0.6f; m <= 1.601f; m += 0.05f)
+                {
+                    float mult = (float)Math.Round(m, 2);
+                    widthMults.Add(mult);
+                    widthLabels.Add(Math.Abs(mult - 1f) < 0.001f ? "100% (stock)" : $"{mult * 100f:F0}%");
+                }
+                int wIdx = 0;
+                for (int i = 0; i < widthMults.Count; i++)
+                    if (Math.Abs(widthMults[i] - wheelFitment.VisualWidth) < 0.026f) { wIdx = i; break; }
+                var widthItem = new NativeListItem<string>("Tire Width", widthLabels.ToArray()) { SelectedIndex = wIdx };
+                widthItem.Description = "Fat meats or stretched rubber";
+                widthItem.ItemChanged += (s, e) => { wheelFitment.VisualWidth = widthMults[e.Index]; };
+                menu.Add(widthItem);
+            }
+            else
+            {
+                var hint = new NativeItem("Wheel Size / Width", "Fit custom wheels") { Enabled = false };
+                hint.Description = "Install aftermarket wheels to unlock wheel sizing";
+                menu.Add(hint);
+            }
+
+            // ---- Camber (degrees, all wheels) ----
+            var camberDegs = new List<int>();
+            var camberLabels = new List<string>();
+            for (int d = -8; d <= 24; d++)
+            {
+                camberDegs.Add(d);
+                camberLabels.Add(d == 0 ? "0° (stock)" : $"{d}°");
+            }
+            int cIdx = 8; // 0°
+            float curDeg = WheelFitment.WheelFitment.ToDegrees(wheelFitment.FrontCamber);
+            for (int i = 0; i < camberDegs.Count; i++)
+                if (Math.Abs(camberDegs[i] - curDeg) < 0.51f) { cIdx = i; break; }
+            var camberItem = new NativeListItem<string>("Camber", camberLabels.ToArray()) { SelectedIndex = cIdx };
+            camberItem.Description = "Tilt the wheels in for that stanced look";
+            camberItem.ItemChanged += (s, e) =>
+            {
+                float rad = WheelFitment.WheelFitment.ToRadians(camberDegs[e.Index]);
+                wheelFitment.FrontCamber = rad;
+                wheelFitment.RearCamber = rad;
+            };
+            menu.Add(camberItem);
+
+            // ---- Ride Height (cm; + lift / - slam). Internal sign is inverted: +Z moves the WHEEL up
+            //      relative to the body, which sits the body LOWER — so internal = -cm/100. ----
+            var heightCms = new List<int>();
+            var heightLabels = new List<string>();
+            for (int cm = -14; cm <= 14; cm++)
+            {
+                heightCms.Add(cm);
+                heightLabels.Add(cm == 0 ? "0 cm (stock)" : (cm > 0 ? $"+{cm} cm" : $"{cm} cm"));
+            }
+            int hIdx = 14; // 0 cm
+            float curCm = -wheelFitment.FrontHeight * 100f;
+            for (int i = 0; i < heightCms.Count; i++)
+                if (Math.Abs(heightCms[i] - curCm) < 0.51f) { hIdx = i; break; }
+            var heightItem = new NativeListItem<string>("Ride Height", heightLabels.ToArray()) { SelectedIndex = hIdx };
+            heightItem.Description = "Lift (+) or slam (-) the whole car";
+            heightItem.ItemChanged += (s, e) =>
+            {
+                float h = -heightCms[e.Index] / 100f;
+                wheelFitment.FrontHeight = h;
+                wheelFitment.RearHeight = h;
+            };
+            menu.Add(heightItem);
+
+            // ---- Wheel Poke (track width, cm out from the body) ----
+            var trackCms = new List<int>();
+            var trackLabels = new List<string>();
+            for (int cm = -5; cm <= 20; cm++)
+            {
+                trackCms.Add(cm);
+                trackLabels.Add(cm == 0 ? "0 cm (stock)" : (cm > 0 ? $"+{cm} cm" : $"{cm} cm"));
+            }
+            int tIdx = 5; // 0 cm
+            float curTcm = wheelFitment.FrontTrackWidth * 100f;
+            for (int i = 0; i < trackCms.Count; i++)
+                if (Math.Abs(trackCms[i] - curTcm) < 0.51f) { tIdx = i; break; }
+            var trackItem = new NativeListItem<string>("Wheel Poke", trackLabels.ToArray()) { SelectedIndex = tIdx };
+            trackItem.Description = "Push the wheels out toward the fenders";
+            trackItem.ItemChanged += (s, e) =>
+            {
+                float t = trackCms[e.Index] / 100f;
+                wheelFitment.FrontTrackWidth = t;
+                wheelFitment.RearTrackWidth = t;
+            };
+            menu.Add(trackItem);
+        }
+
+        private void SaveCurrentFitment()
+        {
+            if (currentVehicle == null || !currentVehicle.Exists()) return;
+            var fitmentData = new VehicleSaveData.FitmentData
+            {
+                FrontCamber = wheelFitment.FrontCamber,
+                RearCamber = wheelFitment.RearCamber,
+                FrontTrackWidth = wheelFitment.FrontTrackWidth,
+                RearTrackWidth = wheelFitment.RearTrackWidth,
+                FrontHeight = wheelFitment.FrontHeight,
+                RearHeight = wheelFitment.RearHeight
+            };
+            VehicleSaveData.SetFitmentData(currentVehicle.DisplayName, fitmentData);
+            VehicleSaveData.Save();
+
+            // Also record this SPECIFIC car (model + plate + fingerprint + decorator tag) so the stance
+            // auto-applies when the player later walks up to THIS car (and not other cars of the model).
+            if (_stanceMgrInit)
+            {
+                if (stanceManager.RecordCar(currentVehicle, wheelFitment, out string stMsg))
+                    Log($"[Stance] {stMsg}");
+                else
+                    GTA.UI.Notification.Show($"~o~Stance not saved per-car: {stMsg}");
+            }
         }
 
         private NativeMenu BuildResprayMenu()
@@ -6019,6 +6457,14 @@ namespace ExtendedLSC
                 UpdateManualTransmission();
             }
 
+            // Wheel fitment updates EVERY tick (in AND out of the menu) so height/camber edits re-settle
+            // immediately while the player is adjusting them, instead of floating until they drive off.
+            UpdateWheelFitment();
+
+            // Auto-apply saved stances to specific cars within range (skips the player's current car).
+            if (_stanceMgrInit && ModSettings.VStancerIntegration)
+                stanceManager.Update();
+
             // Handle custom menu input with native GTA-style acceleration
             HandleMenuInput();
 
@@ -6029,6 +6475,9 @@ namespace ExtendedLSC
 
             // Draw sprite browser if enabled (F6 to toggle)
             DrawSpriteBrowser();
+
+            // White-screen UI preview harness (dev tool) — drawn last so it overlays everything.
+            dragHUD.DrawPreviewIfRequested();
 
             // Keep handbrake on while menu is active (allows rev with just RT)
             // Keep handbrake on while menu is active (allows rev with just RT)
@@ -6295,6 +6744,13 @@ namespace ExtendedLSC
             if (currentVehicle != null && currentVehicle.Exists())
             {
                 Function.Call(Hash.SET_VEHICLE_HANDBRAKE, currentVehicle, false);
+            }
+
+            // On exit, snapshot this specific car (plate + fingerprint + decorator) so its stance
+            // auto-applies next time the player approaches it. RecordCar clears the record if it's stock.
+            if (_stanceMgrInit && currentVehicle != null && currentVehicle.Exists() && wheelFitment.IsInitialized)
+            {
+                try { stanceManager.RecordCar(currentVehicle, wheelFitment, out _); } catch { }
             }
 
             // Save vehicle purchase data
@@ -7314,7 +7770,9 @@ namespace ExtendedLSC
 
             try
             {
-                string logPath = $"scripts\\ExtendedLSC.log";
+                // NOTE: do NOT use Assembly.Location here — SHVDN loads script DLLs from bytes (so the
+                // file can be hot-swapped), which makes Location an empty string and the write throw.
+                string logPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ExtendedLSC.log");
                 string timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
                 System.IO.File.AppendAllText(logPath, $"[{timestamp}] {message}\n");
             }
@@ -7660,8 +8118,78 @@ namespace ExtendedLSC
             {
                 elscTransmission.Update();
 
-                // Draw HUD
-                transmissionHUD?.Draw(vehicle);
+                // Draw HUD — NFS-style drag gauge (replaces the old corner readout)
+                if (ModSettings.DragHudEnabled)
+                {
+                    float rpm = elscTransmission.GetCurrentRPM();
+                    int gearDisp = elscTransmission.InReverse ? -1 : (elscTransmission.InNeutral ? 0 : elscTransmission.CurrentGear);
+                    dragHUD.Draw(rpm, gearDisp, vehicle.Speed * 2.23694f,
+                        elscTransmission.NosLevel, elscTransmission.NosInstalled, elscTransmission.IsInRedline());
+                }
+                else
+                {
+                    transmissionHUD?.Draw(vehicle);
+                }
+            }
+
+            // NOTE: wheel fitment is updated separately in UpdateWheelFitment(), called from OnTick
+            // UNCONDITIONALLY (in AND out of the LSC menu) — its per-frame re-apply and the physics
+            // re-settle must run while the menu is open, which is exactly when the player is adjusting
+            // height/camber. (This method only runs when !isMenuActive, so it can't host the fitment update.)
+        }
+
+        /// <summary>
+        /// Per-frame wheel fitment update. Runs EVERY tick — including while the LSC menu is open — so
+        /// camber/track/height stay applied and the physics re-settle (anti-float) fires immediately
+        /// after a change instead of only once the player drives off.
+        /// </summary>
+        private void UpdateWheelFitment()
+        {
+            if (!(ModSettings.VStancerIntegration && _fitmentInitAllowed)) return;
+
+            Vehicle vehicle = Game.Player.Character?.CurrentVehicle;
+            if (vehicle == null || !vehicle.Exists()) return;
+
+            try
+            {
+                if (!wheelFitment.IsInitialized || lastFitmentVehicle != vehicle)
+                {
+                    // Only attempt initialization after the game is fully loaded
+                    if (Game.GameTime > 10000)
+                    {
+                        wheelFitment.Initialize(vehicle);
+                        lastFitmentVehicle = vehicle;
+
+                        // Prefer this SPECIFIC car's saved stance (per-car identity). Fall back to the
+                        // legacy per-model saved fitment only if this exact car has no stance recorded.
+                        bool loaded = _stanceMgrInit && stanceManager.LoadInto(vehicle, wheelFitment);
+                        if (!loaded)
+                        {
+                            string vehName = vehicle.DisplayName;
+                            if (VehicleSaveData.IsWheelFitmentOwned(vehName))
+                            {
+                                var saved = VehicleSaveData.GetFitmentData(vehName);
+                                wheelFitment.FrontCamber = saved.FrontCamber;
+                                wheelFitment.RearCamber = saved.RearCamber;
+                                wheelFitment.FrontTrackWidth = saved.FrontTrackWidth;
+                                wheelFitment.RearTrackWidth = saved.RearTrackWidth;
+                                wheelFitment.FrontHeight = saved.FrontHeight;
+                                wheelFitment.RearHeight = saved.RearHeight;
+                            }
+                        }
+                    }
+                }
+
+                if (wheelFitment.IsInitialized)
+                {
+                    wheelFitment.Update();
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"[WheelFitment] OnTick error: {ex.Message}");
+                _fitmentInitAllowed = false;
+                Log("[WheelFitment] Disabled due to errors");
             }
         }
 

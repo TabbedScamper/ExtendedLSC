@@ -44,9 +44,23 @@ namespace ExtendedLSC
             public bool HasXenon { get; set; } = false;
             public bool HasBulletproofTires { get; set; } = false;
             public bool HasManualTransmission { get; set; } = false;
+            public bool HasWheelFitment { get; set; } = false;
+
+            // Wheel fitment data
+            public FitmentData Fitment { get; set; } = new FitmentData();
 
             // Custom config-based items: Key = category path (e.g. "Wheels/Tires/Tire Smoke"), Value = list of purchased item values
             public Dictionary<string, List<int>> PurchasedCustomItems { get; set; } = new Dictionary<string, List<int>>();
+        }
+
+        public class FitmentData
+        {
+            public float FrontCamber { get; set; } = 0f;
+            public float RearCamber { get; set; } = 0f;
+            public float FrontTrackWidth { get; set; } = 0f;
+            public float RearTrackWidth { get; set; } = 0f;
+            public float FrontHeight { get; set; } = 0f;
+            public float RearHeight { get; set; } = 0f;
         }
 
         #endregion
@@ -178,6 +192,49 @@ namespace ExtendedLSC
             vehicleName = vehicleName.ToLowerInvariant();
             EnsureVehicle(vehicleName).HasManualTransmission = owned;
             _isDirty = true;
+        }
+
+        /// <summary>
+        /// Check if wheel fitment has been purchased
+        /// </summary>
+        public static bool IsWheelFitmentOwned(string vehicleName)
+        {
+            if (_saveData == null) Load();
+            vehicleName = vehicleName.ToLowerInvariant();
+            return _saveData.Vehicles.TryGetValue(vehicleName, out var data) && data.HasWheelFitment;
+        }
+
+        public static void SetWheelFitmentOwned(string vehicleName, bool owned = true)
+        {
+            if (_saveData == null) Load();
+            vehicleName = vehicleName.ToLowerInvariant();
+            EnsureVehicle(vehicleName).HasWheelFitment = owned;
+            _isDirty = true;
+        }
+
+        /// <summary>
+        /// Get saved fitment data for a vehicle
+        /// </summary>
+        public static FitmentData GetFitmentData(string vehicleName)
+        {
+            if (_saveData == null) Load();
+            vehicleName = vehicleName.ToLowerInvariant();
+            if (_saveData.Vehicles.TryGetValue(vehicleName, out var data))
+                return data.Fitment ?? new FitmentData();
+            return new FitmentData();
+        }
+
+        /// <summary>
+        /// Save fitment data for a vehicle
+        /// </summary>
+        public static void SetFitmentData(string vehicleName, FitmentData fitment)
+        {
+            if (_saveData == null) Load();
+            vehicleName = vehicleName.ToLowerInvariant();
+            var data = EnsureVehicle(vehicleName);
+            data.Fitment = fitment;
+            _isDirty = true;
+            Log?.Invoke($"[SaveData] Saved fitment for {vehicleName}: FC={fitment.FrontCamber:F3} RC={fitment.RearCamber:F3}");
         }
 
         /// <summary>

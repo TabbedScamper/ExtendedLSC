@@ -38,4 +38,13 @@
     </None>
   </ItemGroup>
 
+  <!-- Exclude backup copies and the integrated (C++) mod source from the C# compile -->
+  <ItemGroup>
+    <Compile Remove="ExtendedLSC_backup_\**" />
+    <Compile Remove="ExtendedLSC-backup-2026-06-07\**" />
+    <Compile Remove="ExtendedLSC-backup-*\**" />
+    <Compile Remove="integrated_mods\**" />
+    <Compile Remove="native\**" />
+  </ItemGroup>
+
 </Project>

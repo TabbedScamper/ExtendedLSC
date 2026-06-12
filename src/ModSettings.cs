@@ -43,6 +43,13 @@ namespace ExtendedLSC
         /// <summary>VStancer wheel fitment integration (not yet implemented)</summary>
         public static bool VStancerIntegration { get; set; } = true;
 
+        /// <summary>Wheel Fitment Pro Mode: per-axle camber/track/height sliders. Off = simple menu.</summary>
+        public static bool WheelFitmentProMode { get; set; } = false;
+
+        /// <summary>NFS-style drag gauge HUD for the manual transmission (rev tach + gear + NOS).
+        /// OFF by default — the simple corner HUD is the default; this is an opt-in option.</summary>
+        public static bool DragHudEnabled { get; set; } = false;
+
         /// <summary>Per-vehicle manual transmission upgrade option</summary>
         public static bool ManualTransmission { get; set; } = true;
 
@@ -79,7 +86,7 @@ namespace ExtendedLSC
         public static bool EditorMode { get; set; } = false;
 
         /// <summary>Enable debug logging to ExtendedLSC.log</summary>
-        public static bool DebugLogging { get; set; } = false;
+        public static bool DebugLogging { get; set; } = true;
 
         #endregion
 
@@ -152,6 +159,16 @@ namespace ExtendedLSC
                                 case "vstancer":
                                     VStancerIntegration = ParseBool(value);
                                     break;
+                                case "wheelfitmentpromode":
+                                case "wheel_fitment_pro_mode":
+                                case "promode":
+                                    WheelFitmentProMode = ParseBool(value);
+                                    break;
+                                case "draghudenabled":
+                                case "drag_hud":
+                                case "draghud":
+                                    DragHudEnabled = ParseBool(value);
+                                    break;
                                 case "manualtransmission":
                                 case "manual_transmission":
                                 case "manual":
@@ -204,6 +221,8 @@ namespace ExtendedLSC
                                 case "debuglogging":
                                 case "debug_logging":
                                 case "debug":
+                                case "enablelogging":
+                                case "enable_logging":
                                     DebugLogging = ParseBool(value);
                                     break;
                             }
@@ -288,6 +307,10 @@ namespace ExtendedLSC
 
                     writer.WriteLine("; VStancer wheel fitment integration");
                     writer.WriteLine($"VStancerIntegration = {BoolToString(VStancerIntegration)}");
+                    writer.WriteLine();
+
+                    writer.WriteLine("; Wheel Fitment Pro Mode: per-axle camber/track/height sliders (off = simple menu)");
+                    writer.WriteLine($"WheelFitmentProMode = {BoolToString(WheelFitmentProMode)}");
                     writer.WriteLine();
 
                     writer.WriteLine("; Per-vehicle manual transmission upgrade");

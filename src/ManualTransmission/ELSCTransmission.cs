@@ -41,10 +41,59 @@ namespace ExtendedLSC.ManualTransmission
         public float ShiftUpRPM { get; set; } = 0.85f;          // Optimal shift point (shift indicator)
         public float ShiftDownRPM { get; set; } = 0.35f;        // Recommended downshift point
 
-        // Redline penalty settings
-        public float RedlineStart { get; set; } = 0.93f;        // RPM where power starts dropping
-        public float RedlinePenaltyMild { get; set; } = 0.85f;  // Throttle multiplier at redline start (85%)
-        public float RedlinePenaltyMax { get; set; } = 0.55f;   // Throttle multiplier at full limiter (55%)
+        // Redline (arcade): FULL power all the way up — NO throttle cut, ever. With the clutch engaged
+        // the RPM is locked to wheel speed, so any cut at the "limiter" can never release (the wheels
+        // hold the RPM there) and the car crawls at the cut throttle — that was the 25% dump in 1st.
+        // The game clamps RPM at 1.0 naturally; a gear simply tops out at its ratio ceiling.
+        public float RedlineStart { get; set; } = 0.93f;        // HUD redline zone start (shift indicator)
+
+        // Engine braking (arcade): lifting off decelerates the car, harder in lower gears and at
+        // higher RPM — so downshifting visibly slows you down (decel jumps as RPM rises + gear drops).
+        public float EngineBrakeStrength { get; set; } = 5.0f;  // m/s^2 at RPM 1.0 in 1st gear
+
+        // Perfect shift (NFS drag style): shifting up in the sweet spot is rewarded ONLY with a
+        // "GREAT SHIFT!" callout — no power boost (we want skill-feedback, not a Forza torque cheat).
+        public float PerfectShiftMin { get; set; } = 0.80f;
+        public float PerfectShiftMax { get; set; } = 0.97f;
+        private int _perfectFlashUntil = 0;                     // "GREAT SHIFT!" popup window
+        public bool LastShiftPerfect { get; private set; } = false;
+
+        // ---- NOS / nitrous (arcade, NFS-style) ----
+        public bool NosInstalled { get; set; } = false;        // purchased in LSC
+        public float NosLevel { get; set; } = 1f;              // 0..1 bottle fill
+        public bool NosActive { get; private set; } = false;
+        public float NosDrainPerSec { get; set; } = 0.40f;     // ~2.5s of continuous boost
+        public float NosRefillPerSec { get; set; } = 0.09f;    // slow passive refill
+        public float NosPowerMult { get; set; } = 1.85f;       // torque multiplier while spraying
+        public float NosShove { get; set; } = 4.0f;            // extra forward m/s^2 kick while spraying
+        private System.Windows.Forms.Keys _nosKey = System.Windows.Forms.Keys.N;
+
+        // Anti-bog (arcade forgiveness): too high a gear at low RPM never stalls — a hidden torque
+        // assist keeps the car pulling away, just lazily.
+        public float BogRPM { get; set; } = 0.50f;              // below this RPM the assist ramps in
+        public float BogAssistMax { get; set; } = 4.0f;         // max torque multiplier at idle RPM
+
+        // Gear-ceiling hold: when a pinned gear reaches its ratio ceiling, the GAME cuts throttle and
+        // lets RPM collapse to idle (measured: rpm 1.0 -> 0.27 at constant max speed). Arcade boxes
+        // scream at redline instead. We learn each gear's rpm/speed ratio and, when the game's cut is
+        // detected (rpm far below what speed implies, pedal down), hold RPM at redline + full throttle.
+        private float _gearRpmPerSpeed = 0f;                    // learned ratio for the current gear
+        private ushort _ratioGear = 0;
+
+        // Telemetry/autorun harness (active only while an autorun is triggered via autorun.txt)
+        private int _autorunUntil = 0;
+        private int _runStartTime = 0;
+        private string _autorunMode = "auto";
+        private System.Text.StringBuilder _csv = null;
+        // Runway-end safety: if scripts/ExtendedLSC/runway_end.txt exists ("x;y;z"), a run ends and
+        // brakes hard once the car gets within this range of it (no more desert excursions).
+        private GTA.Math.Vector3 _runwayEnd = default(GTA.Math.Vector3);
+        private bool _runwayEndLoaded = false;
+        private int _autoBrakeUntil = 0;
+        private float _lastTorqueMult = 1f;
+        private const ulong SET_CONTROL_VALUE_NEXT_FRAME_HASH = 0xE8A25867FBA3B05E;
+        private const ulong SET_VEHICLE_CHEAT_POWER_INCREASE_HASH = 0xB59E4BD37AE292DB;
+        private static string DataDir => System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ExtendedLSC");
 
         // Read-only state
         public bool IsEnabled => _enabled;
@@ -113,6 +162,10 @@ namespace ExtendedLSC.ManualTransmission
             // Ensure clutch is fully engaged (arcade - no clutch management)
             VehicleMemory.SetClutch(_vehicle, 1.0f);
 
+            // Disable the game's auto-shift clutch drops — without this the auto-box state machine
+            // fights the pinned gear every physics step and torque dies (see VehicleMemory patches).
+            VehicleMemory.ApplyShiftPatches();
+
             Log?.Invoke($"[ELSCTransmission] Enabled (Arcade Mode), gear: {_targetGear}, top gear: {_cachedTopGear}");
         }
 
@@ -126,6 +179,9 @@ namespace ExtendedLSC.ManualTransmission
                 // Restore full clutch and throttle
                 VehicleMemory.SetClutch(_vehicle, 1.0f);
             }
+
+            // Give the game its automatic gearbox back
+            VehicleMemory.RestoreShiftPatches();
 
             _enabled = false;
             _inNeutral = false;
@@ -197,12 +253,31 @@ namespace ExtendedLSC.ManualTransmission
             byte topGear = VehicleMemory.GetTopGear(_vehicle);
             if (_targetGear >= topGear) return; // Already in top gear
 
+            // PERFECT SHIFT: catching the sweet spot at the moment of the shift rewards a brief
+            // torque boost (applied per-frame in Update via cheat-power).
+            float rpmAtShift = VehicleMemory.GetCurrentRPM(_vehicle);
+            LastShiftPerfect = rpmAtShift >= PerfectShiftMin && rpmAtShift <= PerfectShiftMax;
+            if (LastShiftPerfect)
+                _perfectFlashUntil = Game.GameTime + 800;   // "GREAT SHIFT!" callout (drawn in Update)
+
             // Instant shift (arcade - no clutch delay)
             _targetGear++;
 
             // Set the new gear immediately
             VehicleMemory.SetCurrentGear(_vehicle, _targetGear);
             VehicleMemory.SetNextGear(_vehicle, _targetGear);
+
+            // REV-MATCH SNAP: with the clutch dips patched out, the game only LERPS the rpm toward the
+            // new gear's value (~0.8s glide that parks the tach at the top of every gear). Snap it from
+            // the real ratios instead — instant dual-clutch-style drop to the correct revs.
+            float rOld = VehicleMemory.GetGearRatio(_vehicle, _targetGear - 1);
+            float rNew = VehicleMemory.GetGearRatio(_vehicle, _targetGear);
+            if (rOld > 0.01f && rNew > 0.01f && rNew < rOld)
+            {
+                float snapped = Math.Max(0.2f, rpmAtShift * (rNew / rOld));
+                VehicleMemory.SetCurrentRPM(_vehicle, snapped);
+                _cachedRPM = snapped;
+            }
 
             // Keep clutch engaged (arcade - no clutch management)
             VehicleMemory.SetClutch(_vehicle, 1.0f);
@@ -248,9 +323,14 @@ namespace ExtendedLSC.ManualTransmission
             // Instant shift
             _targetGear--;
 
-            // Auto rev-match (arcade - always smooth)
+            // TRUE REV-MATCH from the real gear ratios (blip to exactly where the shorter gear puts
+            // the revs at this speed; falls back to the old fixed bump if ratios are unreadable).
             float currentRPM = VehicleMemory.GetCurrentRPM(_vehicle);
-            float targetRPM = Math.Min(0.95f, currentRPM + RevMatchStrength);
+            float rHigh = VehicleMemory.GetGearRatio(_vehicle, _targetGear + 1);
+            float rLow = VehicleMemory.GetGearRatio(_vehicle, _targetGear);
+            float targetRPM = (rHigh > 0.01f && rLow > rHigh)
+                ? Math.Min(0.98f, currentRPM * (rLow / rHigh))
+                : Math.Min(0.95f, currentRPM + RevMatchStrength);
             VehicleMemory.SetCurrentRPM(_vehicle, targetRPM);
 
             // Set the new gear immediately
@@ -383,6 +463,11 @@ namespace ExtendedLSC.ManualTransmission
             VehicleMemory.SetCurrentGear(_vehicle, _targetGear);
             VehicleMemory.SetNextGear(_vehicle, _targetGear);
             VehicleMemory.SetClutch(_vehicle, 1.0f);
+            // THROTTLE TAKEOVER: the game's auto-box logic still runs underneath the gear pin, and
+            // whenever it disagrees with our gear it enters a perpetual mid-shift THROTTLE CUT
+            // (measured: engine throttle forced to 0.00 in 3rd at full pedal -> car decays to a stop).
+            // Owning the throttle field every frame ends the fight for good (same approach as ikt's MT).
+            // (throttlePedal is computed below; the write happens after it's read.)
 
             // Block auto-reverse in 1st gear when stopped
             if (_targetGear == 1 && _vehicle.Speed < 0.5f)
@@ -401,30 +486,109 @@ namespace ExtendedLSC.ManualTransmission
                 }
             }
 
-            // === REDLINE PENALTY (every N frames) ===
-            if (_updateCounter % REDLINE_CHECK_INTERVAL == 0)
+            // === ENGINE FEEL (every frame) ===
+            _cachedRPM = VehicleMemory.GetCurrentRPM(_vehicle);
+            if (_updateCounter % 60 == 0)
+                _cachedTopGear = VehicleMemory.GetTopGear(_vehicle);
+            int now = Game.GameTime;
+
+            // 1) NO LIMITER CUT — full power to each gear's ratio ceiling (see RedlineStart comment:
+            //    RPM is wheel-locked in gear, so any cut would latch on permanently).
+
+            // Effective pedal: physical input OR autorun injection. GET_CONTROL_NORMAL can't see
+            // SET_CONTROL_VALUE_NEXT_FRAME injection (measured: engine braking was eating 3rd gear
+            // alive at "full throttle" during test runs), so the injection flag from last frame counts.
+            float throttlePedal = Function.Call<float>(Hash.GET_CONTROL_NORMAL, 0, INPUT_VEH_ACCELERATE);
+            if (_injectedGas && throttlePedal < 1f) throttlePedal = 1f;
+            _injectedGas = false;   // re-set by HandleAutorun at the end of this frame if still injecting
+            float speedNow = _vehicle.Speed;
+
+            // Throttle takeover (see comment at the gear pin): pedal drives the engine, period.
+            if (throttlePedal > 0.05f)
+                VehicleMemory.SetThrottle(_vehicle, throttlePedal);
+
+            // 1a) (Removed gear-ceiling RPM hold: the clutch-drop patch fixes power delivery so RPM now
+            //      tracks the gear naturally. The old hold learned a per-gear rpm/speed ratio that got
+            //      poisoned by the high-rpm/low-speed launch sample and then pinned RPM to redline for
+            //      the whole gear — that was the "always at the top of the gear after shifting" bug.)
+
+            // 1b) ENGINE BRAKING — lifting off drags the car down, scaled by RPM and (inversely) gear,
+            //     so a downshift instantly deepens the drag. This is what makes downshifts slow you.
+            if (throttlePedal < 0.10f && speedNow > 2.0f && _cachedRPM > 0.25f)
             {
-                _cachedRPM = VehicleMemory.GetCurrentRPM(_vehicle);
+                float decel = EngineBrakeStrength * _cachedRPM / Math.Max(1, (int)_targetGear);
+                float dv = decel * Game.LastFrameTime;
+                Function.Call(Hash.APPLY_FORCE_TO_ENTITY, _vehicle.Handle, 1,
+                    0f, -dv, 0f, 0f, 0f, 0f, 0, true /*dir relative*/, true, true /*mass-relative*/, false, true);
+            }
 
-                // Cache top gear less frequently
-                if (_updateCounter % 60 == 0)
-                    _cachedTopGear = VehicleMemory.GetTopGear(_vehicle);
+            // 1c) "GREAT SHIFT!" callout (silent, pops then fades) — right side, clear of the minimap.
+            if (now < _perfectFlashUntil)
+            {
+                float t = (_perfectFlashUntil - now) / 800f;               // 1 -> 0 over the window
+                float scale = 0.85f + 0.45f * Math.Max(0f, t - 0.7f) / 0.3f;  // punchy pop at the start
+                int alpha = (int)(255 * Math.Min(1f, t / 0.4f));             // fade out at the end
+                var txt = new GTA.UI.TextElement("GREAT SHIFT!",
+                    new System.Drawing.PointF(0.82f * GTA.UI.Screen.Width, 0.40f * GTA.UI.Screen.Height), scale,
+                    System.Drawing.Color.FromArgb(alpha, 120, 235, 255),
+                    GTA.UI.Font.Pricedown, GTA.UI.Alignment.Center);
+                txt.Outline = true;
+                txt.Draw();
+            }
 
-                // Only apply penalty if not in top gear and in redline zone
-                if (_targetGear < _cachedTopGear && _cachedRPM > RedlineStart)
+            // 2) TORQUE PIPELINE (anti-bog assist only — perfect shift gives NO power boost now).
+            float mult = 1f;
+            // Anti-bog: in too high a gear at low RPM the GAME's drive force is literally ZERO
+            // (measured: full pedal in 3rd at 6 m/s -> rpm pinned at idle, car decays to a stop),
+            // so a torque multiplier can't help (0 x N = 0). Instead: a direct physical push that
+            // fades out as the engine wakes up — guaranteed arcade pull-away — plus a lugging RPM
+            // floor so the engine sounds like it's working rather than dead.
+            if (_targetGear >= 2 && _cachedRPM < BogRPM && throttlePedal > 0.15f && speedNow < 30f)
+            {
+                float bog = (BogRPM - _cachedRPM) / BogRPM;               // 0..1 (1 = idle RPM)
+                float assistAccel = 3.5f * bog * throttlePedal;           // m/s^2 of hidden push
+                float dvA = assistAccel * Game.LastFrameTime;
+                Function.Call(Hash.APPLY_FORCE_TO_ENTITY, _vehicle.Handle, 1,
+                    0f, dvA, 0f, 0f, 0f, 0f, 0, true, true, true, false, true);
+                // Lugging audio/tach: engine chugs at low revs instead of reading dead-idle
+                float lugRPM = 0.30f + 0.15f * throttlePedal;
+                if (_cachedRPM < lugRPM)
                 {
-                    float redlineProgress = (_cachedRPM - RedlineStart) / (1.0f - RedlineStart);
-                    redlineProgress = Math.Min(1.0f, Math.Max(0.0f, redlineProgress));
-
-                    float throttleMultiplier = RedlinePenaltyMild - (redlineProgress * (RedlinePenaltyMild - RedlinePenaltyMax));
-
-                    float currentThrottle = VehicleMemory.GetThrottle(_vehicle);
-                    if (currentThrottle > 0.1f)
-                    {
-                        VehicleMemory.SetThrottle(_vehicle, currentThrottle * throttleMultiplier);
-                    }
+                    VehicleMemory.SetCurrentRPM(_vehicle, lugRPM);
+                    _cachedRPM = lugRPM;
                 }
             }
+            // 2b) NOS / NITROUS — hold the key while on the gas to spray: big torque + a forward shove,
+            //     bottle drains while active and slowly refills when not. Rides the same torque pipeline.
+            float dt = Game.LastFrameTime;
+            // CONTROLLER FIRST (user is a controller player): Xbox X = INPUT_VEH_HANDBRAKE (control 76).
+            // In a straight-line drag you don't need handbrake, so we read it as NOS and suppress the
+            // handbrake itself only while NOS is eligible (throttle down + moving) so normal handbraking
+            // still works at low/zero throttle. Keyboard N is the secondary fallback.
+            bool nosBtn = NosInstalled &&
+                          (Function.Call<bool>(Hash.IS_CONTROL_PRESSED, 0, 76) || Game.IsKeyPressed(_nosKey));
+            NosActive = nosBtn && NosLevel > 0.02f && throttlePedal > 0.45f && speedNow > 1.5f;
+            if (NosActive)
+            {
+                // Spraying under throttle: this is NOS, not a handbrake — suppress the handbrake input.
+                Function.Call(Hash.DISABLE_CONTROL_ACTION, 0, 76, true);
+                NosLevel = Math.Max(0f, NosLevel - NosDrainPerSec * dt);
+                mult *= NosPowerMult;
+                float dvN = NosShove * dt;
+                Function.Call(Hash.APPLY_FORCE_TO_ENTITY, _vehicle.Handle, 1,
+                    0f, dvN, 0f, 0f, 0f, 0f, 0, true, true, true, false, true);
+            }
+            else if (!nosBtn && NosLevel < 1f)
+            {
+                NosLevel = Math.Min(1f, NosLevel + NosRefillPerSec * dt);
+            }
+
+            _lastTorqueMult = mult;
+            Function.Call((Hash)SET_VEHICLE_CHEAT_POWER_INCREASE_HASH, _vehicle.Handle, mult);
+
+            // 3) AUTORUN TEST HARNESS — file-triggered full-throttle runway runs with CSV telemetry
+            //    (development tool; inert unless scripts/ExtendedLSC/autorun.txt appears).
+            HandleAutorun(now);
 
             // === AUTO-DOWNSHIFT AT STOP (every 30 frames) ===
             if (_updateCounter % 30 == 0 && _targetGear > 1)
@@ -441,6 +605,114 @@ namespace ExtendedLSC.ManualTransmission
 
             // Reset counter to prevent overflow
             if (_updateCounter > 10000) _updateCounter = 0;
+        }
+
+        /// <summary>
+        /// Autorun harness: when scripts/ExtendedLSC/autorun.txt appears (format "seconds;mode",
+        /// mode = auto | hold1), hold full throttle for that long, optionally auto-shifting in the
+        /// perfect window, while logging per-frame CSV telemetry to run_telemetry.csv.
+        /// </summary>
+        private void HandleAutorun(int now)
+        {
+            try
+            {
+                // Post-run safety braking (also covers proximity-triggered early stops)
+                if (now < _autoBrakeUntil)
+                {
+                    Function.Call(Hash.ENABLE_CONTROL_ACTION, 0, INPUT_VEH_BRAKE, true);
+                    Function.Call((Hash)SET_CONTROL_VALUE_NEXT_FRAME_HASH, 0, INPUT_VEH_BRAKE, 1.0f);
+                }
+
+                if (_autorunUntil == 0)
+                {
+                    if (_updateCounter % 30 != 0) return;
+                    string trigger = System.IO.Path.Combine(DataDir, "autorun.txt");
+                    if (!System.IO.File.Exists(trigger)) return;
+                    string[] parts = System.IO.File.ReadAllText(trigger).Trim().Split(';');
+                    System.IO.File.Delete(trigger);
+                    int secs = 8;
+                    int.TryParse(parts[0], out secs);
+                    _autorunMode = parts.Length > 1 ? parts[1].Trim() : "auto";
+                    _autorunUntil = now + Math.Max(1, secs) * 1000;
+                    _runStartTime = now;
+                    _csv = new System.Text.StringBuilder("ms,speed,rpm,gear,throttle,mult\n");
+                    Function.Call(Hash.SET_VEHICLE_HANDBRAKE, _vehicle.Handle, false);
+                    // Load the runway end marker (if recorded) for proximity auto-stop
+                    if (!_runwayEndLoaded)
+                    {
+                        _runwayEndLoaded = true;
+                        try
+                        {
+                            string endFile = System.IO.Path.Combine(DataDir, "runway_end.txt");
+                            if (System.IO.File.Exists(endFile))
+                            {
+                                var pe = System.IO.File.ReadAllText(endFile).Trim().Split(';');
+                                _runwayEnd = new GTA.Math.Vector3(
+                                    float.Parse(pe[0], System.Globalization.CultureInfo.InvariantCulture),
+                                    float.Parse(pe[1], System.Globalization.CultureInfo.InvariantCulture),
+                                    float.Parse(pe[2], System.Globalization.CultureInfo.InvariantCulture));
+                                Log?.Invoke($"[ELSC MT] Runway end marker loaded: {_runwayEnd}");
+                            }
+                        }
+                        catch { }
+                    }
+                    Log?.Invoke($"[ELSC MT] AUTORUN start: {secs}s mode={_autorunMode}");
+                    return;
+                }
+
+                // Proximity auto-stop: end the run and brake hard before the runway runs out
+                if (_runwayEnd != default(GTA.Math.Vector3) &&
+                    _vehicle.Position.DistanceTo2D(_runwayEnd) < 80f)
+                {
+                    _autorunUntil = now;   // forces the completion branch below this frame
+                    _autoBrakeUntil = now + 3000;
+                    Log?.Invoke("[ELSC MT] AUTORUN: runway end ahead - braking");
+                }
+
+                if (now < _autorunUntil)
+                {
+                    // Mode "downs": accelerate for the first 45% of the run, then coast and downshift
+                    // every 900ms — measures engine-brake decel per gear. Other modes: hold throttle.
+                    int elapsed = now - _runStartTime;
+                    int total = _autorunUntil - _runStartTime;
+                    bool coasting = _autorunMode == "downs" && elapsed > total * 45 / 100;
+
+                    if (!coasting)
+                    {
+                        Function.Call(Hash.ENABLE_CONTROL_ACTION, 0, INPUT_VEH_ACCELERATE, true);
+                        Function.Call((Hash)SET_CONTROL_VALUE_NEXT_FRAME_HASH, 0, INPUT_VEH_ACCELERATE, 1.0f);
+                        _injectedGas = true;
+                    }
+                    else if (_targetGear > 1 && (DateTime.Now - _lastShiftTime).TotalMilliseconds > 900)
+                    {
+                        ShiftDown();
+                    }
+
+                    // Auto-shift inside the perfect window (also exercises the boost).
+                    // Wheelspin guard: launch wheelspin reads ~0.9 RPM at walking pace, so also require
+                    // a minimum ground speed per gear before shifting (else 1->2->3 fires instantly and
+                    // the run dies in a bogged high gear).
+                    if (!coasting && (_autorunMode == "auto" || _autorunMode == "downs")
+                        && _cachedRPM >= 0.92f && _targetGear < _cachedTopGear
+                        && _vehicle.Speed > 7f * _targetGear
+                        && (DateTime.Now - _lastShiftTime).TotalMilliseconds > 600)
+                        ShiftUp();
+
+                    _csv?.AppendFormat(System.Globalization.CultureInfo.InvariantCulture,
+                        "{0},{1:F2},{2:F4},{3},{4:F3},{5:F2}\n",
+                        now - _runStartTime, _vehicle.Speed, _cachedRPM, _targetGear,
+                        VehicleMemory.GetThrottle(_vehicle), _lastTorqueMult);
+                }
+                else
+                {
+                    string outPath = System.IO.Path.Combine(DataDir, "run_telemetry.csv");
+                    if (_csv != null) System.IO.File.WriteAllText(outPath, _csv.ToString());
+                    _csv = null;
+                    _autorunUntil = 0;
+                    Log?.Invoke("[ELSC MT] AUTORUN complete -> run_telemetry.csv");
+                }
+            }
+            catch (Exception ex) { Log?.Invoke($"[ELSC MT] Autorun error: {ex.Message}"); _autorunUntil = 0; _csv = null; }
         }
 
         /// <summary>
