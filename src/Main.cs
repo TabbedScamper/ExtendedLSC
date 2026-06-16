@@ -13,6 +13,7 @@ using LemonUI.Menus;
 using LemonUI.Elements;
 using ExtendedLSC.ManualTransmission;
 using ExtendedLSC.WheelFitment;
+using ExtendedLSC.WindowTint;
 
 namespace ExtendedLSC
 {
@@ -473,7 +474,16 @@ namespace ExtendedLSC
         // ELSC Wheel Fitment (VStancer-style wheel adjustments)
         private WheelFitment.WheelFitment wheelFitment = new WheelFitment.WheelFitment();
         private Vehicle lastFitmentVehicle = null;
+
+        // Custom window-glass color (requires the dlc_elsc clear-glass texture)
+        private WindowTint.WindowTintManager windowTint = new WindowTint.WindowTintManager();
+        private VehicleSnapshot.VehicleSnapshotManager vehicleSnapshots = new VehicleSnapshot.VehicleSnapshotManager();
+        private bool _snapMenuWasOpen = false;
+        private int wheelApplyAxle = 0;   // wheel design target: 0 = Front + Rear, 1 = Front only, 2 = Rear only
         private bool _fitmentInitAllowed = true; // Disable if crashes occur
+        // Pause the live fitment while previewing wheels — otherwise it keeps re-applying the OLD wheel's
+        // camber/track/height offsets to the previewed wheel, making rims float/raise. Re-baselined on close.
+        private bool suspendWheelFitment = false;
         // Auto-applies saved stances to specific cars within range (even when not driving them).
         private WheelFitment.VehicleStanceManager stanceManager = new WheelFitment.VehicleStanceManager();
         private bool _stanceMgrInit = false;
@@ -490,10 +500,15 @@ namespace ExtendedLSC
         private const int TRANSACTION_DISPLAY_DURATION = 4000; // 4 seconds
 
         // Consolidated Debug Menu (F7 to open, select tool, B to exit)
-        private enum DebugMode { None, Menu, Resizer, SpriteBrowser, MenuPosition, InputTiming, StatsCalibration }
+        private enum DebugMode { None, Menu, Resizer, SpriteBrowser, MenuPosition, InputTiming }
         private DebugMode activeDebugMode = DebugMode.None;
+        private bool showCollisionDebug = false;   // debug menu: green body collision cloud + blue wheel colliders
+        private readonly System.Collections.Generic.List<Vector3> _bodyHits = new System.Collections.Generic.List<Vector3>();
+        private int _bodyScanHandle = 0;            // vehicle handle the body cloud was scanned for
+        private Vector3 _bodyMin, _bodyMax;         // local-space AABB of the body-only hits (extents box)
+        private bool _bodyBoxValid = false;
         private int debugMenuSelection = 0;
-        private readonly string[] debugMenuOptions = { "Resizer", "Sprite Browser", "Menu Position", "Input Timing", "Stats Calibration", "Exit Debug" };
+        private readonly string[] debugMenuOptions = { "Resizer", "Sprite Browser", "Menu Position", "Input Timing", "Collision Wireframe", "Exit Debug" };
         private bool debugGameInputMode = false;  // R3 toggle: when true, allows game input and hides our menu for comparison
         private bool debugBlockBButton = false;    // Flag to block B button processing this frame
 
@@ -530,11 +545,67 @@ namespace ExtendedLSC
         private int previewOriginalValue = -1;
 
         // Original vehicle stats (stored when entering performance mod menu)
-        private float originalTopSpeed = 0f;
-        private float originalAcceleration = 0f;
-        private float originalBraking = 0f;
-        private float originalTraction = 0f;
+        private float originalTopSpeed = 0f;        // now stores RAW handling fInitialDriveMaxFlatVel
+        private float originalAcceleration = 0f;    // raw fInitialDriveForce
+        private float originalBraking = 0f;         // raw fBrakeForce
+        private float originalTraction = 0f;        // raw fTractionCurveMax
         private bool hasStoredOriginalStats = false;
+
+        // Engine swap state. activeEngineSwap = what's installed on currentVehicle (display bonuses folded into
+        // the stat bars/PI). isPreviewingSwap + the preview bonuses drive the blue/red bar preview on hover.
+        private EngineSwap activeEngineSwap = null;
+        private NativeMenu engineSwapMenu = null;   // reference so preview state can track its visibility
+        private bool isPreviewingSwap = false;
+        private float swapPreviewAccelBonus = 0f;
+        private float swapPreviewSpeedBonus = 0f;
+        // Engine-audio swaps hijack the radio; re-assert the captured station until this GameTime.
+        private string radioRestoreStation = null;
+        private int radioRestoreUntil = 0;
+
+        // LSC stat-bar formulas DERIVED empirically from 107 real cars (handling.meta fields vs the displayed
+        // in-game LSC stats, R²≈0.88-0.94 — residual is the reference data's rounding to 5s). Each bar is ~linear
+        // in ONE handling field. Returns RAW fraction (can exceed 1 — engine swaps — for the Forza-style class
+        // chip); use StatPct() for the clamped [0,1] bar fill.
+        private enum LSCStat { TopSpeed, Accel, Braking, Traction }
+        private static float RawStatPct(LSCStat s, float v)
+        {
+            switch (s)
+            {
+                case LSCStat.TopSpeed: return (2.075f * v + 10.43f) / 340f;   // fInitialDriveMaxFlatVel, full at ~159
+                case LSCStat.Accel:    return (251.06f * v - 0.56f) / 100f;   // fInitialDriveForce,       full at ~0.40
+                case LSCStat.Braking:  return (31.05f * v + 1.79f) / 100f;    // fBrakeForce,              full at ~3.16
+                default:               return (29.85f * v + 0.66f) / 100f;    // fTractionCurveMax,        full at ~3.33
+            }
+        }
+        private static float StatPct(LSCStat s, float v)
+        {
+            float p = RawStatPct(s, v);
+            return p < 0f ? 0f : (p > 1f ? 1f : p);
+        }
+        private static float Clamp01(float x) => x < 0f ? 0f : (x > 1f ? 1f : x);
+
+        // Forza-style Performance Index (0-999) from the four RAW stat fractions (uncapped so upgrades/engine
+        // swaps push a car past its class). Weighting + class boundaries calibrated against the GTA roster
+        // (176 cars): mopeds/buses ~400 (D), compacts ~620 (B), sports ~674 (B), supercars ~750-790 (A),
+        // hypercars ~820 (S), race ~950 (X). See [[gtav-lsc-stat-formula]].
+        private static int ComputePI(float spd, float acc, float brk, float trc)
+        {
+            float pi = (spd * 0.30f + acc * 0.30f + trc * 0.25f + brk * 0.15f) * 999f;
+            if (pi < 0f) pi = 0f;
+            if (pi > 999f) pi = 999f;
+            return (int)(pi + 0.5f);
+        }
+
+        // Map a PI to its class letter + chip colour (D light-blue, C green, B yellow, A orange, S red, X purple).
+        private static void GetVehicleClassInfo(int pi, out string name, out int r, out int g, out int b)
+        {
+            if (pi < 500)      { name = "D"; r = 92;  g = 178; b = 255; }
+            else if (pi < 600) { name = "C"; r = 86;  g = 212; b = 99;  }
+            else if (pi < 700) { name = "B"; r = 240; g = 216; b = 58;  }
+            else if (pi < 800) { name = "A"; r = 255; g = 146; b = 38;  }
+            else if (pi < 900) { name = "S"; r = 240; g = 58;  b = 58;  }
+            else               { name = "X"; r = 190; g = 86;  b = 240; }
+        }
 
         // Config
         private Keys menuKey = Keys.F5;
@@ -542,13 +613,27 @@ namespace ExtendedLSC
 
         // LSC detection
         private int lastInterior = 0;
-        private static readonly int[] LSC_INTERIORS = { 39938 };
+        // All 5 SP Los Santos Customs interior IDs (captured via GET_INTERIOR_AT_COORDS):
+        // 39938 Burton, 37890 La Mesa, 9474 Route 68/Harmony, 115714 Paleto Bay, 93442 Grand Senora.
+        private static readonly int[] LSC_INTERIORS = { 39938, 37890, 9474, 115714, 93442 };
         private bool isInLSC = false;
         private bool waitingForVehicleStop = false;
         private Vector3 lastVehiclePos = Vector3.Zero;
+        private Vector3 lscWorldPos = Vector3.Zero;   // remembered LSC location, to suppress the "closed" help nearby too
+        private Vector3 customizeSpot = Vector3.Zero; // the exact spot the native teleport dropped the car (marker + 5m activation)
+        private int lscSettleSince = 0;               // when the first-entry cinematic finished parking the car
+        private bool lscSwapped = false;              // have we swapped the native mechanic this visit (suppress once)
+        private int lscSuppressUntil = 0;             // keep deleting the bay mechanic each frame until here (kills the vanilla menu flash)
+        private bool lscWentFar = false;              // player left the shop area since the last visit (=> carmod_shop reset => arm fresh)
+        // Default follow-camera framing applied on menu open (relative to the vehicle). Captured live to match
+        // the LSC-style "see what you're working on" angle. Default cam stays active; player can still move it.
+        private const float MENU_CAM_HEADING = -149.08f;
+        private const float MENU_CAM_PITCH = 13.44f;
+        private int menuCamUntil = 0;                 // re-assert the menu framing each frame until here (survives the LSC cinematic-end / follow-cam re-center)
+        private bool _recordVanillaLSC = false;       // TEMP (timing capture): stand down LSC hijack so the vanilla animation + menu run
 
         // Mechanic management
-        private const bool ENABLE_MECHANIC_REPLACEMENT = false; // Disabled for UI alignment
+        private const bool ENABLE_MECHANIC_REPLACEMENT = true; // Seamless swap halts carmod_shop's menu (no script termination)
         private Ped customMechanic = null;
         private Vector3 customMechanicPos = Vector3.Zero;
 
@@ -574,6 +659,8 @@ namespace ExtendedLSC
         private bool isInPresetMode = false;
         private bool isNavigatingMenu = false;  // Flag to prevent CloseMenu during menu navigation
         private NativeMenu wheelFitmentParent = null; // Parent (Wheels) menu to restore when the fitment menu closes
+        private NativeMenu alignmentParent = null;    // Parent (Suspension) menu to restore when Camber & Ride Height closes
+        private bool _hoveringCustomSuspension = false; // true while the "Custom Suspension and Camber" nav item is hovered (show OUR stance, not the game preview)
         private List<ModCameraPreset> availablePresets = new List<ModCameraPreset>();
 
         // Custom menu input handling (native GTA-style acceleration)
@@ -593,23 +680,6 @@ namespace ExtendedLSC
         private readonly string[] inputTimingSettingNames = { "Initial Delay", "Slow Repeat", "Fast Repeat", "Accel Threshold" };
 
         // Stats calibration debug settings (divisors and multipliers for each stat bar)
-        // Divisors based on actual handling.meta max values across all GTA V vehicles
-        private int statsCalibrationSetting = 0;  // 0-7 for 4 stats x 2 values each
-        private float statsTopSpeedDiv = 65f;     // Max ~65 m/s (supercars with upgrades)
-        private float statsTopSpeedMult = 0.95f;
-        private float statsAccelDiv = 0.50f;      // Max ~0.50 (fInitialDriveForce with upgrades)
-        private float statsAccelMult = 0.95f;
-        private float statsBrakingDiv = 1.5f;     // Max ~1.5 (fBrakeForce)
-        private float statsBrakingMult = 0.95f;
-        private float statsTractionDiv = 3.0f;    // Max ~3.0 (fTractionCurveMax)
-        private float statsTractionMult = 0.95f;
-        private readonly string[] statsCalibrationNames = {
-            "TopSpeed Div", "TopSpeed Mult",
-            "Accel Div", "Accel Mult",
-            "Braking Div", "Braking Mult",
-            "Traction Div", "Traction Mult"
-        };
-
         // Menu Position debug settings - multiple UI elements can be positioned
         private enum UIElement { Menu, ScrollArrows, Description, StatsPanel }
         private UIElement selectedUIElement = UIElement.Menu;
@@ -640,6 +710,13 @@ namespace ExtendedLSC
         private bool isEditingDescription = false;
         private string editingCategoryName = null;
         private int keyboardCheckCooldown = 0;
+
+        // Custom license-plate-text editor (on-screen keyboard + uniqueness conflict prompt)
+        private bool isEditingPlate = false;
+        private int plateKbCooldown = 0;
+        private string pendingPlateText = null;        // entered text awaiting conflict resolution
+        private string plateBeforeEdit = null;         // the car's plate when editing began (for color migration)
+        private NativeMenu plateConflictMenu = null;
 
         // Sprite browser debug settings
         private int spriteBrowserPage = 0;
@@ -746,6 +823,12 @@ namespace ExtendedLSC
             // Initialize vehicle save data (tracks purchased mods)
             VehicleSaveData.Log = Log;
             VehicleSaveData.Initialize();
+
+            // Let the window-tint manager surface player-facing messages (e.g. auto-plate on a collision).
+            windowTint.Notify = ShowNotification;
+
+            // Full per-vehicle snapshot save/restore (mods, paint, tint, wheels, …) keyed by model+plate.
+            vehicleSnapshots.Log = Log;
 
             // Initialize Manual Transmission API logging (for ikt's mod if present)
             ManualTransmissionAPI.Log = Log;
@@ -1442,6 +1525,11 @@ namespace ExtendedLSC
             if (menu == null || !menu.Visible) return;
             if (currentVehicle == null || !currentVehicle.Exists()) return;
 
+            // Track engine-swap preview purely from the swap menu's live visibility (no sticky flags to get
+            // stranded). When that menu isn't the one on screen, there is no swap preview.
+            isPreviewingSwap = engineSwapMenu != null && menu == engineSwapMenu;
+            if (isPreviewingSwap) UpdateSwapPreview(menu.SelectedIndex);
+
             // Get menu position for drawing
             float screenW = GTA.UI.Screen.Width;
             float screenH = GTA.UI.Screen.Height;
@@ -1494,66 +1582,72 @@ namespace ExtendedLSC
             }
 
             // Stats panel dimensions (use resizer debug values and scale)
-            float statPanelHeight = (statsRowHeight * 4 + statsPanelPadding) * statsPanelScaleH;
+            // Footer band holds the Forza-style class chip below the 4 stat rows.
+            float chipBandHeight = statsRowHeight * 1.05f * statsPanelScaleH;
+            float statPanelHeight = (statsRowHeight * 4 + statsPanelPadding) * statsPanelScaleH + chipBandHeight;
             float statPanelWidth = menuWidth * statsPanelScaleW;
 
             // Draw stats background panel
             Function.Call(Hash.DRAW_RECT, menuCenterX, statsStartY + statPanelHeight / 2f, statPanelWidth, statPanelHeight, 0, 0, 0, 200);
 
             // Get vehicle stats
-            float topSpeed = Function.Call<float>(Hash.GET_VEHICLE_ESTIMATED_MAX_SPEED, currentVehicle);
-            float acceleration = Function.Call<float>(Hash.GET_VEHICLE_ACCELERATION, currentVehicle);
-            float braking = Function.Call<float>(Hash.GET_VEHICLE_MAX_BRAKING, currentVehicle);
-            float traction = Function.Call<float>(Hash.GET_VEHICLE_MAX_TRACTION, currentVehicle);
+            // SPEED: raw fInitialDriveMaxFlatVel from memory (engine/brake/trans mods don't change top speed —
+            // verified). ACCEL/BRAKING/TRACTION: the NATIVES return the base handling field multiplied by
+            // installed performance-mod effects (and reflect live base-handling tuning too), so the bars MOVE and
+            // the blue/red purchase preview works. At stock the natives EQUAL the raw fields (verified), so the
+            // empirically-derived formula is calibrated for them.
+            float hMaxVel = WheelFitment.WheelMemory.GetHandlingFloat(currentVehicle, WheelFitment.WheelMemory.HOFF_MAX_FLAT_VEL);
+            float nAccel = Function.Call<float>(Hash.GET_VEHICLE_ACCELERATION, currentVehicle);
+            float nBrake = Function.Call<float>(Hash.GET_VEHICLE_MAX_BRAKING, currentVehicle);
+            float nTraction = Function.Call<float>(Hash.GET_VEHICLE_MAX_TRACTION, currentVehicle);
 
-            // LSC stat bars use a visual scaling formula that doesn't directly reflect handling values
-            // The bars are known to be "unreliable" per the modding community
-            // We use empirically-calibrated maximums to match real LSC appearance
-            // Reference: https://gtamods.com/wiki/Handling.meta
+            // Installed engine-swap display bonuses (EnginePowerMultiplier physics isn't read by the natives).
+            float instAcc = activeEngineSwap != null ? activeEngineSwap.AccelBonus : 0f;
+            float instSpd = activeEngineSwap != null ? activeEngineSwap.SpeedBonus : 0f;
 
-            // Native function return value ranges (approximate):
-            // GET_VEHICLE_ESTIMATED_MAX_SPEED: 30-50 m/s for most cars (supercars: 50-60)
-            // GET_VEHICLE_ACCELERATION: 0.25-0.45 (fInitialDriveForce from handling.meta)
-            // GET_VEHICLE_MAX_BRAKING: 0.8-3.0 (calculated from fBrakeForce * factors)
-            // GET_VEHICLE_MAX_TRACTION: 2.0-2.8 (fTractionCurveMax from handling.meta)
+            // RAW (uncapped) fractions. base* = the white "installed" bars; live* = the blue/red preview bars.
+            float baseSpeed = RawStatPct(LSCStat.TopSpeed, hMaxVel) + instSpd;
+            float baseAccel = RawStatPct(LSCStat.Accel, nAccel) + instAcc;
+            float baseBrake = RawStatPct(LSCStat.Braking, nBrake);
+            float baseTrac = RawStatPct(LSCStat.Traction, nTraction);
+            float liveSpeed = baseSpeed, liveAccel = baseAccel, liveBrake = baseBrake, liveTrac = baseTrac;
 
-            // Scaling formula: Use square root for compression (mimics game's visual scaling)
-            // This prevents supercars from maxing out all bars while showing progression
-            // Values are calibrated via Debug Menu > Stats Calibration
-            float topSpeedPct = (float)Math.Sqrt(Math.Min(1f, topSpeed / statsTopSpeedDiv)) * statsTopSpeedMult;
-            float accelPct = (float)Math.Sqrt(Math.Min(1f, acceleration / statsAccelDiv)) * statsAccelMult;
-            float brakingPct = (float)Math.Sqrt(Math.Min(1f, braking / statsBrakingDiv)) * statsBrakingMult;
-            float tractionPct = (float)Math.Sqrt(Math.Min(1f, traction / statsTractionDiv)) * statsTractionMult;
-
-            // Check if previewing a performance mod to show blue/red stat changes
-            float previewTopSpeedPct = -1f;
-            float previewAccelPct = -1f;
-            float previewBrakingPct = -1f;
-            float previewTractionPct = -1f;
-
-            // If we're previewing a mod, show the preview vs original
-            if (isPreviewingMod && previewModIndex >= 0 && hasStoredOriginalStats)
+            bool statPreviewing = false;
+            if (isPreviewingSwap)
+            {
+                // White = currently installed swap (base*), blue/red = hovered swap. Brakes/traction unchanged.
+                statPreviewing = true;
+                float nsSpeed = RawStatPct(LSCStat.TopSpeed, hMaxVel);
+                float nsAccel = RawStatPct(LSCStat.Accel, nAccel);
+                liveSpeed = nsSpeed + swapPreviewSpeedBonus;
+                liveAccel = nsAccel + swapPreviewAccelBonus;
+            }
+            else if (isPreviewingMod && previewModIndex >= 0 && hasStoredOriginalStats)
             {
                 // Performance mod indices: Engine=11, Brakes=12, Transmission=13, Suspension=15, Armor=16, Turbo=18
                 bool isPerformanceMod = previewModIndex == 11 || previewModIndex == 12 ||
                                          previewModIndex == 13 || previewModIndex == 15 ||
                                          previewModIndex == 16 || previewModIndex == 18;
-
                 if (isPerformanceMod)
                 {
-                    // Current stats (with preview applied) become the preview percentages
-                    previewTopSpeedPct = topSpeedPct;
-                    previewAccelPct = accelPct;
-                    previewBrakingPct = brakingPct;
-                    previewTractionPct = tractionPct;
-
-                    // Use stored original stats as the base (same formula as above)
-                    topSpeedPct = (float)Math.Sqrt(Math.Min(1f, originalTopSpeed / statsTopSpeedDiv)) * statsTopSpeedMult;
-                    accelPct = (float)Math.Sqrt(Math.Min(1f, originalAcceleration / statsAccelDiv)) * statsAccelMult;
-                    brakingPct = (float)Math.Sqrt(Math.Min(1f, originalBraking / statsBrakingDiv)) * statsBrakingMult;
-                    tractionPct = (float)Math.Sqrt(Math.Min(1f, originalTraction / statsTractionDiv)) * statsTractionMult;
+                    statPreviewing = true;
+                    // live (blue/red) = current natives (with the previewed mod) + installed swap (already base*)
+                    // base (white) = stored originals + installed swap bonus
+                    baseSpeed = RawStatPct(LSCStat.TopSpeed, originalTopSpeed) + instSpd;
+                    baseAccel = RawStatPct(LSCStat.Accel, originalAcceleration) + instAcc;
+                    baseBrake = RawStatPct(LSCStat.Braking, originalBraking);
+                    baseTrac = RawStatPct(LSCStat.Traction, originalTraction);
                 }
             }
+
+            float topSpeedPct = Clamp01(baseSpeed);
+            float accelPct = Clamp01(baseAccel);
+            float brakingPct = Clamp01(baseBrake);
+            float tractionPct = Clamp01(baseTrac);
+            float previewTopSpeedPct = statPreviewing ? Clamp01(liveSpeed) : -1f;
+            float previewAccelPct = statPreviewing ? Clamp01(liveAccel) : -1f;
+            float previewBrakingPct = statPreviewing ? Clamp01(liveBrake) : -1f;
+            float previewTractionPct = statPreviewing ? Clamp01(liveTrac) : -1f;
 
             // Draw each stat row (apply width scale to internal elements)
             float currentY = statsStartY + statsContentOffsetY;
@@ -1569,6 +1663,72 @@ namespace ExtendedLSC
             DrawStatRow("Braking", brakingPct, labelX, barStartX, barWidth, currentY, statsBarOffsetY, previewBrakingPct);
             currentY += rowHeight;
             DrawStatRow("Traction", tractionPct, labelX, barStartX, barWidth, currentY, statsBarOffsetY, previewTractionPct);
+
+            // Forza-style class chip (footer). PI uses RAW uncapped stats (incl. engine-swap bonuses) so
+            // upgrades/swaps can bump the class. base* = installed, live* = previewed → chip shows "B -> A".
+            int basePI = ComputePI(baseSpeed, baseAccel, baseBrake, baseTrac);
+            int livePI = statPreviewing ? ComputePI(liveSpeed, liveAccel, liveBrake, liveTrac) : basePI;
+            float chipCenterY = statsStartY + statPanelHeight - chipBandHeight / 2f;
+            DrawClassChip(menuLeftX, statPanelWidth, menuCenterX, chipCenterY, chipBandHeight,
+                          basePI, livePI, statPreviewing);
+        }
+
+        /// <summary>
+        /// Draw the Forza-style class chip: a coloured class-letter badge + "PERFORMANCE" label on the left and
+        /// the PI number on the right. When previewing a performance mod it shows the class/PI transition (the
+        /// resulting class colours the badge; the PI is drawn blue for a gain / red for a loss).
+        /// </summary>
+        private void DrawClassChip(float panelLeftX, float panelWidth, float panelCenterX, float centerY,
+                                   float bandHeight, int basePI, int newPI, bool previewing)
+        {
+            bool changed = previewing && newPI != basePI;
+            int shownPI = previewing ? newPI : basePI;
+
+            string baseName; int br, bg, bb; GetVehicleClassInfo(basePI, out baseName, out br, out bg, out bb);
+            string newName; int nr, ng, nb; GetVehicleClassInfo(shownPI, out newName, out nr, out ng, out nb);
+
+            float pad = 0.007f * statsPanelScaleW;
+
+            // --- Class badge (coloured square with the class letter) ---
+            float boxSize = bandHeight * 0.62f;
+            float boxCenterX = panelLeftX + pad + boxSize / 2f;
+            Function.Call(Hash.DRAW_RECT, boxCenterX, centerY, boxSize, boxSize, nr, ng, nb, 255);
+            // class letter centred in the badge (GTA text Y is the glyph top, so raise it ~0.62*box to centre)
+            Function.Call(Hash.SET_TEXT_FONT, 1);
+            Function.Call(Hash.SET_TEXT_SCALE, 0f, bandHeight * 11.5f);
+            Function.Call(Hash.SET_TEXT_COLOUR, 10, 10, 10, 255);
+            Function.Call(Hash.SET_TEXT_CENTRE, true);
+            Function.Call(Hash.BEGIN_TEXT_COMMAND_DISPLAY_TEXT, "STRING");
+            Function.Call(Hash.ADD_TEXT_COMPONENT_SUBSTRING_PLAYER_NAME, newName);
+            Function.Call(Hash.END_TEXT_COMMAND_DISPLAY_TEXT, boxCenterX, centerY - boxSize * 0.62f);
+
+            // --- "CLASS" / transition label to the right of the badge ---
+            float textX = boxCenterX + boxSize / 2f + pad;
+            float labelY = centerY - bandHeight * 0.30f;
+            string classLabel = changed ? (baseName + " → " + newName) : (newName + "-CLASS");
+            Function.Call(Hash.SET_TEXT_FONT, 0);
+            Function.Call(Hash.SET_TEXT_SCALE, 0f, statsLabelScale);
+            if (changed) Function.Call(Hash.SET_TEXT_COLOUR, nr, ng, nb, 255);
+            else Function.Call(Hash.SET_TEXT_COLOUR, 235, 235, 235, 255);
+            Function.Call(Hash.SET_TEXT_CENTRE, false);
+            Function.Call(Hash.BEGIN_TEXT_COMMAND_DISPLAY_TEXT, "STRING");
+            Function.Call(Hash.ADD_TEXT_COMPONENT_SUBSTRING_PLAYER_NAME, classLabel);
+            Function.Call(Hash.END_TEXT_COMMAND_DISPLAY_TEXT, textX, labelY);
+
+            // --- PI number, right-aligned in the band ---
+            int piColR = 235, piColG = 235, piColB = 235;
+            if (changed) { if (newPI > basePI) { piColR = 0; piColG = 150; piColB = 255; } else { piColR = 255; piColG = 50; piColB = 50; } }
+            string piText = (changed ? (basePI + " → " + newPI) : shownPI.ToString()) + " PI";
+            float rightX = panelLeftX + panelWidth - pad;
+            Function.Call(Hash.SET_TEXT_FONT, 4);
+            Function.Call(Hash.SET_TEXT_SCALE, 0f, statsLabelScale);
+            Function.Call(Hash.SET_TEXT_COLOUR, piColR, piColG, piColB, 255);
+            Function.Call(Hash.SET_TEXT_WRAP, 0f, rightX);
+            Function.Call(Hash.SET_TEXT_RIGHT_JUSTIFY, true);
+            Function.Call(Hash.BEGIN_TEXT_COMMAND_DISPLAY_TEXT, "STRING");
+            Function.Call(Hash.ADD_TEXT_COMPONENT_SUBSTRING_PLAYER_NAME, piText);
+            Function.Call(Hash.END_TEXT_COMMAND_DISPLAY_TEXT, 0f, labelY);
+            Function.Call(Hash.SET_TEXT_RIGHT_JUSTIFY, false);
         }
 
         /// <summary>
@@ -1885,6 +2045,11 @@ namespace ExtendedLSC
             // Set current vehicle for MenuConfig (used for vehicle-specific overrides)
             MenuConfig.CurrentVehicle = currentVehicle.DisplayName;
 
+            // Load + re-assert this vehicle's saved engine swap (EnginePowerMultiplier/forced audio reset when
+            // the entity restreams, so re-apply whenever we rebuild the menu for this car).
+            activeEngineSwap = EngineSwaps.Lookup(VehicleSaveData.GetEngineSwapId(currentVehicle.DisplayName));
+            if (activeEngineSwap != null) ApplyEngineSwap(activeEngineSwap);
+
             try
             {
                 // Clear main menu
@@ -2001,7 +2166,7 @@ namespace ExtendedLSC
                 {
                     var frontMenu = CreateModMenuByIndex(1, frontBumperCount, "Front Bumper");
                     frontMenu.Closed += (s, e) => { if (!isNavigatingMenu) bumpersMenu.Visible = true; };
-                    var frontItem = new NativeItem("Front Bumper");
+                    var frontItem = new NativeItem(SlotName(1, "Front Bumper"));
                     frontItem.AltTitle = ">>";
                     frontItem.Activated += (s, e) => { isNavigatingMenu = true; bumpersMenu.Visible = false; frontMenu.Visible = true; isNavigatingMenu = false; };
                     bumpersMenu.Add(frontItem);
@@ -2010,7 +2175,7 @@ namespace ExtendedLSC
                 {
                     var rearMenu = CreateModMenuByIndex(2, rearBumperCount, "Rear Bumper");
                     rearMenu.Closed += (s, e) => { if (!isNavigatingMenu) bumpersMenu.Visible = true; };
-                    var rearItem = new NativeItem("Rear Bumper");
+                    var rearItem = new NativeItem(SlotName(2, "Rear Bumper"));
                     rearItem.AltTitle = ">>";
                     rearItem.Activated += (s, e) => { isNavigatingMenu = true; bumpersMenu.Visible = false; rearMenu.Visible = true; isNavigatingMenu = false; };
                     bumpersMenu.Add(rearItem);
@@ -2025,11 +2190,17 @@ namespace ExtendedLSC
                 AddSubmenuItem("Engine", menu);
             }
 
+            // Engine Swap (custom feature: engine sound + power packages)
+            {
+                var swapMenu = CreateEngineSwapMenu();
+                AddSubmenuItem("Engine Swap", swapMenu);
+            }
+
             // Exhaust (4)
             if (GetModCount(4) > 0)
             {
                 var menu = CreateModMenuByIndex(4, GetModCount(4), "Exhaust");
-                AddSubmenuItem("Exhaust", menu);
+                AddSubmenuItem(SlotName(4, "Exhaust"), menu);
             }
 
             // Extras (Side Course feature - toggle vehicle extras)
@@ -2050,27 +2221,27 @@ namespace ExtendedLSC
             {
                 // Create fender menu directly with left fender mods (most common case)
                 var menu = CreateModMenuByIndex(8, leftFenderCount, "FENDERS");
-                AddSubmenuItem("Fender", menu);
+                AddSubmenuItem(SlotName(8, "Fender"), menu);
             }
             // Right fender is rare - add as separate category if it exists
             if (rightFenderCount > 0)
             {
                 var menu = CreateModMenuByIndex(9, rightFenderCount, "FENDERS (RIGHT)");
-                AddSubmenuItem("Fender (Right)", menu);
+                AddSubmenuItem(SlotName(9, "Fender (Right)"), menu);
             }
 
             // Grille (6)
             if (GetModCount(6) > 0)
             {
                 var menu = CreateModMenuByIndex(6, GetModCount(6), "Grille");
-                AddSubmenuItem("Grille", menu);
+                AddSubmenuItem(SlotName(6, "Grille"), menu);
             }
 
             // Hood (7)
             if (GetModCount(7) > 0)
             {
                 var menu = CreateModMenuByIndex(7, GetModCount(7), "Hood");
-                AddSubmenuItem("Hood", menu);
+                AddSubmenuItem(SlotName(7, "Hood"), menu);
             }
 
             // Horn (14)
@@ -2345,35 +2516,69 @@ namespace ExtendedLSC
             if (GetModCount(5) > 0)
             {
                 var menu = CreateModMenuByIndex(5, GetModCount(5), "Roll Cage");
-                AddSubmenuItem("Roll Cage", menu);
+                AddSubmenuItem(SlotName(5, "Roll Cage"), menu);
             }
 
             // Roof (10)
             if (GetModCount(10) > 0)
             {
                 var menu = CreateModMenuByIndex(10, GetModCount(10), "Roof");
-                AddSubmenuItem("Roof", menu);
+                AddSubmenuItem(SlotName(10, "Roof"), menu);
             }
 
             // Skirts (3)
             if (GetModCount(3) > 0)
             {
                 var menu = CreateModMenuByIndex(3, GetModCount(3), "Skirts");
-                AddSubmenuItem("Skirts", menu);
+                AddSubmenuItem(SlotName(3, "Skirts"), menu);
             }
 
             // Spoiler (0)
             if (GetModCount(0) > 0)
             {
                 var menu = CreateModMenuByIndex(0, GetModCount(0), "Spoiler");
-                AddSubmenuItem("Spoiler", menu);
+                AddSubmenuItem(SlotName(0, "Spoiler"), menu);
             }
 
-            // Suspension (15)
-            if (GetModCount(15) > 0)
+            // Suspension (15) — native lowering levels PLUS the custom Camber & Ride Height (alignment),
+            // because in real life camber + ride height ARE suspension. Always shown so alignment is
+            // available even on vehicles without native suspension mods.
             {
-                var menu = CreateModMenuByIndex(15, GetModCount(15), "Suspension");
-                AddSubmenuItem("Suspension", menu);
+                var menu = GetModCount(15) > 0
+                    ? CreateModMenuByIndex(15, GetModCount(15), "Suspension")
+                    : CreateMenu("Suspension");
+                if (menu != null)
+                {
+                    alignmentParent = menu;   // BuildAlignmentMenu restores to this on close
+                    var alignNav = new NativeItem("Custom Suspension and Camber", FitmentSummary());
+                    alignNav.AltTitle = ">>";
+                    // Refresh the saved-value summary each time the Suspension menu opens.
+                    menu.Shown += (s, e) => { alignNav.Description = FitmentSummary(); _hoveringCustomSuspension = false; };
+                    // Hovering our custom item should show OUR stance, not a game-level preview: undo the
+                    // generic preview (back to the original installed level) and let our ride-height re-apply.
+                    menu.SelectedIndexChanged += (s, e) =>
+                    {
+                        bool onNav = menu.SelectedItem == alignNav;
+                        _hoveringCustomSuspension = onNav;
+                        if (onNav && currentVehicle != null && currentVehicle.Exists())
+                        {
+                            Function.Call(Hash.SET_VEHICLE_MOD_KIT, currentVehicle, 0);
+                            Function.Call(Hash.SET_VEHICLE_MOD, currentVehicle, 15, previewOriginalValue, false);
+                            // Re-apply our stance on THIS frame so there's no one-frame gap at the base.
+                            wheelFitment.SuspendRideHeight = false;
+                            wheelFitment.ApplyRideHeightNow();
+                        }
+                    };
+                    // Rebuild fresh on open so it reflects current wheels / owned / pro-mode state.
+                    alignNav.Activated += (s, e) =>
+                    {
+                        var sub = BuildAlignmentMenu();
+                        if (sub == null) return;
+                        isNavigatingMenu = true; menu.Visible = false; sub.Visible = true; isNavigatingMenu = false;
+                    };
+                    menu.Add(alignNav);
+                    AddSubmenuItem("Suspension", menu);
+                }
             }
 
             // Transmission (13)
@@ -2450,6 +2655,35 @@ namespace ExtendedLSC
             {
                 AddSubmenuItem("Windows", windowTintMenu);
             }
+
+            // Benny's / interior / engine-bay categories (Engine Block, Air Filter, Struts, Arch Cover, Seats,
+            // Dashboard, Door Speakers, Steering Wheel, Hydraulics, Trunk, etc.). These have ModCategories
+            // entries but weren't built by the hardcoded blocks above, so the car's Benny's parts never showed.
+            // Add any the current car actually has. (46 Windows is skipped — the tint item already uses that
+            // name; 48 Livery is already built above.)
+            int[] bennysIndices = { 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45 };
+            foreach (int mi in bennysIndices)
+            {
+                if (mi == 24 && !currentVehicle.Model.IsBike) continue;     // rear wheels: motorcycles only
+                if (GetModCount(mi) <= 0) continue;
+                if (!ModCategories.AllCategories.TryGetValue(mi, out var cat)) continue;
+                var bm = CreateModMenuByIndex(mi, GetModCount(mi), cat.DisplayName);
+                if (bm != null) AddSubmenuItem(cat.DisplayName, bm);
+            }
+        }
+
+        /// <summary>True for motorcycles/bikes — they use the bike wheel type (6) and can't be stanced.</summary>
+        private bool IsBike(Vehicle v)
+        {
+            if (v == null || !v.Exists()) return false;
+            try { return Function.Call<bool>(Hash.IS_THIS_MODEL_A_BIKE, v.Model.Hash); } catch { return false; }
+        }
+
+        /// <summary>Stancing is only allowed on 4-wheel vehicles (excludes bikes, trikes, 6-wheelers, etc.).</summary>
+        private bool CanStance(Vehicle v)
+        {
+            if (v == null || !v.Exists()) return false;
+            try { return WheelFitment.WheelMemory.GetWheelCount(v) == 4; } catch { return false; }
         }
 
         private NativeMenu BuildWheelsMenu()
@@ -2460,16 +2694,57 @@ namespace ExtendedLSC
             var wheelTypeMenu = CreateMenu("Wheel Types");
             wheelTypeMenu.Closed += (s, e) => { if (!isNavigatingMenu) menu.Visible = true; };
 
-            // Wheel types in LSC order: High End, Lowrider, Muscle, Off-Road, Sport, SUV, Tuner
-            var wheelTypes = new[] {
-                (6, "High End"),
-                (2, "Lowrider"),
-                (1, "Muscle"),
-                (4, "Off-Road"),
-                (0, "Sport"),
-                (3, "SUV"),
-                (5, "Tuner")
+            // Stock Wheels — revert to the car's factory wheels (the per-type lists have no -1 "stock"
+            // entry like generic mod menus do). Sits at the top of the wheel-type list.
+            var stockWheelsItem = new NativeItem("Stock Wheels", "Revert to the factory wheels");
+            stockWheelsItem.Activated += (s, e) =>
+            {
+                if (currentVehicle != null && currentVehicle.Exists())
+                {
+                    Function.Call(Hash.SET_VEHICLE_MOD_KIT, currentVehicle, 0);
+                    Function.Call(Hash.SET_VEHICLE_MOD, currentVehicle, 23, -1, false); // front -> stock
+                    Function.Call(Hash.SET_VEHICLE_MOD, currentVehicle, 24, -1, false); // back -> stock
+                    ShowNotification("~g~Reverted to stock wheels");
+                }
             };
+            wheelTypeMenu.Add(stockWheelsItem);
+
+            // Apply-To axle selector — lets the player run staggered setups (different front/rear rim designs).
+            // The wheel TYPE is shared across all wheels (GTA limit), but the front (mod 23) / rear (mod 24)
+            // DESIGN can differ. Not shown on bikes.
+            if (!IsBike(currentVehicle))
+            {
+                var axleItem = new NativeListItem<string>("Apply To", "Front + Rear", "Front Only", "Rear Only")
+                {
+                    SelectedIndex = wheelApplyAxle,
+                    Description = "Choose which wheels a design applies to (for staggered setups)"
+                };
+                axleItem.ItemChanged += (s, e) => { wheelApplyAxle = e.Index; };
+                NoWrap(axleItem);
+                wheelTypeMenu.Add(axleItem);
+            }
+
+            // Wheel types (indices match the GTA enum). High End is 7 (NOT 6 — 6 is BikeWheels). Benny's
+            // (8/9) + Street/Track/Open Wheel (10-12) were missing entirely. Empty types return null and are
+            // skipped, so a car without a given type just won't list it.
+            // Motorcycles only have the Bike Wheels type (6); the car types are empty for them, so show ONLY
+            // bike wheels on a bike and ONLY the car types on a car.
+            var wheelTypes = IsBike(currentVehicle)
+                ? new[] { (6, "Bike Wheels") }
+                : new[] {
+                    (7, "High End"),
+                    (2, "Lowrider"),
+                    (1, "Muscle"),
+                    (4, "Off-Road"),
+                    (0, "Sport"),
+                    (3, "SUV"),
+                    (5, "Tuner"),
+                    (8, "Benny's Originals"),
+                    (9, "Benny's Bespoke"),
+                    (11, "Street"),
+                    (12, "Track"),
+                    (10, "Open Wheel")
+                };
 
             foreach (var (typeIndex, typeName) in wheelTypes)
             {
@@ -2536,11 +2811,10 @@ namespace ExtendedLSC
             tiresNavItem.Activated += (s, e) => { isNavigatingMenu = true; menu.Visible = false; tiresMenu.Visible = true; isNavigatingMenu = false; };
             menu.Add(tiresNavItem);
 
-            // Wheel Fitment submenu (VStancer-style adjustments)
-            GTA.UI.Notification.Show($"~b~DEBUG~w~: VStancerIntegration={ModSettings.VStancerIntegration}");
-            if (ModSettings.VStancerIntegration)
+            // Wheel Fitment submenu (VStancer-style adjustments). Stancing is 4-wheel only — bikes and other
+            // non-4-wheel vehicles don't get the Fitment menu at all.
+            if (ModSettings.VStancerIntegration && CanStance(currentVehicle))
             {
-                GTA.UI.Notification.Show("~g~Building Wheel Fitment menu...");
                 wheelFitmentParent = menu;   // so BuildWheelFitmentMenu can restore this parent on close
                 var fitmentMenu = BuildWheelFitmentMenu();
                 if (fitmentMenu != null)
@@ -2550,9 +2824,18 @@ namespace ExtendedLSC
                     var fitmentNavItem = new NativeItem("Wheel Fitment");
                     fitmentNavItem.AltTitle = ">>";
                     fitmentNavItem.Description = "Adjust camber, track width, and ride height";
-                    fitmentNavItem.Activated += (s, e) => { isNavigatingMenu = true; menu.Visible = false; fitmentMenu.Visible = true; isNavigatingMenu = false; };
+                    // REBUILD on open so the size/width sliders unlock the moment aftermarket wheels are on
+                    // (HasVisualWheels is read at build time; the menu was previously built once with stock
+                    // wheels and never refreshed).
+                    fitmentNavItem.Activated += (s, e) =>
+                    {
+                        isNavigatingMenu = true;
+                        menu.Visible = false;
+                        var fresh = BuildWheelFitmentMenu() ?? fitmentMenu;
+                        fresh.Visible = true;
+                        isNavigatingMenu = false;
+                    };
                     menu.Add(fitmentNavItem);
-                    GTA.UI.Notification.Show("~g~Wheel Fitment menu added!");
                 }
                 else
                 {
@@ -2567,250 +2850,97 @@ namespace ExtendedLSC
         {
             if (currentVehicle == null || !currentVehicle.Exists()) return null;
 
-            var menu = CreateMenu("Wheel Fitment");
-
-            // Restore the parent (Wheels) menu when this menu closes. Wired here — not at the call site —
-            // so EVERY built instance (including the ones rebuilt by Reset/Purchase) navigates back
-            // correctly instead of vanishing and locking up.
-            menu.Closed += (s, e) => { if (!isNavigatingMenu && wheelFitmentParent != null) wheelFitmentParent.Visible = true; };
-
-            // Initialize fitment for current vehicle
-            if (!wheelFitment.IsInitialized || lastFitmentVehicle != currentVehicle)
+            // Simplified: titled "Fitment Service", Pro toggle on top, then Wheel Width / Size / Poke,
+            // then Reset. No purchase gate, no Save button — it auto-saves when you leave the menu.
+            var menu = CreateMenu("Fitment Service");
+            menu.Closed += (s, e) =>
             {
-                wheelFitment.Initialize(currentVehicle);
-                lastFitmentVehicle = currentVehicle;
+                SaveCurrentFitment();   // auto-save on leave
+                if (!isNavigatingMenu && wheelFitmentParent != null) wheelFitmentParent.Visible = true;
+            };
 
-                // Load saved fitment if owned
-                string vehName = currentVehicle.DisplayName;
-                if (VehicleSaveData.IsWheelFitmentOwned(vehName))
-                {
-                    var saved = VehicleSaveData.GetFitmentData(vehName);
-                    wheelFitment.FrontCamber = saved.FrontCamber;
-                    wheelFitment.RearCamber = saved.RearCamber;
-                    wheelFitment.FrontTrackWidth = saved.FrontTrackWidth;
-                    wheelFitment.RearTrackWidth = saved.RearTrackWidth;
-                    wheelFitment.FrontHeight = saved.FrontHeight;
-                    wheelFitment.RearHeight = saved.RearHeight;
-                }
-            }
-
-            // Check if fitment is already owned
-            bool isOwned = VehicleSaveData.IsWheelFitmentOwned(currentVehicle.DisplayName);
-            int fitmentPrice = 2500; // Base price for fitment service
-
-            // Purchase/Status item
-            var purchaseItem = new NativeItem(isOwned ? "Fitment Service" : "Purchase Fitment", isOwned ? "Installed" : $"${fitmentPrice:N0}");
-            purchaseItem.Description = isOwned ? "Adjust your wheel fitment below" : "Purchase to enable wheel fitment adjustments";
-            if (!isOwned)
-            {
-                purchaseItem.Activated += (s, e) =>
-                {
-                    int playerMoney = Game.Player.Money;
-                    if (playerMoney >= fitmentPrice)
-                    {
-                        Game.Player.Money -= fitmentPrice;
-                        VehicleSaveData.SetWheelFitmentOwned(currentVehicle.DisplayName, true);
-                        VehicleSaveData.Save();
-                        transactionAmount = fitmentPrice;
-                        transactionStartTime = Game.GameTime;
-                        GTA.UI.Notification.Show("Wheel Fitment service purchased!");
-                        // Rebuild menu to show sliders
-                        isNavigatingMenu = true;
-                        menu.Visible = false;
-                        var newMenu = BuildWheelFitmentMenu();
-                        newMenu.Visible = true;
-                        isNavigatingMenu = false;
-                    }
-                    else
-                    {
-                        GTA.UI.Notification.Show("~r~Not enough money!");
-                    }
-                };
-            }
-            menu.Add(purchaseItem);
-
-            // Only show adjustment options if owned
-            if (isOwned)
-            {
-                menu.Add(new NativeItem("") { Enabled = false }); // Spacer
-
-                if (ModSettings.WheelFitmentProMode)
-                {
-                // ============ PRO MODE: raw per-axle controls ============
-                // Front Camber slider
-                var frontCamberValues = new List<float>();
-                for (float v = WheelFitment.WheelFitment.MIN_CAMBER; v <= WheelFitment.WheelFitment.MAX_CAMBER + 0.001f; v += 0.01f)
-                    frontCamberValues.Add((float)Math.Round(v, 2));
-                int fcIdx = frontCamberValues.FindIndex(v => Math.Abs(v - wheelFitment.FrontCamber) < 0.005f);
-                if (fcIdx < 0) fcIdx = frontCamberValues.Count / 2;
-                var frontCamberItem = new NativeListItem<float>("Front Camber", frontCamberValues.ToArray()) { SelectedIndex = fcIdx };
-                frontCamberItem.ItemChanged += (s, e) => {
-                    wheelFitment.FrontCamber = e.Object;
-                    GTA.UI.Notification.Show($"~y~Front Camber~w~: {e.Object:F2} rad ({WheelFitment.WheelFitment.ToDegrees(e.Object):F1}°)");
-                };
-                frontCamberItem.Description = $"Tilt front wheels ({WheelFitment.WheelFitment.ToDegrees(WheelFitment.WheelFitment.MIN_CAMBER):F0}° to {WheelFitment.WheelFitment.ToDegrees(WheelFitment.WheelFitment.MAX_CAMBER):F0}°)";
-                menu.Add(frontCamberItem);
-
-                // Rear Camber slider
-                var rearCamberValues = new List<float>();
-                for (float v = WheelFitment.WheelFitment.MIN_CAMBER; v <= WheelFitment.WheelFitment.MAX_CAMBER + 0.001f; v += 0.01f)
-                    rearCamberValues.Add((float)Math.Round(v, 2));
-                int rcIdx = rearCamberValues.FindIndex(v => Math.Abs(v - wheelFitment.RearCamber) < 0.005f);
-                if (rcIdx < 0) rcIdx = rearCamberValues.Count / 2;
-                var rearCamberItem = new NativeListItem<float>("Rear Camber", rearCamberValues.ToArray()) { SelectedIndex = rcIdx };
-                rearCamberItem.ItemChanged += (s, e) => { wheelFitment.RearCamber = e.Object; };
-                rearCamberItem.Description = $"Tilt rear wheels ({WheelFitment.WheelFitment.ToDegrees(WheelFitment.WheelFitment.MIN_CAMBER):F0}° to {WheelFitment.WheelFitment.ToDegrees(WheelFitment.WheelFitment.MAX_CAMBER):F0}°)";
-                menu.Add(rearCamberItem);
-
-                // Front Track Width slider
-                var frontTrackValues = new List<float>();
-                for (float v = WheelFitment.WheelFitment.MIN_TRACK_WIDTH; v <= WheelFitment.WheelFitment.MAX_TRACK_WIDTH + 0.001f; v += 0.01f)
-                    frontTrackValues.Add((float)Math.Round(v, 2));
-                int ftIdx = frontTrackValues.FindIndex(v => Math.Abs(v - wheelFitment.FrontTrackWidth) < 0.005f);
-                if (ftIdx < 0) ftIdx = frontTrackValues.FindIndex(v => Math.Abs(v) < 0.005f);
-                var frontTrackItem = new NativeListItem<float>("Front Track Width", frontTrackValues.ToArray()) { SelectedIndex = ftIdx };
-                frontTrackItem.ItemChanged += (s, e) => {
-                    wheelFitment.FrontTrackWidth = e.Object;
-                    GTA.UI.Notification.Show($"~y~Front Track~w~: {e.Object:F2}m");
-                };
-                frontTrackItem.Description = "Widen or narrow front wheels";
-                menu.Add(frontTrackItem);
-
-                // Rear Track Width slider
-                var rearTrackValues = new List<float>();
-                for (float v = WheelFitment.WheelFitment.MIN_TRACK_WIDTH; v <= WheelFitment.WheelFitment.MAX_TRACK_WIDTH + 0.001f; v += 0.01f)
-                    rearTrackValues.Add((float)Math.Round(v, 2));
-                int rtIdx = rearTrackValues.FindIndex(v => Math.Abs(v - wheelFitment.RearTrackWidth) < 0.005f);
-                if (rtIdx < 0) rtIdx = rearTrackValues.FindIndex(v => Math.Abs(v) < 0.005f);
-                var rearTrackItem = new NativeListItem<float>("Rear Track Width", rearTrackValues.ToArray()) { SelectedIndex = rtIdx };
-                rearTrackItem.ItemChanged += (s, e) => { wheelFitment.RearTrackWidth = e.Object; };
-                rearTrackItem.Description = "Widen or narrow rear wheels";
-                menu.Add(rearTrackItem);
-
-                // Front Height slider
-                var frontHeightValues = new List<float>();
-                for (float v = WheelFitment.WheelFitment.MIN_HEIGHT; v <= WheelFitment.WheelFitment.MAX_HEIGHT + 0.001f; v += 0.01f)
-                    frontHeightValues.Add((float)Math.Round(v, 2));
-                int fhIdx = frontHeightValues.FindIndex(v => Math.Abs(v - wheelFitment.FrontHeight) < 0.005f);
-                if (fhIdx < 0) fhIdx = frontHeightValues.FindIndex(v => Math.Abs(v) < 0.005f);
-                var frontHeightItem = new NativeListItem<float>("Front Height", frontHeightValues.ToArray()) { SelectedIndex = fhIdx };
-                frontHeightItem.ItemChanged += (s, e) => { wheelFitment.FrontHeight = e.Object; };
-                frontHeightItem.Description = "Raise or lower front suspension";
-                menu.Add(frontHeightItem);
-
-                // Rear Height slider
-                var rearHeightValues = new List<float>();
-                for (float v = WheelFitment.WheelFitment.MIN_HEIGHT; v <= WheelFitment.WheelFitment.MAX_HEIGHT + 0.001f; v += 0.01f)
-                    rearHeightValues.Add((float)Math.Round(v, 2));
-                int rhIdx = rearHeightValues.FindIndex(v => Math.Abs(v - wheelFitment.RearHeight) < 0.005f);
-                if (rhIdx < 0) rhIdx = rearHeightValues.FindIndex(v => Math.Abs(v) < 0.005f);
-                var rearHeightItem = new NativeListItem<float>("Rear Height", rearHeightValues.ToArray()) { SelectedIndex = rhIdx };
-                rearHeightItem.ItemChanged += (s, e) => { wheelFitment.RearHeight = e.Object; };
-                rearHeightItem.Description = "Raise or lower rear suspension";
-                menu.Add(rearHeightItem);
-
-                // ---- Visual wheel size/width (reverse-engineered + verified, build 3788) ----
-                if (wheelFitment.HasVisualWheels)
-                {
-                    var visSizeValues = new List<float>();
-                    for (float v = WheelFitment.WheelFitment.MIN_VISUAL; v <= WheelFitment.WheelFitment.MAX_VISUAL + 0.001f; v += 0.05f)
-                        visSizeValues.Add((float)Math.Round(v, 2));
-                    int vsIdx = visSizeValues.FindIndex(v => Math.Abs(v - wheelFitment.VisualSize) < 0.025f);
-                    if (vsIdx < 0) vsIdx = visSizeValues.FindIndex(v => Math.Abs(v - 1f) < 0.025f);
-                    var visSizeItem = new NativeListItem<float>("Wheel Size", visSizeValues.ToArray()) { SelectedIndex = vsIdx };
-                    visSizeItem.ItemChanged += (s, e) => {
-                        wheelFitment.VisualSize = e.Object;
-                        GTA.UI.Notification.Show($"~y~Wheel Size~w~: {e.Object:F2}x");
-                    };
-                    visSizeItem.Description = "Bigger/smaller wheels (visual + collision)";
-                    menu.Add(visSizeItem);
-
-                    var visWidthValues = new List<float>();
-                    for (float v = WheelFitment.WheelFitment.MIN_VISUAL; v <= WheelFitment.WheelFitment.MAX_VISUAL + 0.001f; v += 0.05f)
-                        visWidthValues.Add((float)Math.Round(v, 2));
-                    int vwIdx = visWidthValues.FindIndex(v => Math.Abs(v - wheelFitment.VisualWidth) < 0.025f);
-                    if (vwIdx < 0) vwIdx = visWidthValues.FindIndex(v => Math.Abs(v - 1f) < 0.025f);
-                    var visWidthItem = new NativeListItem<float>("Wheel Width", visWidthValues.ToArray()) { SelectedIndex = vwIdx };
-                    visWidthItem.ItemChanged += (s, e) => {
-                        wheelFitment.VisualWidth = e.Object;
-                        GTA.UI.Notification.Show($"~y~Wheel Width~w~: {e.Object:F2}x");
-                    };
-                    visWidthItem.Description = "Wider/narrower wheels (visual + collision)";
-                    menu.Add(visWidthItem);
-                }
-                else
-                {
-                    var noVisualItem = new NativeItem("Wheel Size / Width", "Fit custom wheels") { Enabled = false };
-                    noVisualItem.Description = "Install aftermarket wheels (LSC) to adjust visual size/width";
-                    menu.Add(noVisualItem);
-                }
-                }
-                else
-                {
-                    // ============ SIMPLE MODE: real-world units, one slider per concept ============
-                    BuildSimpleFitmentItems(menu);
-                }
-
-                // Pro Mode toggle (persisted to INI)
-                var proItem = new NativeCheckboxItem("Pro Mode", "Unlock per-axle camber, track width and height controls", ModSettings.WheelFitmentProMode);
-                proItem.CheckboxChanged += (s, e) =>
-                {
-                    ModSettings.WheelFitmentProMode = proItem.Checked;
-                    ModSettings.Save();
-                    // Rebuild so the item set matches the mode
-                    isNavigatingMenu = true;
-                    menu.Visible = false;
-                    var newMenu = BuildWheelFitmentMenu();
-                    newMenu.Visible = true;
-                    isNavigatingMenu = false;
-                };
-                menu.Add(proItem);
-
-                menu.Add(new NativeItem("") { Enabled = false }); // Spacer
-
-                // Save button
-                var saveItem = new NativeItem("Save Fitment");
-                saveItem.Description = "Save current fitment settings";
-                saveItem.Activated += (s, e) =>
-                {
-                    SaveCurrentFitment();
-                    GTA.UI.Notification.Show("Fitment saved!");
-                };
-                menu.Add(saveItem);
-
-                // Reset button
-                var resetItem = new NativeItem("Reset to Stock");
-                resetItem.Description = "Reset all fitment to factory settings";
-                resetItem.Activated += (s, e) =>
-                {
-                    wheelFitment.Reset();
-                    SaveCurrentFitment();
-                    GTA.UI.Notification.Show("Fitment reset to stock");
-                    // Rebuild menu to update slider positions
-                    isNavigatingMenu = true;
-                    menu.Visible = false;
-                    var newMenu = BuildWheelFitmentMenu();
-                    newMenu.Visible = true;
-                    isNavigatingMenu = false;
-                };
-                menu.Add(resetItem);
-
-            }
-
+            _fitmentResync.Clear();
+            InitFitmentForVehicle();
+            AddProModeToggle(menu, BuildWheelFitmentMenu);
+            AddSizeWidthItems(menu);   // Wheel Width, Wheel Size (wheel-specific fitment)
+            AddPokeItems(menu);        // Wheel Poke (or Front/Rear Poke in Pro)
+            AddResetItem(menu, BuildWheelFitmentMenu);
             return menu;
         }
 
-        /// <summary>
-        /// Simple-mode fitment items: real-world units (inches / degrees / cm), one slider per concept,
-        /// applied to all wheels. Auto-adapt (big wheels lift the body) and easing make it feel natural.
-        /// </summary>
-        private void BuildSimpleFitmentItems(NativeMenu menu)
+        // ============================================================================================
+        // Fitment slider GROUPS — shared by the Wheel Fitment menu (Wheels) and the Camber & Ride Height
+        // submenu (Suspension). Each group respects Pro Mode internally (combined vs per-axle).
+        // ============================================================================================
+
+        // Generic per-axle float slider (radians/metres) used by the Pro-mode camber/height/poke controls.
+        // Make a value slider STOP at its ends instead of wrapping (+max -> -min). Reverts a user left/right
+        // that wrapped the index past an end. Direction is Unknown for programmatic SelectedIndex sets (e.g.
+        // the auto-recovery resync), so those are ignored. Use on numeric value sliders, not choice-lists.
+        private void NoWrap<T>(NativeListItem<T> item)
         {
-            // ---- Wheel Size (inches — the render size field is the wheel's diameter in meters) ----
+            item.ItemChanged += (s, e) =>
+            {
+                int last = item.Items.Count - 1;
+                if (last <= 0) return;
+                if (e.Direction == Direction.Right && e.Index == 0) item.SelectedIndex = last;
+                else if (e.Direction == Direction.Left && e.Index == last) item.SelectedIndex = 0;
+            };
+        }
+
+        private NativeListItem<float> MakeFitSlider(string label, float min, float max, float step,
+                                                    Func<float> get, Action<float> set, string desc)
+        {
+            var vals = new List<float>();
+            for (float v = min; v <= max + 0.001f; v += step) vals.Add((float)Math.Round(v, 2));
+            int idx = vals.FindIndex(v => Math.Abs(v - get()) < step * 0.55f);
+            if (idx < 0) idx = vals.FindIndex(v => Math.Abs(v) < step * 0.55f);
+            if (idx < 0) idx = vals.Count / 2;
+            var item = new NativeListItem<float>(label, vals.ToArray()) { SelectedIndex = idx };
+            item.Description = desc;
+            item.ItemChanged += (s, e) => set(e.Object);
+            _fitmentResync.Add(() =>
+            {
+                int j = vals.FindIndex(v => Math.Abs(v - get()) < step * 0.55f);
+                if (j < 0) j = vals.FindIndex(v => Math.Abs(v) < step * 0.55f);
+                if (j < 0) j = vals.Count / 2;
+                item.SelectedIndex = j;
+            });
+            NoWrap(item);
+            return item;
+        }
+
+        // ---- Wheel Width + Wheel Size (custom rims only). Width first, per the requested order. ----
+        private void AddSizeWidthItems(NativeMenu menu)
+        {
             if (wheelFitment.HasVisualWheels)
             {
-                // Range capped at THIS vehicle's stability budget (suspension travel) — the largest
-                // size that rides cleanly with matching collision. Varies per car: trucks allow more.
+                // Wheel Width (%) — up to 500% for wide-tire / deep-dish stance looks.
+                var widthMults = new List<float>();
+                var widthLabels = new List<string>();
+                for (float m = 0.3f; m <= 5.001f; m += 0.05f)
+                {
+                    float mult = (float)Math.Round(m, 2);
+                    widthMults.Add(mult);
+                    widthLabels.Add(Math.Abs(mult - 1f) < 0.001f ? "100% (stock)" : $"{mult * 100f:F0}%");
+                }
+                int wIdx = 0;
+                for (int i = 0; i < widthMults.Count; i++)
+                    if (Math.Abs(widthMults[i] - wheelFitment.VisualWidth) < 0.026f) { wIdx = i; break; }
+                var widthItem = new NativeListItem<string>("Wheel Width", widthLabels.ToArray()) { SelectedIndex = wIdx };
+                widthItem.Description = "Fat meats or stretched rubber";
+                widthItem.ItemChanged += (s, e) => { wheelFitment.VisualWidth = widthMults[e.Index]; };
+                NoWrap(widthItem);
+                menu.Add(widthItem);
+                _fitmentResync.Add(() =>
+                {
+                    int j = 0;
+                    for (int i = 0; i < widthMults.Count; i++)
+                        if (Math.Abs(widthMults[i] - wheelFitment.VisualWidth) < 0.026f) { j = i; break; }
+                    widthItem.SelectedIndex = j;
+                });
+
+                // Wheel Size (inches)
                 float maxMult = wheelFitment.MaxSizeMult;
                 var sizeMults = new List<float>();
                 var sizeLabels = new List<string>();
@@ -2826,26 +2956,17 @@ namespace ExtendedLSC
                 for (int i = 0; i < sizeMults.Count; i++)
                     if (Math.Abs(sizeMults[i] - wheelFitment.VisualSize) < 0.026f) { sIdx = i; break; }
                 var sizeItem = new NativeListItem<string>("Wheel Size", sizeLabels.ToArray()) { SelectedIndex = sIdx };
-                sizeItem.Description = "Overall wheel diameter. Oversized wheels lift the body automatically.";
+                sizeItem.Description = "Overall wheel diameter";
                 sizeItem.ItemChanged += (s, e) => { wheelFitment.VisualSize = sizeMults[e.Index]; };
+                NoWrap(sizeItem);
                 menu.Add(sizeItem);
-
-                // ---- Tire Width (%) ----
-                var widthMults = new List<float>();
-                var widthLabels = new List<string>();
-                for (float m = 0.6f; m <= 1.601f; m += 0.05f)
+                _fitmentResync.Add(() =>
                 {
-                    float mult = (float)Math.Round(m, 2);
-                    widthMults.Add(mult);
-                    widthLabels.Add(Math.Abs(mult - 1f) < 0.001f ? "100% (stock)" : $"{mult * 100f:F0}%");
-                }
-                int wIdx = 0;
-                for (int i = 0; i < widthMults.Count; i++)
-                    if (Math.Abs(widthMults[i] - wheelFitment.VisualWidth) < 0.026f) { wIdx = i; break; }
-                var widthItem = new NativeListItem<string>("Tire Width", widthLabels.ToArray()) { SelectedIndex = wIdx };
-                widthItem.Description = "Fat meats or stretched rubber";
-                widthItem.ItemChanged += (s, e) => { wheelFitment.VisualWidth = widthMults[e.Index]; };
-                menu.Add(widthItem);
+                    int j = 0;
+                    for (int i = 0; i < sizeMults.Count; i++)
+                        if (Math.Abs(sizeMults[i] - wheelFitment.VisualSize) < 0.026f) { j = i; break; }
+                    sizeItem.SelectedIndex = j;
+                });
             }
             else
             {
@@ -2853,73 +2974,262 @@ namespace ExtendedLSC
                 hint.Description = "Install aftermarket wheels to unlock wheel sizing";
                 menu.Add(hint);
             }
+        }
 
-            // ---- Camber (degrees, all wheels) ----
-            var camberDegs = new List<int>();
-            var camberLabels = new List<string>();
-            for (int d = -8; d <= 24; d++)
+        // ---- Camber (alignment — Suspension) ----
+        private void AddCamberItems(NativeMenu menu)
+        {
+            if (ModSettings.WheelFitmentProMode)
             {
-                camberDegs.Add(d);
-                camberLabels.Add(d == 0 ? "0° (stock)" : $"{d}°");
+                menu.Add(MakeFitSlider("Front Camber", WheelFitment.WheelFitment.MIN_CAMBER, WheelFitment.WheelFitment.MAX_CAMBER, 0.01f,
+                    () => wheelFitment.FrontCamber, v => wheelFitment.FrontCamber = v, "Tilt the front wheels in/out"));
+                menu.Add(MakeFitSlider("Rear Camber", WheelFitment.WheelFitment.MIN_CAMBER, WheelFitment.WheelFitment.MAX_CAMBER, 0.01f,
+                    () => wheelFitment.RearCamber, v => wheelFitment.RearCamber = v, "Tilt the rear wheels in/out"));
             }
-            int cIdx = 8; // 0°
-            float curDeg = WheelFitment.WheelFitment.ToDegrees(wheelFitment.FrontCamber);
-            for (int i = 0; i < camberDegs.Count; i++)
-                if (Math.Abs(camberDegs[i] - curDeg) < 0.51f) { cIdx = i; break; }
-            var camberItem = new NativeListItem<string>("Camber", camberLabels.ToArray()) { SelectedIndex = cIdx };
-            camberItem.Description = "Tilt the wheels in for that stanced look";
-            camberItem.ItemChanged += (s, e) =>
+            else
             {
-                float rad = WheelFitment.WheelFitment.ToRadians(camberDegs[e.Index]);
-                wheelFitment.FrontCamber = rad;
-                wheelFitment.RearCamber = rad;
-            };
-            menu.Add(camberItem);
+                var degs = new List<int>(); var labels = new List<string>();
+                for (int d = -45; d <= 45; d++) { degs.Add(d); labels.Add(d == 0 ? "0° (stock)" : $"{d}°"); }
+                int idx = 45; float cur = WheelFitment.WheelFitment.ToDegrees(wheelFitment.FrontCamber);
+                for (int i = 0; i < degs.Count; i++) if (Math.Abs(degs[i] - cur) < 0.51f) { idx = i; break; }
+                var item = new NativeListItem<string>("Camber", labels.ToArray()) { SelectedIndex = idx };
+                item.Description = "Tilt the wheels in for that stanced look";
+                item.ItemChanged += (s, e) =>
+                {
+                    float rad = WheelFitment.WheelFitment.ToRadians(degs[e.Index]);
+                    wheelFitment.FrontCamber = rad; wheelFitment.RearCamber = rad;
+                };
+                NoWrap(item);
+                menu.Add(item);
+                _fitmentResync.Add(() =>
+                {
+                    int j = degs.IndexOf(0); float c = WheelFitment.WheelFitment.ToDegrees(wheelFitment.FrontCamber);
+                    for (int i = 0; i < degs.Count; i++) if (Math.Abs(degs[i] - c) < 0.51f) { j = i; break; }
+                    item.SelectedIndex = j;
+                });
+            }
+        }
 
-            // ---- Ride Height (cm; + lift / - slam). Internal sign is inverted: +Z moves the WHEEL up
-            //      relative to the body, which sits the body LOWER — so internal = -cm/100. ----
-            var heightCms = new List<int>();
-            var heightLabels = new List<string>();
-            for (int cm = -14; cm <= 14; cm++)
+        // ---- Ride Height (Suspension). Now drives the STABLE handling body-lift (fSuspensionRaise) — a single
+        // whole-body value, so there is no front/rear split even in Pro mode. Range matches the raise clamp. ----
+        private void AddHeightItems(NativeMenu menu)
+        {
+            int lo = (int)Math.Round(WheelFitment.WheelFitment.MIN_RAISE * 100f);   // e.g. -30 cm (slam)
+            int hi = (int)Math.Round(WheelFitment.WheelFitment.MAX_RAISE * 100f);   // e.g. +45 cm (lift)
+            var cms = new List<int>(); var labels = new List<string>();
+            for (int cm = lo; cm <= hi; cm++) { cms.Add(cm); labels.Add(cm == 0 ? "0 cm (stock)" : (cm > 0 ? $"+{cm} cm" : $"{cm} cm")); }
+            int idx = cms.IndexOf(0); float cur = -wheelFitment.FrontHeight * 100f;
+            for (int i = 0; i < cms.Count; i++) if (Math.Abs(cms[i] - cur) < 0.51f) { idx = i; break; }
+            var item = new NativeListItem<string>("Ride Height", labels.ToArray()) { SelectedIndex = idx };
+            item.Description = "Lift (+) or slam (-) the whole car";
+            item.ItemChanged += (s, e) =>
             {
-                heightCms.Add(cm);
-                heightLabels.Add(cm == 0 ? "0 cm (stock)" : (cm > 0 ? $"+{cm} cm" : $"{cm} cm"));
-            }
-            int hIdx = 14; // 0 cm
-            float curCm = -wheelFitment.FrontHeight * 100f;
-            for (int i = 0; i < heightCms.Count; i++)
-                if (Math.Abs(heightCms[i] - curCm) < 0.51f) { hIdx = i; break; }
-            var heightItem = new NativeListItem<string>("Ride Height", heightLabels.ToArray()) { SelectedIndex = hIdx };
-            heightItem.Description = "Lift (+) or slam (-) the whole car";
-            heightItem.ItemChanged += (s, e) =>
-            {
-                float h = -heightCms[e.Index] / 100f;
-                wheelFitment.FrontHeight = h;
-                wheelFitment.RearHeight = h;
+                float h = -cms[e.Index] / 100f;
+                wheelFitment.FrontHeight = h; wheelFitment.RearHeight = h;
             };
-            menu.Add(heightItem);
+            NoWrap(item);
+            menu.Add(item);
+            _fitmentResync.Add(() =>
+            {
+                int j = cms.IndexOf(0); float c = -wheelFitment.FrontHeight * 100f;
+                for (int i = 0; i < cms.Count; i++) if (Math.Abs(cms[i] - c) < 0.51f) { j = i; break; }
+                item.SelectedIndex = j;
+            });
+        }
 
-            // ---- Wheel Poke (track width, cm out from the body) ----
-            var trackCms = new List<int>();
-            var trackLabels = new List<string>();
-            for (int cm = -5; cm <= 20; cm++)
+        // ---- Rake (front/rear tilt — Suspension). + lowers the front, - lowers the rear. ----
+        private void AddRakeItems(NativeMenu menu)
+        {
+            int lo = (int)Math.Round(WheelFitment.WheelFitment.MIN_RAKE * 100f);   // - = rear low
+            int hi = (int)Math.Round(WheelFitment.WheelFitment.MAX_RAKE * 100f);   // + = front low
+            var cms = new List<int>(); var labels = new List<string>();
+            for (int cm = lo; cm <= hi; cm++)
+                cms.Add(cm);
+            foreach (int cm in cms)
+                labels.Add(cm == 0 ? "0 (level)" : (cm > 0 ? $"+{cm} (front low)" : $"{cm} (rear low)"));
+            int idx = cms.IndexOf(0); float cur = wheelFitment.Rake * 100f;
+            for (int i = 0; i < cms.Count; i++) if (Math.Abs(cms[i] - cur) < 0.51f) { idx = i; break; }
+            var item = new NativeListItem<string>("Rake", labels.ToArray()) { SelectedIndex = idx };
+            item.Description = "Tilt the car front/back: + drops the front, - drops the rear";
+            item.ItemChanged += (s, e) => { wheelFitment.Rake = cms[e.Index] / 100f; };
+            NoWrap(item);
+            menu.Add(item);
+            _fitmentResync.Add(() =>
             {
-                trackCms.Add(cm);
-                trackLabels.Add(cm == 0 ? "0 cm (stock)" : (cm > 0 ? $"+{cm} cm" : $"{cm} cm"));
+                int j = cms.IndexOf(0); float c = wheelFitment.Rake * 100f;
+                for (int i = 0; i < cms.Count; i++) if (Math.Abs(cms[i] - c) < 0.51f) { j = i; break; }
+                item.SelectedIndex = j;
+            });
+        }
+
+        // ---- Wheel Poke / track width (wheel fitment — Wheels) ----
+        private void AddPokeItems(NativeMenu menu)
+        {
+            if (ModSettings.WheelFitmentProMode)
+            {
+                menu.Add(MakeFitSlider("Front Poke", WheelFitment.WheelFitment.MIN_TRACK_WIDTH, WheelFitment.WheelFitment.MAX_TRACK_WIDTH, 0.01f,
+                    () => wheelFitment.FrontTrackWidth, v => wheelFitment.FrontTrackWidth = v, "Push front wheels out"));
+                menu.Add(MakeFitSlider("Rear Poke", WheelFitment.WheelFitment.MIN_TRACK_WIDTH, WheelFitment.WheelFitment.MAX_TRACK_WIDTH, 0.01f,
+                    () => wheelFitment.RearTrackWidth, v => wheelFitment.RearTrackWidth = v, "Push rear wheels out"));
             }
-            int tIdx = 5; // 0 cm
-            float curTcm = wheelFitment.FrontTrackWidth * 100f;
-            for (int i = 0; i < trackCms.Count; i++)
-                if (Math.Abs(trackCms[i] - curTcm) < 0.51f) { tIdx = i; break; }
-            var trackItem = new NativeListItem<string>("Wheel Poke", trackLabels.ToArray()) { SelectedIndex = tIdx };
-            trackItem.Description = "Push the wheels out toward the fenders";
-            trackItem.ItemChanged += (s, e) =>
+            else
             {
-                float t = trackCms[e.Index] / 100f;
-                wheelFitment.FrontTrackWidth = t;
-                wheelFitment.RearTrackWidth = t;
+                int lo = (int)Math.Round(WheelFitment.WheelFitment.MIN_TRACK_WIDTH * 100f);   // inward (tuck)
+                int hi = (int)Math.Round(WheelFitment.WheelFitment.MAX_TRACK_WIDTH * 100f);   // outward (poke)
+                var cms = new List<int>(); var labels = new List<string>();
+                for (int cm = lo; cm <= hi; cm++) { cms.Add(cm); labels.Add(cm == 0 ? "0 cm (stock)" : (cm > 0 ? $"+{cm} cm" : $"{cm} cm")); }
+                int idx = cms.IndexOf(0); float cur = wheelFitment.FrontTrackWidth * 100f;
+                for (int i = 0; i < cms.Count; i++) if (Math.Abs(cms[i] - cur) < 0.51f) { idx = i; break; }
+                var item = new NativeListItem<string>("Wheel Poke", labels.ToArray()) { SelectedIndex = idx };
+                item.Description = "Push the wheels out toward the fenders";
+                item.ItemChanged += (s, e) =>
+                {
+                    float t = cms[e.Index] / 100f;
+                    wheelFitment.FrontTrackWidth = t; wheelFitment.RearTrackWidth = t;
+                };
+                NoWrap(item);
+                menu.Add(item);
+                _fitmentResync.Add(() =>
+                {
+                    int j = cms.IndexOf(0); float c = wheelFitment.FrontTrackWidth * 100f;
+                    for (int i = 0; i < cms.Count; i++) if (Math.Abs(cms[i] - c) < 0.51f) { j = i; break; }
+                    item.SelectedIndex = j;
+                });
+            }
+        }
+
+        // Init + load saved fitment for the current vehicle (shared by both fitment menus).
+        private void InitFitmentForVehicle()
+        {
+            if (currentVehicle == null || !currentVehicle.Exists()) return;
+            if (!wheelFitment.IsInitialized || lastFitmentVehicle != currentVehicle)
+            {
+                // Hand off cleanly: restore the OLD car's model-shared suspension raise before rebinding.
+                if (wheelFitment.IsInitialized && lastFitmentVehicle != currentVehicle)
+                    try { wheelFitment.RestoreSuspension(); } catch { }
+                wheelFitment.Initialize(currentVehicle);
+                lastFitmentVehicle = currentVehicle;
+                string vehName = currentVehicle.DisplayName;
+                if (VehicleSaveData.IsWheelFitmentOwned(vehName))
+                {
+                    var saved = VehicleSaveData.GetFitmentData(vehName);
+                    wheelFitment.FrontCamber = saved.FrontCamber;
+                    wheelFitment.RearCamber = saved.RearCamber;
+                    wheelFitment.FrontTrackWidth = saved.FrontTrackWidth;
+                    wheelFitment.RearTrackWidth = saved.RearTrackWidth;
+                    wheelFitment.FrontHeight = saved.FrontHeight;
+                    wheelFitment.RearHeight = saved.RearHeight;
+                    wheelFitment.Rake = saved.Rake;
+                    wheelFitment.StockFake = saved.StockFake;
+                    wheelFitment.VisualSize = saved.VisualSize;
+                    wheelFitment.VisualWidth = saved.VisualWidth;
+                }
+            }
+        }
+
+        // Shared "service" controls (Pro Mode toggle + Save + Reset). rebuild() rebuilds the host menu.
+        // Pro Mode toggle (top of each fitment menu) — rebuilds the host menu so the item set matches.
+        private void AddProModeToggle(NativeMenu menu, Func<NativeMenu> rebuild)
+        {
+            var proItem = new NativeCheckboxItem("Pro Mode", "Per-axle (front/rear separate) controls", ModSettings.WheelFitmentProMode);
+            proItem.CheckboxChanged += (s, e) =>
+            {
+                ModSettings.WheelFitmentProMode = proItem.Checked;
+                ModSettings.Save();
+                isNavigatingMenu = true; menu.Visible = false;
+                var nm = rebuild(); if (nm != null) nm.Visible = true;
+                isNavigatingMenu = false;
             };
-            menu.Add(trackItem);
+            menu.Add(proItem);
+        }
+
+        // Reset-to-stock (bottom of each fitment menu). No separate Save — menus auto-save on close.
+        private void AddResetItem(NativeMenu menu, Func<NativeMenu> rebuild)
+        {
+            var resetItem = new NativeItem("Reset to Stock", "Reset all fitment to factory settings");
+            resetItem.Activated += (s, e) =>
+            {
+                wheelFitment.Reset();
+                SaveCurrentFitment();
+                GTA.UI.Notification.Show("Fitment reset to stock");
+                isNavigatingMenu = true; menu.Visible = false;
+                var nm = rebuild(); if (nm != null) nm.Visible = true;
+                isNavigatingMenu = false;
+            };
+            menu.Add(resetItem);
+        }
+
+        // Camber & Ride Height submenu — lives under the SUSPENSION category (alignment + springs are
+        // suspension in real life). Pro toggle on top, then sliders, then Reset; auto-saves on close.
+        private NativeMenu BuildAlignmentMenu()
+        {
+            if (currentVehicle == null || !currentVehicle.Exists()) return null;
+            var menu = CreateMenu("Custom Suspension and Camber");
+            menu.Closed += (s, e) =>
+            {
+                SaveCurrentFitment();   // auto-save on leave
+                if (!isNavigatingMenu && alignmentParent != null) alignmentParent.Visible = true;
+            };
+            _fitmentResync.Clear();
+            InitFitmentForVehicle();
+            AddProModeToggle(menu, BuildAlignmentMenu);
+            AddCamberItems(menu);
+            AddHeightItems(menu);
+            AddRakeItems(menu);
+            AddResetItem(menu, BuildAlignmentMenu);
+            return menu;
+        }
+
+        // Resync callbacks for the currently-built fitment sliders. Each one re-reads its wheelFitment value
+        // and corrects its SelectedIndex in place. Rebuilt whenever a fitment menu is built.
+        private readonly List<Action> _fitmentResync = new List<Action>();
+
+        // When the stability monitor reverts an unstable setup, snap the OPEN fitment sliders to the reverted
+        // values IN PLACE (correct each item's SelectedIndex). We don't rebuild the menu — that left the old
+        // menu object still receiving input, so the slider would jump back to its pre-revert index on the next
+        // press. Resyncing the live items keeps the player on the same menu they're navigating.
+        private void RebuildOpenFitmentMenu()
+        {
+            try { foreach (var a in _fitmentResync) a(); }
+            catch { }
+        }
+
+        // One-line summary of the current custom suspension/camber values, shown as the nav-item description.
+        private string FitmentSummary()
+        {
+            try
+            {
+                if (!wheelFitment.IsInitialized) return "Ride height, camber, rake & poke";
+                var parts = new List<string>();
+                int h = (int)Math.Round(-wheelFitment.FrontHeight * 100f);   // +cm = lift, -cm = slam
+                if (Math.Abs(h) >= 1) parts.Add($"Height {(h > 0 ? "+" : "")}{h}cm");
+                int camDeg = (int)Math.Round(WheelFitment.WheelFitment.ToDegrees(wheelFitment.FrontCamber));
+                if (Math.Abs(camDeg) >= 1) parts.Add($"Camber {(camDeg > 0 ? "+" : "")}{camDeg}°");
+                int rake = (int)Math.Round(wheelFitment.Rake * 100f);
+                if (Math.Abs(rake) >= 1) parts.Add($"Rake {(rake > 0 ? "+" : "")}{rake}");
+                int poke = (int)Math.Round(wheelFitment.FrontTrackWidth * 100f);
+                if (Math.Abs(poke) >= 1) parts.Add($"Poke {(poke > 0 ? "+" : "")}{poke}cm");
+                return parts.Count == 0 ? "Stock — nothing set" : string.Join("  ·  ", parts);
+            }
+            catch { return "Ride height, camber, rake & poke"; }
+        }
+
+        // The player chose one of the game's native Suspension levels (Stock/Lowered/Street/Sport/Competition).
+        // Hand ride height over to the game: re-base our fake-lowering off the new level and zero our custom
+        // offset so the two don't stack. Camber/poke/rake/size are independent and stay.
+        private void OnGameSuspensionChosen()
+        {
+            try
+            {
+                if (!wheelFitment.IsInitialized) return;
+                wheelFitment.SuspendRideHeight = false;
+                wheelFitment.RefreshStockFake();   // the game just set the new level's ride height
+                wheelFitment.FrontHeight = 0f;     // disable our custom ride-height (game's level takes over)
+                wheelFitment.RearHeight = 0f;
+                SaveCurrentFitment();
+                RebuildOpenFitmentMenu();           // reflect the zeroed ride-height slider if it's open
+            }
+            catch { }
         }
 
         private void SaveCurrentFitment()
@@ -2932,9 +3242,16 @@ namespace ExtendedLSC
                 FrontTrackWidth = wheelFitment.FrontTrackWidth,
                 RearTrackWidth = wheelFitment.RearTrackWidth,
                 FrontHeight = wheelFitment.FrontHeight,
-                RearHeight = wheelFitment.RearHeight
+                RearHeight = wheelFitment.RearHeight,
+                Rake = wheelFitment.Rake,
+                StockFake = wheelFitment.StockFake,
+                VisualSize = wheelFitment.VisualSize,
+                VisualWidth = wheelFitment.VisualWidth
             };
             VehicleSaveData.SetFitmentData(currentVehicle.DisplayName, fitmentData);
+            // Mark "owned" so InitFitmentForVehicle re-loads this on re-entry (the purchase gate that used
+            // to set this was removed — fitment is now free, and saving is what flags a car as customised).
+            VehicleSaveData.SetWheelFitmentOwned(currentVehicle.DisplayName, true);
             VehicleSaveData.Save();
 
             // Also record this SPECIFIC car (model + plate + fingerprint + decorator tag) so the stance
@@ -3275,11 +3592,86 @@ namespace ExtendedLSC
         /// </summary>
         private NativeMenu CreateWindowTintMenuFromConfig()
         {
-            return CreateMenuFromConfig(
+            var menu = CreateMenuFromConfig(
                 "Windows",
                 () => (int)currentVehicle.Mods.WindowTint,
-                (item) => ApplyWindowTint(item.Value)
+                (item) => { windowTint.ClearCustomColor(currentVehicle); ApplyWindowTint(item.Value); }
             );
+            if (menu == null) return null;
+
+            // Custom Color picker (requires the dlc_elsc clear-glass texture). Choosing a preset above clears it.
+            var colorMenu = CreateCustomWindowColorMenu();
+            var openItem = new NativeItem("Custom Color") { AltTitle = ">>" };
+            openItem.Activated += (s, e) =>
+            {
+                isNavigatingMenu = true; menu.Visible = false; colorMenu.Visible = true; isNavigatingMenu = false;
+            };
+            colorMenu.Closed += (s, e) => { if (!isNavigatingMenu) menu.Visible = true; };
+            menu.Add(openItem);
+            return menu;
+        }
+
+        /// <summary>RGB picker for custom window glass color. Live-previews on change; saves on Apply/close.</summary>
+        private NativeMenu CreateCustomWindowColorMenu()
+        {
+            var menu = CreateMenu("Custom Window Color");
+
+            // R/G/B: 0..255 in steps of 5. Intensity: 5%..100% in steps of 5.
+            var chVals = new List<int>(); for (int v = 0; v <= 255; v += 5) chVals.Add(v);
+            var intList = new List<int>(); for (int v = 5; v <= 100; v += 5) intList.Add(v);
+            var intVals = intList.ToArray();
+
+            int saved = windowTint.CurrentColor(currentVehicle);
+            // Fresh start: R/G/B = 0, intensity 25% (alpha ~64). Existing color loads its saved values.
+            int def = saved != 0 ? saved : WindowTintManager.PackArgb(64, 0, 0, 0);
+            WindowTintManager.UnpackArgb(def, out int da, out int dr, out int dg, out int db);
+
+            int Nearest(List<int> list, int val)
+            {
+                int best = 0, bd = int.MaxValue;
+                for (int i = 0; i < list.Count; i++) { int d = Math.Abs(list[i] - val); if (d < bd) { bd = d; best = i; } }
+                return best;
+            }
+            int NearestArr(int[] list, int val)
+            {
+                int best = 0, bd = int.MaxValue;
+                for (int i = 0; i < list.Length; i++) { int d = Math.Abs(list[i] - val); if (d < bd) { bd = d; best = i; } }
+                return best;
+            }
+
+            var rItem = new NativeListItem<int>("Red", chVals.ToArray()) { SelectedIndex = Nearest(chVals, dr) };
+            var gItem = new NativeListItem<int>("Green", chVals.ToArray()) { SelectedIndex = Nearest(chVals, dg) };
+            var bItem = new NativeListItem<int>("Blue", chVals.ToArray()) { SelectedIndex = Nearest(chVals, db) };
+            var iItem = new NativeListItem<int>("Intensity %", intVals) { SelectedIndex = NearestArr(intVals, (int)Math.Round(da / 2.55)) };
+
+            Func<int> build = () =>
+            {
+                int a = (int)Math.Round(iItem.SelectedItem * 2.55);
+                return WindowTintManager.PackArgb(a, rItem.SelectedItem, gItem.SelectedItem, bItem.SelectedItem);
+            };
+            Action preview = () =>
+            {
+                if (currentVehicle == null) return;
+                if (!windowTint.CanPreview) { ShowNotification("~y~Initializing window-color table… try again in a moment."); return; }
+                windowTint.PreviewColor(currentVehicle, build());
+            };
+            rItem.ItemChanged += (s, e) => preview();
+            gItem.ItemChanged += (s, e) => preview();
+            bItem.ItemChanged += (s, e) => preview();
+            iItem.ItemChanged += (s, e) => preview();
+            menu.Add(rItem); menu.Add(gItem); menu.Add(bItem); menu.Add(iItem);
+
+            // While the picker is open, stop the per-tick assertion from re-stamping the saved color over the
+            // live slider preview, and show the starting color immediately.
+            menu.Shown += (s, e) => { windowTint.BeginPreview(currentVehicle); preview(); };
+
+            // Backing out saves the previewed color (to clear a custom color, pick None in the parent menu).
+            menu.Closed += (s, e) =>
+            {
+                if (currentVehicle != null && windowTint.Ready) windowTint.ApplyCustomColor(currentVehicle, build());
+                windowTint.EndPreview();
+            };
+            return menu;
         }
 
         /// <summary>
@@ -3445,6 +3837,13 @@ namespace ExtendedLSC
                 noStockOption = category.NoStockOption;
             }
 
+            // Body/visual slots (0-10): use the vehicle-specific LSC name (e.g. Skirts -> "Truck Bed").
+            if (modIndex >= 0 && modIndex <= 10)
+            {
+                string slot = SlotName(modIndex, null);
+                if (!string.IsNullOrEmpty(slot)) menuTitle = slot.ToUpper();
+            }
+
             var menu = CreateMenu(menuTitle);
             modMenusByIndex[modIndex] = menu;
 
@@ -3466,7 +3865,7 @@ namespace ExtendedLSC
                     // Performance mod indices: Engine=11, Brakes=12, Transmission=13, Suspension=15, Armor=16, Turbo=18
                     if (idx == 11 || idx == 12 || idx == 13 || idx == 15 || idx == 16 || idx == 18)
                     {
-                        originalTopSpeed = Function.Call<float>(Hash.GET_VEHICLE_ESTIMATED_MAX_SPEED, currentVehicle);
+                        originalTopSpeed = WheelFitment.WheelMemory.GetHandlingFloat(currentVehicle, WheelFitment.WheelMemory.HOFF_MAX_FLAT_VEL);
                         originalAcceleration = Function.Call<float>(Hash.GET_VEHICLE_ACCELERATION, currentVehicle);
                         originalBraking = Function.Call<float>(Hash.GET_VEHICLE_MAX_BRAKING, currentVehicle);
                         originalTraction = Function.Call<float>(Hash.GET_VEHICLE_MAX_TRACTION, currentVehicle);
@@ -3528,6 +3927,7 @@ namespace ExtendedLSC
                     isPreviewingMod = false;
                     previewModIndex = -1;
                     ApplyModByIndex(idx, -1);
+                    if (idx == 15) OnGameSuspensionChosen();
                 };
                 menu.Add(stockItem);
             }
@@ -3575,6 +3975,7 @@ namespace ExtendedLSC
                     previewModIndex = -1;
 
                     ApplyModByIndex(idx, modValue);
+                    if (idx == 15) OnGameSuspensionChosen();
                     // Mark as owned when purchased
                     if (!owned)
                     {
@@ -3588,6 +3989,130 @@ namespace ExtendedLSC
             return menu;
         }
 
+        // ---------- Engine Swap (custom feature: FORCE_VEHICLE_ENGINE_AUDIO sound + EnginePowerMultiplier power) ----------
+
+        /// <summary>Apply (or, with null, revert) an engine swap to the current vehicle.</summary>
+        private void ApplyEngineSwap(EngineSwap swap)
+        {
+            if (currentVehicle == null || !currentVehicle.Exists()) return;
+            activeEngineSwap = swap;
+
+            // FORCE_VEHICLE_ENGINE_AUDIO has a side effect of switching/enabling the radio. Capture the player's
+            // current station first and re-assert it for a short window afterwards (the audio engine applies the
+            // radio change asynchronously, so a one-shot restore can get overwritten).
+            string preStation = Function.Call<string>(Hash.GET_PLAYER_RADIO_STATION_NAME);
+
+            if (swap == null)
+            {
+                currentVehicle.EnginePowerMultiplier = 1.0f; // ~stock power
+                string spawn = GetVehicleSpawnName(currentVehicle);
+                if (!string.IsNullOrEmpty(spawn))
+                    Function.Call((Hash)5695999342423706424L, currentVehicle, spawn); // FORCE_VEHICLE_ENGINE_AUDIO — best-effort sound revert
+            }
+            else
+            {
+                Function.Call((Hash)5695999342423706424L, currentVehicle, swap.AudioName);
+                currentVehicle.EnginePowerMultiplier = swap.PowerMult;
+            }
+
+            radioRestoreStation = preStation;
+            radioRestoreUntil = Game.GameTime + 500;
+            RestoreRadioStation();
+        }
+
+        /// <summary>Re-assert the captured radio station so the engine-audio swap doesn't hijack it.</summary>
+        private void RestoreRadioStation()
+        {
+            if (currentVehicle == null || !currentVehicle.Exists()) return;
+            string st = radioRestoreStation;
+            if (string.IsNullOrEmpty(st) || st == "OFF" || st == "OFF_RADIO")
+                Function.Call(Hash.SET_VEH_RADIO_STATION, currentVehicle, "OFF");
+            else
+                Function.Call(Hash.SET_RADIO_TO_STATION_NAME, st);
+        }
+
+        /// <summary>Best-effort spawn/audio name for a vehicle (its model label token, lowercased).</summary>
+        private string GetVehicleSpawnName(Vehicle v)
+        {
+            if (v == null || !v.Exists()) return null;
+            string token = Function.Call<string>(Hash.GET_DISPLAY_NAME_FROM_VEHICLE_MODEL, (uint)v.Model.Hash);
+            return string.IsNullOrEmpty(token) ? null : token.ToLowerInvariant();
+        }
+
+        /// <summary>Set the hovered-swap preview bonuses for the blue/red stat preview (index 0 = Stock).</summary>
+        private void UpdateSwapPreview(int index)
+        {
+            if (index <= 0) { swapPreviewAccelBonus = 0f; swapPreviewSpeedBonus = 0f; return; }
+            int si = index - 1;
+            if (si >= 0 && si < EngineSwaps.All.Count)
+            {
+                swapPreviewAccelBonus = EngineSwaps.All[si].AccelBonus;
+                swapPreviewSpeedBonus = EngineSwaps.All[si].SpeedBonus;
+            }
+        }
+
+        private NativeMenu CreateEngineSwapMenu()
+        {
+            var menu = CreateMenu("ENGINE SWAP");
+            engineSwapMenu = menu;
+
+            // Refresh each item's price/installed icon from the active swap.
+            void RefreshIcons()
+            {
+                string id = activeEngineSwap?.Id;
+                var stock = menu.Items[0];
+                if (id == null) { stock.AltTitle = ""; itemOwnershipStatus[stock] = STATUS_INSTALLED; }
+                else { stock.AltTitle = "Free"; itemOwnershipStatus.Remove(stock); }
+                for (int i = 0; i < EngineSwaps.All.Count; i++)
+                {
+                    var it = menu.Items[i + 1];
+                    var sw = EngineSwaps.All[i];
+                    if (id == sw.Id) { it.AltTitle = ""; itemOwnershipStatus[it] = STATUS_INSTALLED; }
+                    else { it.AltTitle = $"${sw.Price:N0}"; itemOwnershipStatus.Remove(it); }
+                }
+            }
+
+            // Preview state is driven by the menu's live visibility in DrawVehicleStats (sticky Shown/Closed
+            // flags could get left set if the whole pool closes at once, freezing the chip). Keep this only
+            // for immediate responsiveness on hover.
+            menu.SelectedIndexChanged += (s, e) => UpdateSwapPreview(e.Index);
+
+            // Stock (index 0) — revert
+            var stockItem = new NativeItem("Stock Engine");
+            stockItem.Description = "Factory engine and sound. Reverts any swap.";
+            stockItem.Activated += (s, e) =>
+            {
+                isPreviewingSwap = false;
+                ApplyEngineSwap(null);
+                VehicleSaveData.SetEngineSwapId(currentVehicle.DisplayName, null);
+                VehicleSaveData.Save();
+                RefreshIcons();
+            };
+            menu.Add(stockItem);
+
+            // One item per swap
+            foreach (var swap in EngineSwaps.All)
+            {
+                var captured = swap;
+                var item = new NativeItem(swap.Name);
+                item.Description = swap.Description;
+                item.Activated += (s, e) =>
+                {
+                    bool owned = activeEngineSwap != null && activeEngineSwap.Id == captured.Id;
+                    if (!TryPurchase(captured.Price, owned)) return;
+                    isPreviewingSwap = false;
+                    ApplyEngineSwap(captured);
+                    VehicleSaveData.SetEngineSwapId(currentVehicle.DisplayName, captured.Id);
+                    VehicleSaveData.Save();
+                    RefreshIcons();
+                };
+                menu.Add(item);
+            }
+
+            RefreshIcons();
+            return menu;
+        }
+
         private NativeMenu CreateModMenu(VehicleModType modType, int count)
         {
             return CreateModMenuByIndex((int)modType, count, ModPricing.GetModTypeName(modType));
@@ -3595,34 +4120,180 @@ namespace ExtendedLSC
 
         private NativeMenu CreateWheelTypeMenu(int wheelType)
         {
-            // Set wheel type temporarily to count wheels
+            // Set wheel type temporarily to count wheels AND read their real LSC names. The wheel label
+            // only resolves under the matching wheel type, so we must fetch names inside this window.
+            // CRITICAL: changing the wheel TYPE resets the current wheel MOD index, so we capture the full
+            // wheel state (type + front/back mod + custom-tire flag) and restore ALL of it afterwards —
+            // otherwise just opening the menu (which builds all 7 type menus) reverts the player's rims.
             int origType = Function.Call<int>(Hash.GET_VEHICLE_WHEEL_TYPE, currentVehicle);
+            int origFrontMod = Function.Call<int>(Hash.GET_VEHICLE_MOD, currentVehicle, 23);
+            int origBackMod = Function.Call<int>(Hash.GET_VEHICLE_MOD, currentVehicle, 24);
+            bool origCustomTires = Function.Call<bool>(Hash.GET_VEHICLE_MOD_VARIATION, currentVehicle, 23);
+            // The fitment's visual size/width (StreamRenderGfx) also gets reset by the type juggle + mod
+            // re-apply below, and the fitment caches "last applied" so it won't re-write an unchanged value
+            // (the wheels render the wrong width until the slider is nudged). Capture + restore it too.
+            float origVisSize = WheelMemory.GetVisualSize(currentVehicle);
+            float origVisWidth = WheelMemory.GetVisualWidth(currentVehicle);
             Function.Call(Hash.SET_VEHICLE_WHEEL_TYPE, currentVehicle, wheelType);
 
             int count = Function.Call<int>(Hash.GET_NUM_VEHICLE_MODS, currentVehicle, 23); // 23 = front wheels
 
-            // Restore original
+            var wheelNames = new string[count > 0 ? count : 0];
+            for (int i = 0; i < count; i++)
+            {
+                string label = Function.Call<string>(Hash.GET_MOD_TEXT_LABEL, currentVehicle, 23, i);
+                string name = (!string.IsNullOrEmpty(label) && label != "NULL") ? Game.GetLocalizedString(label) : null;
+                wheelNames[i] = string.IsNullOrEmpty(name) ? $"Wheel {i + 1}" : name;
+            }
+
+            // Restore the FULL original wheel state (type AND mod), then re-stamp the visual size/width the
+            // mod re-apply just cleared, so the rims keep their fitment width when the menu opens.
             Function.Call(Hash.SET_VEHICLE_WHEEL_TYPE, currentVehicle, origType);
+            Function.Call(Hash.SET_VEHICLE_MOD, currentVehicle, 23, origFrontMod, origCustomTires);
+            Function.Call(Hash.SET_VEHICLE_MOD, currentVehicle, 24, origBackMod, origCustomTires);
+            if (origVisSize > 0.1f && origVisSize < 5f) WheelMemory.SetVisualSize(currentVehicle, origVisSize);
+            if (origVisWidth > 0.1f && origVisWidth < 5f) WheelMemory.SetVisualWidth(currentVehicle, origVisWidth);
 
             if (count <= 0) return null;
 
             var menu = CreateMenu(ModPricing.GetWheelTypeName(wheelType));
+            int wType = wheelType; // capture for closures
+
+            // Preview state (menu-scoped): captured ONCE when the menu opens, restored on close unless bought.
+            // Wheels need SET_VEHICLE_WHEEL_TYPE in addition to SET_VEHICLE_MOD, which is why the generic
+            // mod-menu preview path didn't cover them and rims only showed after purchase.
+            int previewOrigWheelType = origType;
+            int previewOrigWheelMod = Function.Call<int>(Hash.GET_VEHICLE_MOD, currentVehicle, 23);
+            int previewOrigBackMod = Function.Call<int>(Hash.GET_VEHICLE_MOD, currentVehicle, 24);
+            bool wheelPurchased = false;
+            bool captured = false; // guard: don't re-capture the "original" once previews have started
+            var wheelItems = new List<(NativeItem item, int wheelIdx)>();
+
+            // Preview a wheel index under this menu's wheel type, on the axle(s) the player picked (staggered).
+            void PreviewWheel(int wheelIdx)
+            {
+                if (currentVehicle == null || !currentVehicle.Exists() || wheelIdx < 0) return;
+                Function.Call(Hash.SET_VEHICLE_MOD_KIT, currentVehicle, 0);
+                Function.Call(Hash.SET_VEHICLE_WHEEL_TYPE, currentVehicle, wType);   // type is shared across wheels
+                if (wheelApplyAxle != 2) Function.Call(Hash.SET_VEHICLE_MOD, currentVehicle, 23, wheelIdx, false); // Front
+                if (wheelApplyAxle != 1) Function.Call(Hash.SET_VEHICLE_MOD, currentVehicle, 24, wheelIdx, false); // Back
+            }
+
+            // Mark the item matching the player's ORIGINAL wheel as installed (not the previewed one),
+            // and any PREVIOUSLY-BOUGHT wheel of this type as owned (icon + free re-install).
+            void MarkInstalled()
+            {
+                bool currentTypeMatches = previewOrigWheelType == wType;
+                // Highlight the rim installed on the axle currently being edited (rear when "Rear Only").
+                int installedMod = wheelApplyAxle == 2 ? previewOrigBackMod : previewOrigWheelMod;
+                string vName = currentVehicle != null && currentVehicle.Exists() ? currentVehicle.DisplayName : null;
+                foreach (var (item, wi) in wheelItems)
+                {
+                    itemOwnershipStatus.Remove(item);
+                    bool owned = vName != null && VehicleSaveData.IsModOwned(vName, 23, WheelOwnKey(wType, wi));
+                    if (currentTypeMatches && wi == installedMod)
+                    {
+                        itemOwnershipStatus[item] = STATUS_INSTALLED;
+                        item.AltTitle = "";
+                    }
+                    else if (owned)
+                    {
+                        itemOwnershipStatus[item] = STATUS_OWNED;
+                        item.AltTitle = "";
+                    }
+                    else
+                    {
+                        item.AltTitle = $"${ModPricing.GetWheelPrice(wType, wi):N0}";
+                    }
+                }
+            }
+
+            // Store the player's current wheels when the menu opens (once), then preview the highlighted one.
+            menu.Shown += (s, e) =>
+            {
+                if (currentVehicle != null && currentVehicle.Exists())
+                {
+                    if (!captured)
+                    {
+                        previewOrigWheelType = Function.Call<int>(Hash.GET_VEHICLE_WHEEL_TYPE, currentVehicle);
+                        previewOrigWheelMod = Function.Call<int>(Hash.GET_VEHICLE_MOD, currentVehicle, 23);
+                        previewOrigBackMod = Function.Call<int>(Hash.GET_VEHICLE_MOD, currentVehicle, 24);
+                        captured = true;
+                    }
+                    // Pause the live fitment and clear its applied offsets so previewed wheels sit naturally
+                    // instead of inheriting the old wheel's stance (the "raises/lowers off the ground" issue).
+                    suspendWheelFitment = true;
+                    try { wheelFitment.RestoreSuspension(); } catch { }
+                    wheelPurchased = false;
+                    MarkInstalled();
+                    PreviewWheel(menu.SelectedIndex);
+                }
+            };
+
+            // Preview the wheel as the player scrolls (the fix — rims now show before buying).
+            menu.SelectedIndexChanged += (s, e) =>
+            {
+                PreviewWheel(e.Index);
+            };
+
+            // Revert to the original wheels when closing without buying.
+            menu.Closed += (s, e) =>
+            {
+                if (!wheelPurchased && captured && currentVehicle != null && currentVehicle.Exists())
+                {
+                    Function.Call(Hash.SET_VEHICLE_MOD_KIT, currentVehicle, 0);
+                    Function.Call(Hash.SET_VEHICLE_WHEEL_TYPE, currentVehicle, previewOrigWheelType);
+                    Function.Call(Hash.SET_VEHICLE_MOD, currentVehicle, 23, previewOrigWheelMod, false);
+                    Function.Call(Hash.SET_VEHICLE_MOD, currentVehicle, 24, previewOrigBackMod, false); // keep staggered rear
+                }
+                captured = false; // allow a fresh capture next time the menu opens
+                // Resume the live fitment. The wheel-key change triggers RefreshBaseline (seating + baseline)
+                // on its own next tick — do NOT force a full re-init here (lastFitmentVehicle=null), which
+                // would WIPE the player's live camber/track/height values back to saved/stock.
+                suspendWheelFitment = false;
+            };
 
             for (int i = 0; i < count; i++)
             {
                 int price = ModPricing.GetWheelPrice(wheelType, i);
-                var item = new NativeItem($"Wheel {i + 1}");
-                item.AltTitle = $"${price:N0}";
+                var item = new NativeItem(wheelNames[i]);
+
+                // Show the owned icon (and make it free) if this wheel was bought before — matches every
+                // other mod category, which the wheel menu previously didn't do (wheels weren't saved).
+                bool ownedAtBuild = currentVehicle != null && currentVehicle.Exists()
+                    && VehicleSaveData.IsModOwned(currentVehicle.DisplayName, 23, WheelOwnKey(wType, i));
+                if (ownedAtBuild)
+                {
+                    item.AltTitle = ""; // icon drawn instead of price
+                    itemOwnershipStatus[item] = STATUS_OWNED;
+                }
+                else
+                {
+                    item.AltTitle = $"${price:N0}";
+                }
 
                 int wheelIndex = i;
-                int wType = wheelType;
                 int wheelPrice = price;
                 item.Activated += (s, e) =>
                 {
-                    if (!TryPurchase(wheelPrice, false)) return;
-                    ApplyWheel(wType, wheelIndex);
+                    bool owned = VehicleSaveData.IsModOwned(currentVehicle.DisplayName, 23, WheelOwnKey(wType, wheelIndex));
+                    if (!TryPurchase(wheelPrice, owned)) return;
+                    wheelPurchased = true; // keep the preview, don't revert on close
+                    ApplyWheelAxle(wType, wheelIndex, wheelApplyAxle);
+                    // Save wheel ownership so it's free to re-install later and shows the owned icon.
+                    if (!owned)
+                    {
+                        VehicleSaveData.SetModOwned(currentVehicle.DisplayName, 23, WheelOwnKey(wType, wheelIndex));
+                        VehicleSaveData.Save();
+                    }
+                    // This wheel is now installed on the chosen axle(s) — update the revert baseline + icon.
+                    previewOrigWheelType = wType;
+                    if (wheelApplyAxle != 2) previewOrigWheelMod = wheelIndex;
+                    if (wheelApplyAxle != 1) previewOrigBackMod = wheelIndex;
+                    MarkInstalled();
                 };
                 menu.Add(item);
+                wheelItems.Add((item, wheelIndex));
             }
 
             return menu;
@@ -4593,120 +5264,117 @@ namespace ExtendedLSC
             return menu;
         }
 
+        // Read the vehicle's current pearlescent colour (wheel colour is the 2nd extra-colour slot).
+        private int GetCurrentPearl()
+        {
+            int pearl = 0;
+            if (currentVehicle != null && currentVehicle.Exists())
+                unsafe { int p, w; Function.Call(Hash.GET_VEHICLE_EXTRA_COLOURS, currentVehicle, &p, &w); pearl = p; }
+            return pearl;
+        }
+
+        private int GetCurrentWheelColor()
+        {
+            int wheel = 0;
+            if (currentVehicle != null && currentVehicle.Exists())
+                unsafe { int p, w; Function.Call(Hash.GET_VEHICLE_EXTRA_COLOURS, currentVehicle, &p, &w); wheel = w; }
+            return wheel;
+        }
+
         private NativeMenu CreateWheelColorMenu()
         {
             var menu = CreateMenu("Wheel Color");
-            var wheelColors = VehicleColors.WheelColors;
-            int originalWheelColor = 0;
 
-            // Store original wheel color when menu opens and preview selected color
-            menu.Shown += (s, e) =>
+            // The full GTA palette (was a flat 7-color list) organized into previewable category submenus,
+            // mirroring the main paint menu. Wheel colour is any color index 0-159 via SET_VEHICLE_EXTRA_COLOURS.
+            // NOTE: Chrome is intentionally excluded — chrome doesn't apply as a wheel colour in-game.
+            var categories = new (string name, VehicleColors.ColorInfo[] colors)[]
             {
-                if (currentVehicle != null && currentVehicle.Exists())
-                {
-                    int pearl;
-                    unsafe
-                    {
-                        int p, wheel;
-                        Function.Call(Hash.GET_VEHICLE_EXTRA_COLOURS, currentVehicle, &p, &wheel);
-                        originalWheelColor = wheel;
-                        pearl = p;
-                    }
-                    isPreviewingColor = true;
-
-                    // Preview the currently selected wheel color (not always index 0)
-                    int selectedIdx = menu.SelectedIndex;
-                    if (selectedIdx >= 0 && selectedIdx < wheelColors.Length)
-                    {
-                        Function.Call(Hash.SET_VEHICLE_EXTRA_COLOURS, currentVehicle, pearl, wheelColors[selectedIdx].ColorIndex);
-                    }
-                }
+                ("Classic", VehicleColors.ClassicColors),
+                ("Metallic", VehicleColors.MetallicColors),
+                ("Matte", VehicleColors.MatteColors),
+                ("Metal", VehicleColors.MetalFinishes),
             };
 
-            // Revert to original when menu closes
-            menu.Closed += (s, e) =>
+            int price = ModPricing.WheelColorPrice;
+            string priceText = $"${price:N0}";
+
+            foreach (var (categoryName, colors) in categories)
             {
-                if (isPreviewingColor && currentVehicle != null && currentVehicle.Exists())
+                var categoryMenu = CreateMenu(categoryName);
+                var capturedColors = colors;
+                int origWheelColor = 0;
+                bool previewing = false;
+                var colorItems = new List<(NativeItem item, int colorIndex)>();
+
+                void PreviewWheelColor(int colorIndex)
                 {
-                    int pearl;
-                    unsafe
-                    {
-                        int p, w;
-                        Function.Call(Hash.GET_VEHICLE_EXTRA_COLOURS, currentVehicle, &p, &w);
-                        pearl = p;
-                    }
-                    Function.Call(Hash.SET_VEHICLE_EXTRA_COLOURS, currentVehicle, pearl, originalWheelColor);
-                    isPreviewingColor = false;
+                    if (currentVehicle == null || !currentVehicle.Exists()) return;
+                    Function.Call(Hash.SET_VEHICLE_EXTRA_COLOURS, currentVehicle, GetCurrentPearl(), colorIndex);
                 }
-            };
 
-            // Preview wheel color on selection change
-            menu.SelectedIndexChanged += (s, e) =>
-            {
-                if (currentVehicle != null && currentVehicle.Exists() && e.Index >= 0 && e.Index < wheelColors.Length)
+                // On open: snapshot the player's wheel colour, mark the installed one, preview the highlight.
+                categoryMenu.Shown += (s, e) =>
                 {
-                    int pearl;
-                    unsafe
+                    if (currentVehicle == null || !currentVehicle.Exists()) return;
+                    origWheelColor = GetCurrentWheelColor();
+                    previewing = true;
+                    foreach (var (item, colorIndex) in colorItems)
                     {
-                        int p, w;
-                        Function.Call(Hash.GET_VEHICLE_EXTRA_COLOURS, currentVehicle, &p, &w);
-                        pearl = p;
+                        itemOwnershipStatus.Remove(item);
+                        item.AltTitle = priceText;
+                        if (colorIndex == origWheelColor) { itemOwnershipStatus[item] = STATUS_INSTALLED; item.AltTitle = ""; }
                     }
-                    Function.Call(Hash.SET_VEHICLE_EXTRA_COLOURS, currentVehicle, pearl, wheelColors[e.Index].ColorIndex);
-                }
-            };
-
-            // Track items for ownership sprite
-            string wheelPriceText = $"${ModPricing.WheelColorPrice}";
-            var wheelColorItems = new List<(NativeItem item, int colorIndex)>();
-
-            foreach (var color in wheelColors)
-            {
-                var item = new NativeItem(color.DisplayName);
-                item.AltTitle = wheelPriceText;
-                int colorId = color.ColorIndex;
-                item.Activated += (s, e) =>
-                {
-                    if (!TryPurchase(ModPricing.WheelColorPrice, false)) return;
-                    isPreviewingColor = false;
-                    ApplyWheelColor(colorId);
-
-                    foreach (var (otherItem, _) in wheelColorItems)
-                    {
-                        itemOwnershipStatus.Remove(otherItem);
-                        otherItem.AltTitle = wheelPriceText;
-                    }
-                    itemOwnershipStatus[item] = STATUS_INSTALLED;
-                    item.AltTitle = "";
+                    int sel = categoryMenu.SelectedIndex;
+                    if (sel >= 0 && sel < capturedColors.Length) PreviewWheelColor(capturedColors[sel].ColorIndex);
                 };
-                menu.Add(item);
-                wheelColorItems.Add((item, colorId));
-            }
 
-            var capturedWheelColorItems = wheelColorItems;
-            menu.Shown += (s, e) =>
-            {
-                if (currentVehicle == null || !currentVehicle.Exists()) return;
-
-                int currentWheelColor;
-                unsafe
+                // Preview as the player scrolls.
+                categoryMenu.SelectedIndexChanged += (s, e) =>
                 {
-                    int p, w;
-                    Function.Call(Hash.GET_VEHICLE_EXTRA_COLOURS, currentVehicle, &p, &w);
-                    currentWheelColor = w;
-                }
+                    if (e.Index >= 0 && e.Index < capturedColors.Length) PreviewWheelColor(capturedColors[e.Index].ColorIndex);
+                };
 
-                foreach (var (item, colorIndex) in capturedWheelColorItems)
+                // Revert to the original wheel colour on close unless one was bought.
+                categoryMenu.Closed += (s, e) =>
                 {
-                    itemOwnershipStatus.Remove(item);
-                    item.AltTitle = wheelPriceText;
-                    if (colorIndex == currentWheelColor)
+                    if (previewing && currentVehicle != null && currentVehicle.Exists())
                     {
+                        PreviewWheelColor(origWheelColor);
+                        previewing = false;
+                    }
+                    if (!isNavigatingMenu) menu.Visible = true;
+                };
+
+                foreach (var color in colors)
+                {
+                    var item = new NativeItem(color.DisplayName);
+                    item.AltTitle = priceText;
+                    int colorId = color.ColorIndex;
+                    item.Activated += (s, e) =>
+                    {
+                        if (!TryPurchase(price, false)) return;
+                        previewing = false; // keep the chosen colour
+                        ApplyWheelColor(colorId);
+                        foreach (var (otherItem, _) in colorItems)
+                        {
+                            itemOwnershipStatus.Remove(otherItem);
+                            otherItem.AltTitle = priceText;
+                        }
                         itemOwnershipStatus[item] = STATUS_INSTALLED;
                         item.AltTitle = "";
-                    }
+                    };
+                    categoryMenu.Add(item);
+                    colorItems.Add((item, colorId));
                 }
-            };
+
+                var navItem = new NativeItem(categoryName);
+                navItem.AltTitle = ">>";
+                navItem.Description = $"{colors.Length} colors";
+                var capturedMenu = categoryMenu;
+                navItem.Activated += (s, e) => { isNavigatingMenu = true; menu.Visible = false; capturedMenu.Visible = true; isNavigatingMenu = false; };
+                menu.Add(navItem);
+            }
 
             return menu;
         }
@@ -4911,6 +5579,23 @@ namespace ExtendedLSC
         {
             var menu = CreateMenu("License Plate");
 
+            // --- Custom plate TEXT (ELSC extra: name your car; doubles as its persistent identity) ---
+            string curText = GetPlateText(currentVehicle);
+            var customTextItem = new NativeItem("Custom Plate Text", "Type your own plate (up to 8 characters)")
+            {
+                AltTitle = string.IsNullOrEmpty(curText) ? "" : curText
+            };
+            customTextItem.Activated += (s, e) => StartEditPlate();
+            menu.Add(customTextItem);
+
+            var randomTextItem = new NativeItem("Random Plate", "Generate a unique plate automatically");
+            randomTextItem.Activated += (s, e) =>
+            {
+                string p = windowTint.GenerateUniquePlate();
+                if (!string.IsNullOrEmpty(p)) ApplyCustomPlate(p, GetPlateText(currentVehicle));
+            };
+            menu.Add(randomTextItem);
+
             string[] plates = { "Blue on White 1", "Yellow on Black", "Yellow on Blue", "Blue on White 2", "Blue on White 3", "Yankton" };
             int currentPlate = (int)currentVehicle.Mods.LicensePlateStyle;
 
@@ -4960,6 +5645,28 @@ namespace ExtendedLSC
         private string GetModName(VehicleModType modType, int index)
         {
             return GetModNameByIndex((int)modType, index);
+        }
+
+        /// <summary>
+        /// Vehicle-specific mod-slot name, exactly as Los Santos Customs shows it. The same slot is named
+        /// differently per vehicle (e.g. the "Skirts" slot is "Truck Bed" on a truck, "Spoiler" can be
+        /// "Wing", etc.). GET_MOD_SLOT_NAME returns the game's own per-vehicle label; we fall back to our
+        /// own name only if the game returns nothing. Using this everywhere keeps category names in sync
+        /// with LSC for every vehicle automatically.
+        /// </summary>
+        private string SlotName(int modIndex, string fallback)
+        {
+            if (currentVehicle != null && currentVehicle.Exists())
+            {
+                string label = Function.Call<string>(Hash.GET_MOD_SLOT_NAME, currentVehicle, modIndex);
+                if (!string.IsNullOrEmpty(label) && label != "NULL")
+                {
+                    string name = Game.GetLocalizedString(label);
+                    if (!string.IsNullOrEmpty(name))
+                        return name;
+                }
+            }
+            return fallback;
         }
 
         private string GetModNameByIndex(int modIndex, int valueIndex)
@@ -5224,6 +5931,25 @@ namespace ExtendedLSC
         private void ApplyMod(VehicleModType modType, int index)
         {
             ApplyModByIndex((int)modType, index);
+        }
+
+        // Ownership key for a wheel: encodes BOTH the wheel type and the rim index into one int, stored under
+        // mod index 23. The same rim index means different wheels under different types, so the type must be
+        // part of the key (otherwise buying "Sport #0" would mark "Muscle #0" as owned too).
+        private static int WheelOwnKey(int wheelType, int wheelIndex) => wheelType * 1000 + wheelIndex;
+
+        /// <summary>Apply a wheel design to the chosen axle(s): 0 = front+rear, 1 = front only, 2 = rear only.
+        /// The wheel TYPE is shared across all wheels (GTA limit); only the design index differs per axle.</summary>
+        private void ApplyWheelAxle(int wheelType, int wheelIndex, int axle)
+        {
+            if (currentVehicle == null) return;
+            Function.Call(Hash.SET_VEHICLE_MOD_KIT, currentVehicle, 0);
+            Function.Call(Hash.SET_VEHICLE_WHEEL_TYPE, currentVehicle, wheelType);
+            if (axle != 2) Function.Call(Hash.SET_VEHICLE_MOD, currentVehicle, 23, wheelIndex, false); // front
+            if (axle != 1) Function.Call(Hash.SET_VEHICLE_MOD, currentVehicle, 24, wheelIndex, false); // rear
+            ShowNotification(axle == 1 ? "~g~Front wheels installed!" : axle == 2 ? "~g~Rear wheels installed!" : "~g~Wheels installed!");
+            MechanicSpeak();
+            Log($"Applied wheel type {wheelType} index {wheelIndex} axle {axle}");
         }
 
         private void ApplyWheel(int wheelType, int wheelIndex)
@@ -5705,15 +6431,60 @@ namespace ExtendedLSC
 
         private void OnTick(object sender, EventArgs e)
         {
+            // Publish live menu state so the bridge (Claude) can read which menu/item is focused
+            // in real time and navigate reliably instead of blind key-counting. Throttled internally.
+            DumpMenuState();
+
+            // Re-assert the radio station after an engine-audio swap hijacked it (async, so hold it briefly).
+            if (radioRestoreUntil != 0)
+            {
+                if (Game.GameTime < radioRestoreUntil) RestoreRadioStation();
+                else radioRestoreUntil = 0;
+            }
+
+            // Custom window color: advance the one-time table scan, and re-assert the driven car's color.
+            try { windowTint.Tick(Game.Player.Character?.CurrentVehicle); } catch { }
+
+            // Full vehicle snapshot: restore saved cars (sweep), and capture the current car when the player
+            // finishes customizing (the whole ELSC menu tree just closed).
+            try
+            {
+                vehicleSnapshots.Tick();
+                bool elscOpen = menuPool.AreAnyVisible;
+                if (_snapMenuWasOpen && !elscOpen)
+                {
+                    var cv = Game.Player.Character?.CurrentVehicle;
+                    if (cv != null && cv.Exists()) vehicleSnapshots.CaptureCurrent(cv);
+                }
+                _snapMenuWasOpen = elscOpen;
+            }
+            catch { }
+
+            // Re-assert the menu's default-camera framing for a short window after open, so it survives the LSC
+            // cinematic-end / follow-cam re-centering (a single SET on the open frame gets overridden). Released
+            // after the window so the player can move the camera freely. Skipped during orbital Camera Mode.
+            if (isMenuActive && !isWalkAroundActive && Game.GameTime < menuCamUntil)
+            {
+                Function.Call(Hash.SET_GAMEPLAY_CAM_RELATIVE_HEADING, MENU_CAM_HEADING);
+                Function.Call(Hash.SET_GAMEPLAY_CAM_RELATIVE_PITCH, MENU_CAM_PITCH, 1.0f);
+            }
+
+            // Collision wireframe overlay (F8) — drawn every frame regardless of menu state.
+            if (showCollisionDebug) DrawCollisionDebug();
+
             // Handle description editor first (on-screen keyboard)
             UpdateDescriptionEditor();
+
+            // Handle custom plate-text editor (on-screen keyboard)
+            UpdatePlateEditor();
 
             // Check for X to edit/cancel description (editor mode)
             CheckDescriptionEditInput();
 
-            // Skip input processing while editing description (keyboard is open)
-            // But still draw the menu and custom UI
-            if (isEditingDescription)
+            // Skip input processing while an on-screen keyboard is open (description OR plate text), so button
+            // presses go to the text box and don't leak through to the menu underneath.
+            // But still draw the menu and custom UI.
+            if (isEditingDescription || isEditingPlate)
             {
                 Game.DisableAllControlsThisFrame();
                 menuPool.Process();
@@ -5828,16 +6599,25 @@ namespace ExtendedLSC
                 // A button selects
                 if (Game.IsControlJustPressed(GTA.Control.FrontendAccept))
                 {
+                    bool modeSwitched = true;
                     switch (debugMenuSelection)
                     {
                         case 0: activeDebugMode = DebugMode.Resizer; break;
                         case 1: activeDebugMode = DebugMode.SpriteBrowser; spriteBrowserPage = 0; break;
                         case 2: activeDebugMode = DebugMode.MenuPosition; selectedUIElement = UIElement.Menu; break;
                         case 3: activeDebugMode = DebugMode.InputTiming; break;
-                        case 4: activeDebugMode = DebugMode.StatsCalibration; break;
+                        case 4:
+                            showCollisionDebug = !showCollisionDebug;
+                            if (showCollisionDebug) _bodyScanHandle = 0;   // force a fresh body scan
+                            ShowNotification(showCollisionDebug
+                                ? "~g~Collision wireframe ON~w~  (~g~green~w~ body, ~b~blue~w~ wheels)"
+                                : "~y~Collision wireframe OFF");
+                            modeSwitched = false;
+                            break;
                         case 5: ExitDebugMode(); return;
                     }
-                    ShowNotification($"~g~{debugMenuOptions[debugMenuSelection]}~w~ mode active");
+                    if (modeSwitched)
+                        ShowNotification($"~g~{debugMenuOptions[debugMenuSelection]}~w~ mode active");
                 }
 
                 // Draw menu
@@ -6333,128 +7113,18 @@ namespace ExtendedLSC
                 return;
             }
 
-            // Stats Calibration debug mode
-            if (activeDebugMode == DebugMode.StatsCalibration)
-            {
-                // Skip all processing if in game input mode (should have returned earlier, but safety check)
-                if (debugGameInputMode) return;
-
-                foreach (var obj in menuPool)
-                {
-                    if (obj is NativeMenu menu)
-                        menu.AcceptsInput = false;
-                }
-
-                // B goes back to debug menu (only if not in game input mode)
-                if (!debugGameInputMode && !debugBlockBButton && Game.IsControlJustPressed(GTA.Control.FrontendCancel))
-                {
-                    // Log final values before exiting
-                    LogStatsCalibrationValues();
-                    activeDebugMode = DebugMode.Menu;
-                    return;
-                }
-                Game.DisableControlThisFrame(GTA.Control.FrontendCancel);
-
-                // U/D to cycle settings (8 total: 4 stats x 2 values each)
-                if (Game.IsControlJustPressed(GTA.Control.FrontendUp))
-                    statsCalibrationSetting = (statsCalibrationSetting - 1 + 8) % 8;
-                if (Game.IsControlJustPressed(GTA.Control.FrontendDown))
-                    statsCalibrationSetting = (statsCalibrationSetting + 1) % 8;
-
-                // L/R to adjust values
-                float divStep = 1f;
-                float multStep = 0.01f;
-                bool isDiv = (statsCalibrationSetting % 2 == 0);  // Even = divisor, Odd = multiplier
-
-                if (Game.IsControlJustPressed(GTA.Control.FrontendLeft))
-                {
-                    switch (statsCalibrationSetting)
-                    {
-                        case 0: statsTopSpeedDiv = Math.Max(1f, statsTopSpeedDiv - divStep); break;
-                        case 1: statsTopSpeedMult = Math.Max(0.1f, statsTopSpeedMult - multStep); break;
-                        case 2: statsAccelDiv = Math.Max(0.01f, statsAccelDiv - 0.01f); break;
-                        case 3: statsAccelMult = Math.Max(0.1f, statsAccelMult - multStep); break;
-                        case 4: statsBrakingDiv = Math.Max(0.1f, statsBrakingDiv - 0.1f); break;
-                        case 5: statsBrakingMult = Math.Max(0.1f, statsBrakingMult - multStep); break;
-                        case 6: statsTractionDiv = Math.Max(0.1f, statsTractionDiv - 0.1f); break;
-                        case 7: statsTractionMult = Math.Max(0.1f, statsTractionMult - multStep); break;
-                    }
-                }
-                if (Game.IsControlJustPressed(GTA.Control.FrontendRight))
-                {
-                    switch (statsCalibrationSetting)
-                    {
-                        case 0: statsTopSpeedDiv += divStep; break;
-                        case 1: statsTopSpeedMult = Math.Min(1f, statsTopSpeedMult + multStep); break;
-                        case 2: statsAccelDiv += 0.01f; break;
-                        case 3: statsAccelMult = Math.Min(1f, statsAccelMult + multStep); break;
-                        case 4: statsBrakingDiv += 0.1f; break;
-                        case 5: statsBrakingMult = Math.Min(1f, statsBrakingMult + multStep); break;
-                        case 6: statsTractionDiv += 0.1f; break;
-                        case 7: statsTractionMult = Math.Min(1f, statsTractionMult + multStep); break;
-                    }
-                }
-
-                // X button to log current values
-                if (Game.IsControlJustPressed(GTA.Control.FrontendX))
-                {
-                    LogStatsCalibrationValues();
-                    ShowNotification("~g~Stats values logged to console");
-                }
-
-                menuPool.Process();
-                DrawCustomBanner();
-
-                // Get current raw values for display
-                float rawTopSpeed = 0f, rawAccel = 0f, rawBraking = 0f, rawTraction = 0f;
-                if (currentVehicle != null && currentVehicle.Exists())
-                {
-                    rawTopSpeed = Function.Call<float>(Hash.GET_VEHICLE_ESTIMATED_MAX_SPEED, currentVehicle);
-                    rawAccel = Function.Call<float>(Hash.GET_VEHICLE_ACCELERATION, currentVehicle);
-                    rawBraking = Function.Call<float>(Hash.GET_VEHICLE_MAX_BRAKING, currentVehicle);
-                    rawTraction = Function.Call<float>(Hash.GET_VEHICLE_MAX_TRACTION, currentVehicle);
-                }
-
-                // Draw debug panel on right side of screen using native text (avoids subtitle flashing)
-                float rightX = 0.75f;  // Right side of screen
-                float startY = 0.15f;
-                float lineHeight = 0.025f;
-                float panelWidth = 0.22f;
-                float panelHeight = lineHeight * 12 + 0.02f;
-
-                // Draw background panel
-                Function.Call(Hash.DRAW_RECT, rightX + panelWidth / 2f - 0.01f, startY + panelHeight / 2f - 0.01f, panelWidth, panelHeight, 0, 0, 0, 180);
-
-                // Draw title
-                DrawDebugText("STATS CALIBRATION", rightX, startY, 255, 255, 0);
-                DrawDebugText("U/D=setting, L/R=adjust, X=log, B=back", rightX, startY + lineHeight, 200, 200, 200);
-                DrawDebugText($"Raw: Spd={rawTopSpeed:F1} Acc={rawAccel:F3} Brk={rawBraking:F2} Trc={rawTraction:F2}", rightX, startY + lineHeight * 2, 180, 180, 180);
-
-                float[] values = { statsTopSpeedDiv, statsTopSpeedMult, statsAccelDiv, statsAccelMult, statsBrakingDiv, statsBrakingMult, statsTractionDiv, statsTractionMult };
-                for (int i = 0; i < 8; i++)
-                {
-                    string format = (i % 2 == 0) ? "F1" : "F2";
-                    if (i == 2 || i == 3) format = "F2";
-                    string prefix = (i == statsCalibrationSetting) ? "> " : "  ";
-                    string text = prefix + statsCalibrationNames[i] + ": " + values[i].ToString(format);
-                    int r = (i == statsCalibrationSetting) ? 100 : 255;
-                    int g = 255;
-                    int b = (i == statsCalibrationSetting) ? 100 : 255;
-                    DrawDebugText(text, rightX, startY + lineHeight * (3 + i), r, g, b);
-                }
-                return;
-            }
-
             // Debug: Log controller input (only when not editing)
             DebugLogControllerInput();
 
             // Handle button mapping for manual transmission (runs even in menu)
             HandleButtonMapping();
 
-            // Update manual transmission when driving (not in menu)
+            // Update manual transmission when driving (not in menu). Guarded: an exception here must
+            // NOT escape OnTick (SHVDN would unload the whole script mid-session). Transient-tolerant.
             if (!isMenuActive)
             {
-                UpdateManualTransmission();
+                try { UpdateManualTransmission(); }
+                catch (Exception ex) { Log($"[MT] OnTick error: {ex.Message}"); }
             }
 
             // Wheel fitment updates EVERY tick (in AND out of the menu) so height/camber edits re-settle
@@ -6462,8 +7132,12 @@ namespace ExtendedLSC
             UpdateWheelFitment();
 
             // Auto-apply saved stances to specific cars within range (skips the player's current car).
+            // Guarded like fitment: on error, disable for the session rather than crash the script.
             if (_stanceMgrInit && ModSettings.VStancerIntegration)
-                stanceManager.Update();
+            {
+                try { stanceManager.Update(); }
+                catch (Exception ex) { Log($"[Stance] OnTick error: {ex.Message}"); _stanceMgrInit = false; Log("[Stance] Disabled due to errors"); }
+            }
 
             // Handle custom menu input with native GTA-style acceleration
             HandleMenuInput();
@@ -6716,6 +7390,16 @@ namespace ExtendedLSC
                 isMenuActive = true;
                 mainMenu.Visible = true;
 
+                // Frame the car the moment the menu opens (like vanilla LSC) instead of leaving the camera stuck
+                // behind the car looking janky. Swing the DEFAULT follow camera to a fixed relative angle — NOT a
+                // script cam — so the player keeps full camera control (orbital Camera Mode on Y is separate). On
+                // an LSC AUTO-open the cinematic is just ending / the follow cam re-centers behind the just-parked
+                // car, so a single SET here gets overridden — re-assert it for ~0.9s (see OnTick) to win the
+                // transition, then release so the player can move it.
+                Function.Call(Hash.SET_GAMEPLAY_CAM_RELATIVE_HEADING, MENU_CAM_HEADING);
+                Function.Call(Hash.SET_GAMEPLAY_CAM_RELATIVE_PITCH, MENU_CAM_PITCH, 1.0f);
+                menuCamUntil = Game.GameTime + 900;
+
                 // Force handbrake on so player can rev with just RT
                 currentVehicle.IsEngineRunning = true;
                 Function.Call(Hash.SET_VEHICLE_HANDBRAKE, currentVehicle, true);
@@ -6767,6 +7451,8 @@ namespace ExtendedLSC
 
         private void CheckLSCEntry()
         {
+            if (_recordVanillaLSC) return;   // TEMP: let vanilla carmod_shop run uninterrupted for timing capture
+
             var player = Game.Player.Character;
             int interior = Function.Call<int>(Hash.GET_INTERIOR_FROM_ENTITY, player);
 
@@ -6779,14 +7465,31 @@ namespace ExtendedLSC
 
                 if (enteredLSC && player.IsInVehicle())
                 {
-                    Log("Entered Los Santos Customs - waiting for vehicle to stop");
                     isInLSC = true;
-                    waitingForVehicleStop = true;
+                    // Arm AUTO-open only on a genuine FRESH setup: first time ever, or we'd left the shop area
+                    // (>120m) since the last visit — which is when carmod_shop resets (mechanic respawns +
+                    // animation replays). A quick hop out and back stays close -> NOT a fresh setup -> don't
+                    // re-arm; the marker (drive within 5m of the customize spot + press) handles re-open.
+                    bool freshSetup = lscWorldPos == Vector3.Zero || lscWentFar;
+                    if (freshSetup)
+                    {
+                        Log("Entered LSC (fresh setup) - arming auto-open");
+                        waitingForVehicleStop = true;
+                        lscSwapped = false;
+                        lscWentFar = false;
+                    }
+                    else
+                    {
+                        Log("Re-entered LSC (near) - marker re-open only");
+                        waitingForVehicleStop = false;
+                    }
                 }
                 else if (leftLSC)
                 {
                     Log("Left Los Santos Customs - closing menu");
                     isInLSC = false;
+                    waitingForVehicleStop = false;
+                    lastVehiclePos = Vector3.Zero;
 
                     Function.Call(Hash.SET_MAX_WANTED_LEVEL, 5);
 
@@ -6800,6 +7503,12 @@ namespace ExtendedLSC
                 lastInterior = interior;
             }
 
+            // Track whether the player has gone FAR from the shop since the last visit — that's what makes
+            // carmod_shop reset (respawn its mechanic + replay the animation). A quick hop-out-and-back stays
+            // close and does NOT reset, so it must NOT re-arm the auto-open (marker handles re-open).
+            if (lscWorldPos != Vector3.Zero && Game.Player.Character.Position.DistanceTo(lscWorldPos) > 120f)
+                lscWentFar = true;
+
             // Detect service position
             if (waitingForVehicleStop && isInLSC)
             {
@@ -6807,24 +7516,110 @@ namespace ExtendedLSC
                 if (ped.IsInVehicle())
                 {
                     var vehicle = ped.CurrentVehicle;
-                    var pos = vehicle.Position;
-                    float speed = vehicle.Speed;
-                    float posDiff = lastVehiclePos != Vector3.Zero ? pos.DistanceTo(lastVehiclePos) : 0;
 
-                    if (speed < 0.5f && posDiff > 0.3f && posDiff < 1.5f)
+                    // carmod_shop takes player control (control OFF) for the WHOLE drive-in animation + its menu.
+                    // RECORDED TIMING (Burton): control off at ~11.2s, the car is driven automatically at a steady
+                    // ~2.96 m/s for ~5s, then parks (speed->0) at ~16.2s — and ONLY THEN does the vanilla menu
+                    // appear. The car is moving (speed > 1) for the entire drive-in and only drops to ~0 at the
+                    // end, so "stopped while the cinematic is active" cleanly marks the animation finishing.
+                    //
+                    // So we must NOT touch carmod_shop until that settle point (touching it earlier kills the
+                    // animation — the old bug). At settle we swap the bay mechanic (halts carmod_shop's menu before
+                    // it can show) and open ours. For an already-visited shop with no drive-in, the car is already
+                    // stopped, so this fires immediately — instant open, as expected.
+                    // Settle = car stopped while inside the LSC interior. ONE timer, reset ONLY by MOVEMENT (not by
+                    // the control toggle), so it survives the control on->off transition cleanly.
+                    if (vehicle.Speed < 0.5f)
                     {
-                        Log($"Service position teleport detected! Pos diff: {posDiff:F2}");
+                        if (lscSettleSince == 0) lscSettleSince = Game.GameTime;
+                    }
+                    else lscSettleSince = 0;
+
+                    // Act on the VERY FIRST parked frame to beat the vanilla menu (it appears ~1 frame after the
+                    // car parks). The delay is near-zero — that's what kills the split-second vanilla-menu flash.
+                    //  - CINEMATIC (control OFF, e.g. Burton 39938 / Airport 93442): the drive-in animation just
+                    //    parked the car -> act THIS frame (0ms). The car moves the WHOLE drive-in (speed never
+                    //    dips < 0.5 until the end), so this only fires at the park and never preempts the animation.
+                    //  - NO cinematic (control ON, e.g. Grand Senora 9474): an animation ALWAYS grabs the car while
+                    //    it's still MOVING (control goes off before the car stops), so a stop with control STILL ON
+                    //    means no animation is coming -> safe to act with just a 2-frame confirm (~32ms) to ignore
+                    //    a momentary slow-roll dip.
+                    bool cinematic = !Function.Call<bool>(Hash.IS_PLAYER_CONTROL_ON, Game.Player);
+
+                    // DIRECT "vanilla menu just opened" signal: carmod_shop switches the vehicle radio to this
+                    // hidden station the instant it shows its menu (state 44, per decompiled carmod_shop.c line
+                    // 7209). Catching it = take over the EXACT frame the menu appears (minimal flash) and NEVER
+                    // before the drive-in (the menu only opens AFTER the animation finishes).
+                    bool vanillaMenuOpen = false;
+                    try { vanillaMenuOpen = Function.Call<string>(Hash.GET_PLAYER_RADIO_STATION_NAME) == "HIDDEN_RADIO_09_HIPHOP_OLD"; } catch { }
+
+                    // Cinematic park -> act immediately. Otherwise wait ~800ms of CONTINUOUS stop so a cinematic
+                    // (some shops grab a STOPPED car a beat after you park) gets its chance before we conclude
+                    // "no animation" — UNLESS the vanilla menu actually opens first, in which case take over then.
+                    long needed = cinematic ? 0 : 800;
+                    if (lscSettleSince != 0 && ((Game.GameTime - lscSettleSince) >= needed || vanillaMenuOpen))
+                    {
+                        // Remove the bay mechanic NOW so carmod_shop never gets to show its menu (no-op at shops
+                        // without one); open regardless so non-animated shops still auto-open.
+                        DeleteAndRespawnMechanic(vehicle.Position);
+                        lscSwapped = true;
+                        lscWentFar = false;   // start fresh; only a real far-trip re-arms next time
+                        // carmod_shop reacts to the missing mechanic over a few frames, and at a no-animation shop
+                        // its menu (state 44) can pop the instant the car stops. Keep deleting the mechanic every
+                        // frame for ~0.7s so the vanilla menu can't establish/linger while ELSC's menu covers it.
+                        lscSuppressUntil = Game.GameTime + 700;
+                        Log($"LSC parked ({(cinematic ? "animated" : "no-anim")}) -> instant takeover");
                         waitingForVehicleStop = false;
-                        lastVehiclePos = Vector3.Zero;
-
-                        DeleteAndRespawnMechanic(pos);
+                        lscSettleSince = 0;
+                        customizeSpot = vehicle.Position;
                         TryOpenMenu();
-
                         Function.Call(Hash.SET_MAX_WANTED_LEVEL, 0);
                         Function.Call(Hash.CLEAR_PLAYER_WANTED_LEVEL, Game.Player);
                     }
+                }
+            }
 
-                    lastVehiclePos = pos;
+            // Suppression window: for a short time after takeover, keep deleting any bay mechanic carmod_shop
+            // (re)spawns each frame, so its menu can't establish or linger underneath ELSC's. DeleteAndRespawn is
+            // a no-op once the native mechanic is already gone, so this is cheap and flicker-free.
+            if (isInLSC && Game.GameTime < lscSuppressUntil)
+            {
+                try { DeleteAndRespawnMechanic(Game.Player.Character.Position); } catch { }
+            }
+
+            // We own the shop's help slot in and AROUND the LSC. With carmod_shop's mechanic gone it sits in a
+            // "shop closed" state and spams "Los Santos Customs is closed..." help — which it shows in its trigger
+            // zone, slightly outside the interior too. Remember the LSC world position while inside, and suppress
+            // the message anywhere near it. When parked inside, overwrite the slot with OUR re-open prompt.
+            if (isInLSC) lscWorldPos = Game.Player.Character.Position;
+            bool nearLsc = isInLSC || (lscWorldPos != Vector3.Zero && Game.Player.Character.Position.DistanceTo(lscWorldPos) < 60f);
+
+            if (nearLsc && !isMenuActive)
+            {
+                // Show a small marker at the customize spot the whole time we're in the bay, so the player knows
+                // where to drive to. Activation is manual: within 5m of it, press the button to open the menu.
+                bool atSpot = false;
+                if (isInLSC && customizeSpot != Vector3.Zero)
+                {
+                    Function.Call(Hash.DRAW_MARKER, 1,
+                        customizeSpot.X, customizeSpot.Y, customizeSpot.Z - 1.0f,
+                        0f, 0f, 0f, 0f, 0f, 0f, 1.6f, 1.6f, 0.6f,
+                        80, 160, 255, 110, false, false, 2, false, 0, 0, false);
+                    atSpot = Game.Player.Character.Position.DistanceTo(customizeSpot) < 5f;
+                }
+
+                if (atSpot)
+                {
+                    // Native help bubble renders the correct glyph per input device (E on KB, DPad on controller).
+                    Function.Call(Hash.BEGIN_TEXT_COMMAND_DISPLAY_HELP, "STRING");
+                    Function.Call(Hash.ADD_TEXT_COMPONENT_SUBSTRING_PLAYER_NAME, "Press ~INPUT_CONTEXT~ to customize your vehicle.");
+                    Function.Call(Hash.END_TEXT_COMMAND_DISPLAY_HELP, 0, false, false, -1);
+                    if (Game.IsControlJustPressed(GTA.Control.Context))
+                        TryOpenMenu();   // vanilla menu already halted; just reshow ours
+                }
+                else
+                {
+                    Function.Call(Hash.CLEAR_HELP, true);   // suppress carmod_shop's "shop closed" help (inside or nearby)
                 }
             }
 
@@ -6838,54 +7633,74 @@ namespace ExtendedLSC
 
         #region Mechanic Management
 
-        private void DeleteAndRespawnMechanic(Vector3 position)
+        /// <summary>Swap out carmod_shop's mechanic (the nearest bay ped, its Local_757.f_12). Removing the
+        /// script's expected ped cleanly halts its menu flow WITHOUT terminating the script — so control, camera,
+        /// the moddable state and re-entry all stay intact. We delete + recreate an identical clone in the SAME
+        /// tick (no visible gap, no model-load hitch since the model is already resident), then plant the clone so
+        /// it stands as scenery and never wanders.</summary>
+        /// <summary>Returns true if it actually swapped a native mechanic (so callers can stop retrying).</summary>
+        /// <summary>True if carmod_shop's NATIVE bay mechanic is present (a nearby ped that isn't us or our
+        /// clone). Non-destructive — used to detect a fresh shop setup so we know to (re)arm the auto-open. After
+        /// we take over we delete that mechanic, so this reads false until carmod_shop respawns one on a real
+        /// reset (first entry / far-return).</summary>
+        private bool IsNativeMechanicPresent(Vector3 position)
         {
-            if (!ENABLE_MECHANIC_REPLACEMENT) return;
-
-            DeleteCustomMechanic();
-
-            Ped[] nearbyPeds = World.GetNearbyPeds(position, 10f);
-
-            foreach (var ped in nearbyPeds)
+            if (!ENABLE_MECHANIC_REPLACEMENT) return false;
+            foreach (var ped in World.GetNearbyPeds(position, 25f))
             {
-                if (ped == Game.Player.Character) continue;
-
-                Model model = ped.Model;
-                Vector3 pos = ped.Position;
-                float heading = ped.Heading;
-
-                int[] drawables = new int[12];
-                int[] textures = new int[12];
-                for (int i = 0; i < 12; i++)
-                {
-                    drawables[i] = Function.Call<int>(Hash.GET_PED_DRAWABLE_VARIATION, ped, i);
-                    textures[i] = Function.Call<int>(Hash.GET_PED_TEXTURE_VARIATION, ped, i);
-                }
-
-                Log($"Deleting mechanic - Model: {model.Hash}, Pos: {pos}");
-                ped.Delete();
-
-                model.Request(1000);
-                if (model.IsLoaded)
-                {
-                    Ped newMechanic = World.CreatePed(model, pos, heading);
-                    if (newMechanic != null)
-                    {
-                        for (int i = 0; i < 12; i++)
-                        {
-                            Function.Call(Hash.SET_PED_COMPONENT_VARIATION, newMechanic, i, drawables[i], textures[i], 0);
-                        }
-
-                        newMechanic.BlockPermanentEvents = true;
-                        customMechanic = newMechanic;
-                        customMechanicPos = pos;
-                        Log($"Respawned mechanic with original outfit at {pos}");
-                    }
-                    model.MarkAsNoLongerNeeded();
-                }
-
-                break;
+                if (ped == null || !ped.Exists() || ped == Game.Player.Character) continue;
+                if (customMechanic != null && customMechanic.Exists() && ped == customMechanic) continue;
+                return true;
             }
+            return false;
+        }
+
+        private bool DeleteAndRespawnMechanic(Vector3 position)
+        {
+            if (!ENABLE_MECHANIC_REPLACEMENT) return false;
+
+            // Find the nearest NATIVE mechanic to suppress (a bay ped that isn't already our clone). If there's
+            // none (we already swapped this session and carmod_shop hasn't respawned one), do NOTHING — its menu
+            // is already halted and deleting our clone would leave the bay empty.
+            Ped target = null;
+            foreach (var ped in World.GetNearbyPeds(position, 25f))
+            {
+                if (ped == null || !ped.Exists() || ped == Game.Player.Character) continue;
+                if (customMechanic != null && customMechanic.Exists() && ped == customMechanic) continue;
+                target = ped; break;
+            }
+            if (target == null) return false;
+
+            Model model = target.Model;
+            Vector3 pos = target.Position;
+            float heading = target.Heading;
+            int[] drawables = new int[12];
+            int[] textures = new int[12];
+            for (int i = 0; i < 12; i++)
+            {
+                drawables[i] = Function.Call<int>(Hash.GET_PED_DRAWABLE_VARIATION, target, i);
+                textures[i] = Function.Call<int>(Hash.GET_PED_TEXTURE_VARIATION, target, i);
+            }
+
+            DeleteCustomMechanic();        // remove the previous clone; we're about to make a fresh one
+            target.Delete();               // same-tick swap: gone + recreated before this frame renders
+            model.Request(500);
+            if (model.IsLoaded)
+            {
+                Ped clone = World.CreatePed(model, pos, heading);
+                if (clone != null)
+                {
+                    for (int i = 0; i < 12; i++)
+                        Function.Call(Hash.SET_PED_COMPONENT_VARIATION, clone, i, drawables[i], textures[i], 0);
+                    clone.BlockPermanentEvents = true;
+                    Function.Call(Hash.SET_BLOCKING_OF_NON_TEMPORARY_EVENTS, clone, true);
+                    Function.Call(Hash.TASK_STAND_STILL, clone, -1);   // plant as scenery, never wanders
+                    customMechanic = clone;
+                    customMechanicPos = pos;
+                }
+                model.MarkAsNoLongerNeeded();
+            }
+            return true;
         }
 
         private void DeleteCustomMechanic()
@@ -7683,34 +8498,6 @@ namespace ExtendedLSC
         }
 
         /// <summary>
-        /// Log stats calibration values for copy/paste into code
-        /// </summary>
-        private void LogStatsCalibrationValues()
-        {
-            float rawTopSpeed = 0f, rawAccel = 0f, rawBraking = 0f, rawTraction = 0f;
-            if (currentVehicle != null && currentVehicle.Exists())
-            {
-                rawTopSpeed = Function.Call<float>(Hash.GET_VEHICLE_ESTIMATED_MAX_SPEED, currentVehicle);
-                rawAccel = Function.Call<float>(Hash.GET_VEHICLE_ACCELERATION, currentVehicle);
-                rawBraking = Function.Call<float>(Hash.GET_VEHICLE_MAX_BRAKING, currentVehicle);
-                rawTraction = Function.Call<float>(Hash.GET_VEHICLE_MAX_TRACTION, currentVehicle);
-            }
-
-            string log = "\n========== STATS CALIBRATION VALUES ==========\n";
-            log += $"Vehicle: {currentVehicle?.DisplayName ?? "None"}\n";
-            log += $"Raw Values: TopSpeed={rawTopSpeed:F2}, Accel={rawAccel:F4}, Braking={rawBraking:F3}, Traction={rawTraction:F3}\n\n";
-            log += "// Copy these values to DrawVehicleStats:\n";
-            log += $"float topSpeedPct = (float)Math.Sqrt(Math.Min(1f, topSpeed / {statsTopSpeedDiv:F1}f)) * {statsTopSpeedMult:F2}f;\n";
-            log += $"float accelPct = (float)Math.Sqrt(Math.Min(1f, acceleration / {statsAccelDiv:F2}f)) * {statsAccelMult:F2}f;\n";
-            log += $"float brakingPct = (float)Math.Sqrt(Math.Min(1f, braking / {statsBrakingDiv:F1}f)) * {statsBrakingMult:F2}f;\n";
-            log += $"float tractionPct = (float)Math.Sqrt(Math.Min(1f, traction / {statsTractionDiv:F1}f)) * {statsTractionMult:F2}f;\n";
-            log += "===============================================\n";
-
-            System.IO.File.AppendAllText("scripts/ExtendedLSC_debug.log", log);
-            GTA.UI.Notification.Show("~g~Stats calibration logged to ExtendedLSC_debug.log");
-        }
-
-        /// <summary>
         /// Get the player's current cash
         /// </summary>
         private int GetPlayerCash()
@@ -7775,6 +8562,302 @@ namespace ExtendedLSC
                 string logPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ExtendedLSC.log");
                 string timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
                 System.IO.File.AppendAllText(logPath, $"[{timestamp}] {message}\n");
+            }
+            catch { }
+        }
+
+        // --- Live menu-state publishing (for bridge-driven, feedback-based navigation) ---
+        private string _lastMenuStateJson = "";
+        private void DumpMenuState()
+        {
+            if (!ModSettings.DebugLogging) return; // dev/automation only — keeps release builds from writing the file
+            try
+            {
+                NativeMenu vis = null;
+                foreach (var obj in menuPool)
+                    if (obj is NativeMenu m && m.Visible) vis = m; // last visible = topmost open submenu
+
+                string json;
+                if (vis == null)
+                {
+                    json = "{\"open\":false}";
+                }
+                else
+                {
+                    var sb = new System.Text.StringBuilder();
+                    sb.Append("{\"open\":true,\"menu\":").Append(JsonStr(vis.Name));
+                    sb.Append(",\"selectedIndex\":").Append(vis.SelectedIndex);
+                    sb.Append(",\"count\":").Append(vis.Items.Count);
+                    sb.Append(",\"selected\":").Append(JsonStr(vis.SelectedItem != null ? vis.SelectedItem.Title : ""));
+                    sb.Append(",\"selectedValue\":").Append(JsonStr(TryGetListValue(vis.SelectedItem)));
+                    sb.Append(",\"items\":[");
+                    for (int i = 0; i < vis.Items.Count; i++)
+                    {
+                        if (i > 0) sb.Append(',');
+                        sb.Append(JsonStr(vis.Items[i].Title));
+                    }
+                    sb.Append("]}");
+                    json = sb.ToString();
+                }
+
+                if (json != _lastMenuStateJson)
+                {
+                    _lastMenuStateJson = json;
+                    string p = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ExtendedLSC_menustate.json");
+                    System.IO.File.WriteAllText(p, json);
+                }
+            }
+            catch { }
+        }
+
+        private static string TryGetListValue(NativeItem item)
+        {
+            if (item == null) return "";
+            try
+            {
+                // NativeListItem<T> exposes SelectedItem (the T value); read it generically.
+                var prop = item.GetType().GetProperty("SelectedItem");
+                if (prop != null && prop.PropertyType != typeof(NativeItem))
+                {
+                    var val = prop.GetValue(item);
+                    if (val != null) return val.ToString();
+                }
+            }
+            catch { }
+            return "";
+        }
+
+        private static string JsonStr(string v)
+        {
+            if (v == null) return "\"\"";
+            var sb = new System.Text.StringBuilder("\"");
+            foreach (char c in v)
+            {
+                if (c == '"' || c == '\\') sb.Append('\\').Append(c);
+                else if (c == '\n') sb.Append("\\n");
+                else if (c == '\r') sb.Append("\\r");
+                else if (c < 0x20) sb.Append(' ');
+                else sb.Append(c);
+            }
+            return sb.Append('"').ToString();
+        }
+
+        // ---- Collision wireframe overlay (F8) ----
+        // GREEN = body collision box (model extents). BLUE = each wheel's PHYSICAL collider cylinder, built
+        // from the live collision radius/width in CWheel memory — so you can see collision vs the rendered
+        // wheel (float = visual below collider, sink = visual above it) while re-tuning the raw fitment.
+        private void DrawCollisionDebug()
+        {
+            try
+            {
+                Vehicle v = currentVehicle;
+                if (v == null || !v.Exists())
+                {
+                    Ped pl = Game.Player.Character;
+                    v = (pl != null && pl.Exists() && pl.IsInVehicle()) ? pl.CurrentVehicle : null;
+                }
+                if (v == null || !v.Exists()) return;
+
+                // GREEN body collision — the ACTUAL collision surface, found by raycasting a grid from all
+                // six sides inward and keeping where the rays hit this vehicle. Scanned once per vehicle (the
+                // body collision is static) and cached in vehicle-local space, so it tracks the car as it
+                // moves. Drawn as a point cloud (small crosses).
+                if (_bodyScanHandle != v.Handle)
+                {
+                    ScanBodyCollision(v);
+                    _bodyScanHandle = v.Handle;
+                }
+                Color green = Color.FromArgb(255, 0, 255, 0);
+                foreach (Vector3 lp in _bodyHits)
+                {
+                    Vector3 w = v.GetOffsetPosition(lp);
+                    World.DrawLine(w + new Vector3(-0.03f, 0, 0), w + new Vector3(0.03f, 0, 0), green);
+                    World.DrawLine(w + new Vector3(0, -0.03f, 0), w + new Vector3(0, 0.03f, 0), green);
+                    World.DrawLine(w + new Vector3(0, 0, -0.03f), w + new Vector3(0, 0, 0.03f), green);
+                }
+                // Extents box from the body-only hits (lighter green) so the bounds are clear.
+                if (_bodyBoxValid)
+                    DrawLocalBox(v, _bodyMin, _bodyMax, Color.FromArgb(255, 150, 255, 150));
+
+
+                // BLUE wheel collider cylinders (actual physical collision).
+                string[] bones = { "wheel_lf", "wheel_rf", "wheel_lr", "wheel_rr" };
+                Color blue = Color.FromArgb(255, 40, 130, 255);
+                int n = WheelMemory.GetWheelCount(v);
+                for (int i = 0; i < bones.Length && i < n; i++)
+                {
+                    int bi = Function.Call<int>(Hash.GET_ENTITY_BONE_INDEX_BY_NAME, v, bones[i]);
+                    if (bi < 0) continue;
+                    Vector3 c = Function.Call<Vector3>(Hash.GET_WORLD_POSITION_OF_ENTITY_BONE, v, bi);
+                    float r = WheelMemory.GetTyreColliderRadius(v, i);
+                    float w = WheelMemory.GetTyreColliderWidth(v, i);
+                    if (r < 0.05f || r > 2f) continue;
+                    DrawWheelCylinder(v, c, r, w, blue);
+                }
+            }
+            catch { }
+        }
+
+        // Wireframe box from a local-space min/max, transformed to world via the entity matrix.
+        private void DrawLocalBox(Entity e, Vector3 min, Vector3 max, Color col)
+        {
+            Vector3 C(float x, float y, float z) =>
+                Function.Call<Vector3>(Hash.GET_OFFSET_FROM_ENTITY_IN_WORLD_COORDS, e, x, y, z);
+            Vector3[] p =
+            {
+                C(min.X, min.Y, min.Z), C(max.X, min.Y, min.Z), C(max.X, max.Y, min.Z), C(min.X, max.Y, min.Z),
+                C(min.X, min.Y, max.Z), C(max.X, min.Y, max.Z), C(max.X, max.Y, max.Z), C(min.X, max.Y, max.Z)
+            };
+            int[,] edges = { {0,1},{1,2},{2,3},{3,0}, {4,5},{5,6},{6,7},{7,4}, {0,4},{1,5},{2,6},{3,7} };
+            for (int i = 0; i < 12; i++)
+                World.DrawLine(p[edges[i, 0]], p[edges[i, 1]], col);
+        }
+
+        // Wireframe cylinder for a wheel: two radius circles in the wheel's roll plane (vehicle fwd/up),
+        // offset along the axle (vehicle right) by the collider width, plus a few connecting struts.
+        private void DrawWheelCylinder(Entity v, Vector3 center, float radius, float width, Color col)
+        {
+            Vector3 axle = v.RightVector;
+            Vector3 fwd = v.ForwardVector;
+            Vector3 up = v.UpVector;
+            float half = width * 0.5f;
+            Vector3 cA = center + axle * half;
+            Vector3 cB = center - axle * half;
+            const int seg = 18;
+            Vector3 prevA = Vector3.Zero, prevB = Vector3.Zero;
+            for (int s = 0; s <= seg; s++)
+            {
+                float a = (float)(s * 2.0 * Math.PI / seg);
+                Vector3 dir = fwd * (float)Math.Cos(a) + up * (float)Math.Sin(a);
+                Vector3 pA = cA + dir * radius;
+                Vector3 pB = cB + dir * radius;
+                if (s > 0)
+                {
+                    World.DrawLine(prevA, pA, col);
+                    World.DrawLine(prevB, pB, col);
+                    if (s % 3 == 0) World.DrawLine(pA, pB, col);   // sparse cylinder struts
+                }
+                prevA = pA; prevB = pB;
+            }
+        }
+
+        // Scan the vehicle's ACTUAL collision surface by raycasting a grid from all six faces of the model
+        // box inward; keep the points where the ray hits THIS vehicle. Stored in vehicle-local space so the
+        // cloud stays glued to the car. One-shot per vehicle (a brief hitch on first enable is expected).
+        private void ScanBodyCollision(Vehicle v)
+        {
+            _bodyHits.Clear();
+            try
+            {
+                var oMin = new OutputArgument();
+                var oMax = new OutputArgument();
+                Function.Call(Hash.GET_MODEL_DIMENSIONS, v.Model.Hash, oMin, oMax);
+                Vector3 mn = oMin.GetResult<Vector3>();
+                Vector3 mx = oMax.GetResult<Vector3>();
+
+                // Build wheel exclusion cylinders (local center + tyre radius + half-width) so we can drop
+                // ray hits that landed on a wheel — those are shown separately in blue.
+                var wCenter = new System.Collections.Generic.List<Vector3>();
+                var wRad = new System.Collections.Generic.List<float>();
+                var wHalf = new System.Collections.Generic.List<float>();
+                string[] bones = { "wheel_lf", "wheel_rf", "wheel_lr", "wheel_rr" };
+                int nW = WheelMemory.GetWheelCount(v);
+                for (int i = 0; i < bones.Length && i < nW; i++)
+                {
+                    int bi = Function.Call<int>(Hash.GET_ENTITY_BONE_INDEX_BY_NAME, v, bones[i]);
+                    if (bi < 0) continue;
+                    Vector3 c = v.GetPositionOffset(Function.Call<Vector3>(Hash.GET_WORLD_POSITION_OF_ENTITY_BONE, v, bi));
+                    float r = WheelMemory.GetTyreColliderRadius(v, i);
+                    float w = WheelMemory.GetTyreColliderWidth(v, i);
+                    wCenter.Add(c);
+                    wRad.Add(r > 0.05f && r < 2f ? r : 0.4f);
+                    wHalf.Add(w > 0.02f && w < 1f ? w * 0.5f : 0.2f);
+                }
+
+                // The body can never sit below the tyre contact line, so anything lower is the ground or a
+                // stray low hit — reject it. (No wheels found -> no floor cut.)
+                float floorZ = float.MinValue;
+                for (int k = 0; k < wCenter.Count; k++)
+                {
+                    float bottom = wCenter[k].Z - wRad[k];
+                    floorZ = (k == 0) ? bottom : Math.Min(floorZ, bottom);
+                }
+
+                // In LOCAL space: X = axle (lateral), Y = forward, Z = up. A point is "on a wheel" if it's
+                // inside that wheel's cylinder (axially within half-width, radially within tyre radius).
+                bool IsWheel(Vector3 p)
+                {
+                    for (int k = 0; k < wCenter.Count; k++)
+                    {
+                        Vector3 d = p - wCenter[k];
+                        float axial = Math.Abs(d.X);
+                        float radial = (float)Math.Sqrt(d.Y * d.Y + d.Z * d.Z);
+                        // Generous margins: tyres can poke past the bone-centered collider (stance/camber),
+                        // so over-exclude a little rather than leave wheel points in the body cloud.
+                        if (axial < wHalf[k] + 0.16f && radial < wRad[k] + 0.14f) return true;
+                    }
+                    return false;
+                }
+
+                void Cast(Vector3 ls, Vector3 le)
+                {
+                    RaycastResult r = World.Raycast(v.GetOffsetPosition(ls), v.GetOffsetPosition(le), IntersectFlags.Vehicles);
+                    if (r.DidHit && r.HitEntity != null && r.HitEntity.Handle == v.Handle)
+                    {
+                        Vector3 lp = v.GetPositionOffset(r.HitPosition);
+                        if (lp.Z < floorZ + 0.02f) return;   // below tyre contact = ground / stray
+                        if (!IsWheel(lp)) _bodyHits.Add(lp);
+                    }
+                }
+
+                const int G = 11;        // grid resolution per face
+                const float pad = 0.4f;  // start the ray this far outside the box
+                for (int i = 0; i < G; i++)
+                {
+                    float ti = (float)i / (G - 1);
+                    float x = mn.X + (mx.X - mn.X) * ti;
+                    float yi = mn.Y + (mx.Y - mn.Y) * ti;
+                    for (int j = 0; j < G; j++)
+                    {
+                        float tj = (float)j / (G - 1);
+                        float y = mn.Y + (mx.Y - mn.Y) * tj;
+                        float z = mn.Z + (mx.Z - mn.Z) * tj;
+                        Cast(new Vector3(x, y, mx.Z + pad), new Vector3(x, y, mn.Z - pad));   // top-down
+                        Cast(new Vector3(x, y, mn.Z - pad), new Vector3(x, y, mx.Z + pad));   // bottom-up
+                        Cast(new Vector3(mn.X - pad, yi, z), new Vector3(mx.X + pad, yi, z));  // left->right
+                        Cast(new Vector3(mx.X + pad, yi, z), new Vector3(mn.X - pad, yi, z));  // right->left
+                        Cast(new Vector3(x, mn.Y - pad, z), new Vector3(x, mx.Y + pad, z));    // front->back
+                        Cast(new Vector3(x, mx.Y + pad, z), new Vector3(x, mn.Y - pad, z));    // back->front
+                    }
+                }
+
+                // Dedicated DENSE underside pass (bottom-up) — the floor pan is large and flat, so the main
+                // grid under-samples it. Finer grid catches the underside cleanly.
+                const int GB = 19;
+                for (int i = 0; i < GB; i++)
+                {
+                    float x = mn.X + (mx.X - mn.X) * i / (GB - 1);
+                    for (int j = 0; j < GB; j++)
+                    {
+                        float y = mn.Y + (mx.Y - mn.Y) * j / (GB - 1);
+                        Cast(new Vector3(x, y, mn.Z - pad), new Vector3(x, y, mx.Z + pad));
+                    }
+                }
+
+                // Extents box (AABB) of the body-only hits, in local space.
+                if (_bodyHits.Count > 0)
+                {
+                    Vector3 lo = _bodyHits[0], hi = _bodyHits[0];
+                    foreach (Vector3 p in _bodyHits)
+                    {
+                        lo = new Vector3(Math.Min(lo.X, p.X), Math.Min(lo.Y, p.Y), Math.Min(lo.Z, p.Z));
+                        hi = new Vector3(Math.Max(hi.X, p.X), Math.Max(hi.Y, p.Y), Math.Max(hi.Z, p.Z));
+                    }
+                    _bodyMin = lo; _bodyMax = hi; _bodyBoxValid = true;
+                }
+                else _bodyBoxValid = false;
+
+                Log($"[Collision] body scan: {_bodyHits.Count} body hits (wheels excluded) for {v.DisplayName}");
             }
             catch { }
         }
@@ -7866,6 +8949,108 @@ namespace ExtendedLSC
                 isEditingDescription = false;
                 editingCategoryName = null;
             }
+        }
+
+        #endregion
+
+        #region Custom Plate Text
+
+        private string GetPlateText(Vehicle v)
+        {
+            try { return (Function.Call<string>(Hash.GET_VEHICLE_NUMBER_PLATE_TEXT, v) ?? "").Trim(); }
+            catch { return ""; }
+        }
+
+        /// <summary>Open the on-screen keyboard to type a custom plate (max 8 chars), prefilled with the current.</summary>
+        private void StartEditPlate()
+        {
+            if (isEditingPlate || currentVehicle == null || !currentVehicle.Exists()) return;
+            isEditingPlate = true;
+            plateBeforeEdit = GetPlateText(currentVehicle);
+            Function.Call(Hash.DISPLAY_ONSCREEN_KEYBOARD, 0, "FMMC_KEY_TIP8", "", plateBeforeEdit, "", "", "", 8);
+            ShowNotification("~y~Enter a plate (up to 8 characters)");
+        }
+
+        /// <summary>Poll the keyboard; on accept, validate uniqueness and apply (or raise the conflict prompt).</summary>
+        private void UpdatePlateEditor()
+        {
+            if (!isEditingPlate) return;
+            if (plateKbCooldown > 0) { plateKbCooldown--; return; }
+            plateKbCooldown = 5;
+
+            int status = Function.Call<int>(Hash.UPDATE_ONSCREEN_KEYBOARD);
+            if (status == 1) // accepted
+            {
+                isEditingPlate = false;
+                string text = (Function.Call<string>(Hash.GET_ONSCREEN_KEYBOARD_RESULT) ?? "").Trim().ToUpperInvariant();
+                if (string.IsNullOrEmpty(text)) { ShowNotification("~r~Plate not changed (empty)"); return; }
+                if (currentVehicle == null || !currentVehicle.Exists()) return;
+
+                // Same as current -> nothing to do.
+                if (string.Equals(text, plateBeforeEdit, StringComparison.OrdinalIgnoreCase)) return;
+
+                if (windowTint.PlateUsedBySavedVehicle(currentVehicle, text))
+                {
+                    pendingPlateText = text;
+                    ShowPlateConflict(text);
+                }
+                else
+                {
+                    ApplyCustomPlate(text, plateBeforeEdit);
+                }
+            }
+            else if (status == 2) // cancelled
+            {
+                isEditingPlate = false;
+                ShowNotification("~y~Plate edit cancelled");
+            }
+        }
+
+        /// <summary>Set the plate text and migrate this car's saved window color so the tint follows the rename.</summary>
+        private void ApplyCustomPlate(string text, string oldPlate)
+        {
+            if (currentVehicle == null || !currentVehicle.Exists()) return;
+            windowTint.MoveColorToPlate(currentVehicle.DisplayName, oldPlate, text);  // keep the tint on the renamed car
+            Function.Call(Hash.SET_VEHICLE_NUMBER_PLATE_TEXT, currentVehicle, text);
+            ShowNotification($"~g~Plate set to ~b~{text}");
+            pendingPlateText = null;
+            // Refresh the plate menu so the "Custom Plate Text" AltTitle shows the new value.
+            if (plateMenu != null && plateMenu.Visible)
+            {
+                isNavigatingMenu = true; plateMenu.Visible = false;
+                plateMenu = CreatePlateMenu(); plateMenu.Visible = true;
+                isNavigatingMenu = false;
+            }
+        }
+
+        /// <summary>Duplicate-plate prompt: choose a different name or overwrite the other vehicle's identity.</summary>
+        private void ShowPlateConflict(string text)
+        {
+            if (plateConflictMenu == null)
+            {
+                plateConflictMenu = CreateMenu("Plate In Use");
+                var diff = new NativeItem("Choose a Different Name", "Re-open the keyboard to pick a unique plate");
+                diff.Activated += (s, e) =>
+                {
+                    isNavigatingMenu = true; plateConflictMenu.Visible = false; isNavigatingMenu = false;
+                    StartEditPlate();
+                };
+                var over = new NativeItem("Overwrite Anyway", "Use this plate even though another saved vehicle has it");
+                over.Activated += (s, e) =>
+                {
+                    isNavigatingMenu = true; plateConflictMenu.Visible = false;
+                    if (plateMenu != null) plateMenu.Visible = true;
+                    isNavigatingMenu = false;
+                    if (!string.IsNullOrEmpty(pendingPlateText)) ApplyCustomPlate(pendingPlateText, plateBeforeEdit);
+                };
+                plateConflictMenu.Add(diff);
+                plateConflictMenu.Add(over);
+            }
+            ShowNotification($"~o~Plate ~b~{text}~o~ is already used by another saved vehicle.");
+            isNavigatingMenu = true;
+            if (plateMenu != null) plateMenu.Visible = false;
+            plateConflictMenu.Visible = true;
+            isNavigatingMenu = false;
         }
 
         /// <summary>
@@ -8116,6 +9301,7 @@ namespace ExtendedLSC
             // Update transmission state
             if (elscTransmission.IsEnabled)
             {
+                elscTransmission.NosInstalled = ModSettings.NosEnabled;   // test toggle until LSC purchase
                 elscTransmission.Update();
 
                 // Draw HUD — NFS-style drag gauge (replaces the old corner readout)
@@ -8146,9 +9332,22 @@ namespace ExtendedLSC
         private void UpdateWheelFitment()
         {
             if (!(ModSettings.VStancerIntegration && _fitmentInitAllowed)) return;
+            if (suspendWheelFitment) return; // paused while previewing wheels (see CreateWheelTypeMenu)
 
             Vehicle vehicle = Game.Player.Character?.CurrentVehicle;
             if (vehicle == null || !vehicle.Exists()) return;
+
+            // Stancing is 4-wheel only. On a bike / non-4-wheel vehicle, release any prior binding and bail so
+            // we never write camber/track/height to wheels that shouldn't be stanced.
+            if (!CanStance(vehicle))
+            {
+                if (wheelFitment.IsInitialized && lastFitmentVehicle != null)
+                {
+                    try { wheelFitment.RestoreSuspension(); } catch { }
+                    lastFitmentVehicle = null;
+                }
+                return;
+            }
 
             try
             {
@@ -8157,6 +9356,9 @@ namespace ExtendedLSC
                     // Only attempt initialization after the game is fully loaded
                     if (Game.GameTime > 10000)
                     {
+                        // Hand off cleanly: restore the OLD car's model-shared raise before rebinding.
+                        if (wheelFitment.IsInitialized && lastFitmentVehicle != vehicle)
+                            try { wheelFitment.RestoreSuspension(); } catch { }
                         wheelFitment.Initialize(vehicle);
                         lastFitmentVehicle = vehicle;
 
@@ -8175,6 +9377,10 @@ namespace ExtendedLSC
                                 wheelFitment.RearTrackWidth = saved.RearTrackWidth;
                                 wheelFitment.FrontHeight = saved.FrontHeight;
                                 wheelFitment.RearHeight = saved.RearHeight;
+                                wheelFitment.Rake = saved.Rake;
+                                wheelFitment.StockFake = saved.StockFake;
+                                wheelFitment.VisualSize = saved.VisualSize;
+                                wheelFitment.VisualWidth = saved.VisualWidth;
                             }
                         }
                     }
@@ -8182,7 +9388,19 @@ namespace ExtendedLSC
 
                 if (wheelFitment.IsInitialized)
                 {
+                    // While hovering the game's native Suspension (15) levels, suspend our ride-height so the
+                    // game's default preview shows. But on our own "Custom Suspension and Camber" item, DON'T
+                    // suspend — show our saved stance instead.
+                    wheelFitment.SuspendRideHeight = isPreviewingMod && previewModIndex == 15 && !_hoveringCustomSuspension;
                     wheelFitment.Update();
+                    // Auto-recovery: if the live stability monitor reverted an unstable setup, warn + persist.
+                    string instWarn = wheelFitment.ConsumeInstability();
+                    if (instWarn != null)
+                    {
+                        ShowNotification("~r~" + instWarn);
+                        SaveCurrentFitment();
+                        RebuildOpenFitmentMenu();   // snap the sliders to the reverted values
+                    }
                 }
             }
             catch (Exception ex)

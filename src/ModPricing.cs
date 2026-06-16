@@ -250,9 +250,11 @@ namespace ExtendedLSC
         /// </summary>
         public static string GetWheelTypeName(int wheelType)
         {
-            string[] types = { "Sport", "Muscle", "Lowrider", "SUV", "Offroad", "Tuner", "High End",
-                              "Benny's Original", "Benny's Bespoke", "Open Wheel", "Street", "Track" };
-            return wheelType < types.Length ? types[wheelType] : $"Type {wheelType}";
+            // Indices match the GTA/SHVDN VehicleWheelType enum exactly (6 = BikeWheels, 7 = HighEnd,
+            // 8 = Benny's Originals, 9 = Benny's Bespoke). The old table omitted BikeWheels and was off by one.
+            string[] types = { "Sport", "Muscle", "Lowrider", "SUV", "Offroad", "Tuner", "Bike Wheels", "High End",
+                              "Benny's Originals", "Benny's Bespoke", "Open Wheel", "Street", "Track" };
+            return (wheelType >= 0 && wheelType < types.Length) ? types[wheelType] : $"Type {wheelType}";
         }
     }
 }

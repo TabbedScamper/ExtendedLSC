@@ -388,7 +388,10 @@ namespace ExtendedLSC
                 new MenuItem { Name = "None", Price = 0, Value = 0 },
                 new MenuItem { Name = "Light Smoke", Price = 500, Value = 3 },
                 new MenuItem { Name = "Dark Smoke", Price = 500, Value = 2 },
-                new MenuItem { Name = "Limo", Price = 500, Value = 5 }
+                new MenuItem { Name = "Limo", Description = "Darkest tint.", Price = 500, Value = 1 }
+                // NOTE: window-tint enums 4-6 (Stock/Limo/Green) resolve to a hardcoded white fallback that
+                // looks milky on the clear-glass texture, and overlap the custom-color slot pool. Presets must
+                // stay on slots 0-3 (enum 0-3); any other color is available via the Custom Color picker.
             }, menuTitle: "TINTS");
 
             // Lights (with sub-categories)

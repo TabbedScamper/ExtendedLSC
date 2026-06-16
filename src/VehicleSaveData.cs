@@ -51,6 +51,16 @@ namespace ExtendedLSC
 
             // Custom config-based items: Key = category path (e.g. "Wheels/Tires/Tire Smoke"), Value = list of purchased item values
             public Dictionary<string, List<int>> PurchasedCustomItems { get; set; } = new Dictionary<string, List<int>>();
+
+            // Custom window-glass color (AARRGGBB int). 0 = none/not set (use a normal preset instead).
+            public int CustomWindowColor { get; set; } = 0;
+
+            // Persistent tint-array slot assigned to this car's custom color (-1 = unassigned). Persisted so a
+            // car keeps the SAME slot forever — adding/removing other cars never reshuffles it.
+            public int CustomWindowSlot { get; set; } = -1;
+
+            // Installed engine swap id (see EngineSwaps.All). null/empty = stock engine.
+            public string EngineSwapId { get; set; } = null;
         }
 
         public class FitmentData
@@ -61,6 +71,10 @@ namespace ExtendedLSC
             public float RearTrackWidth { get; set; } = 0f;
             public float FrontHeight { get; set; } = 0f;
             public float RearHeight { get; set; } = 0f;
+            public float Rake { get; set; } = 0f;         // front/rear tilt (+front-low, -rear-low)
+            public float StockFake { get; set; } = 0f;    // clean suspension-mod base for ride height (anti-drift)
+            public float VisualSize { get; set; } = 1f;   // wheel size multiplier (1 = stock)
+            public float VisualWidth { get; set; } = 1f;  // wheel width multiplier (1 = stock)
         }
 
         #endregion
@@ -137,6 +151,23 @@ namespace ExtendedLSC
             if (_saveData == null) Load();
             vehicleName = vehicleName.ToLowerInvariant();
             EnsureVehicle(vehicleName).HasTurbo = true;
+            _isDirty = true;
+        }
+
+        /// <summary>Get this vehicle's installed engine swap id (null = stock).</summary>
+        public static string GetEngineSwapId(string vehicleName)
+        {
+            if (_saveData == null) Load();
+            vehicleName = vehicleName.ToLowerInvariant();
+            return _saveData.Vehicles.TryGetValue(vehicleName, out var data) ? data.EngineSwapId : null;
+        }
+
+        /// <summary>Set this vehicle's installed engine swap id (null/empty = revert to stock).</summary>
+        public static void SetEngineSwapId(string vehicleName, string swapId)
+        {
+            if (_saveData == null) Load();
+            vehicleName = vehicleName.ToLowerInvariant();
+            EnsureVehicle(vehicleName).EngineSwapId = string.IsNullOrEmpty(swapId) ? null : swapId;
             _isDirty = true;
         }
 
@@ -368,6 +399,70 @@ namespace ExtendedLSC
                 return new List<int>();
 
             return new List<int>(purchasedValues);
+        }
+
+        /// <summary>Get the saved custom window color (AARRGGBB) for a vehicle, or 0 if none.</summary>
+        public static int GetCustomWindowColor(string vehicleName)
+        {
+            if (_saveData == null) Load();
+            vehicleName = vehicleName.ToLowerInvariant();
+            return _saveData.Vehicles.TryGetValue(vehicleName, out var data) ? data.CustomWindowColor : 0;
+        }
+
+        /// <summary>All vehicles that have a custom window color, name -> AARRGGBB. For populating slots so
+        /// multiple parked custom cars can all show their colors at once.</summary>
+        public static System.Collections.Generic.Dictionary<string, int> GetAllCustomWindowColors()
+        {
+            if (_saveData == null) Load();
+            var result = new System.Collections.Generic.Dictionary<string, int>();
+            foreach (var kvp in _saveData.Vehicles)
+                if (kvp.Value.CustomWindowColor != 0) result[kvp.Key] = kvp.Value.CustomWindowColor;
+            return result;
+        }
+
+        /// <summary>Set (or clear with 0) the saved custom window color for a vehicle.</summary>
+        public static void SetCustomWindowColor(string vehicleName, int argb)
+        {
+            if (_saveData == null) Load();
+            vehicleName = vehicleName.ToLowerInvariant();
+            var data = EnsureVehicle(vehicleName);
+            if (data.CustomWindowColor != argb)
+            {
+                data.CustomWindowColor = argb;
+                _isDirty = true;
+            }
+        }
+
+        /// <summary>Get this car's persisted tint slot, or -1 if it hasn't been assigned one.</summary>
+        public static int GetCustomWindowSlot(string vehicleName)
+        {
+            if (_saveData == null) Load();
+            vehicleName = vehicleName.ToLowerInvariant();
+            return _saveData.Vehicles.TryGetValue(vehicleName, out var data) ? data.CustomWindowSlot : -1;
+        }
+
+        /// <summary>Persist this car's tint slot (-1 to release it).</summary>
+        public static void SetCustomWindowSlot(string vehicleName, int slot)
+        {
+            if (_saveData == null) Load();
+            vehicleName = vehicleName.ToLowerInvariant();
+            var data = EnsureVehicle(vehicleName);
+            if (data.CustomWindowSlot != slot)
+            {
+                data.CustomWindowSlot = slot;
+                _isDirty = true;
+            }
+        }
+
+        /// <summary>Slots currently in use (car name -> slot), counting only cars that still have a color.</summary>
+        public static System.Collections.Generic.Dictionary<string, int> GetAllCustomWindowSlots()
+        {
+            if (_saveData == null) Load();
+            var result = new System.Collections.Generic.Dictionary<string, int>();
+            foreach (var kvp in _saveData.Vehicles)
+                if (kvp.Value.CustomWindowColor != 0 && kvp.Value.CustomWindowSlot >= 0)
+                    result[kvp.Key] = kvp.Value.CustomWindowSlot;
+            return result;
         }
 
         /// <summary>

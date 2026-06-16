@@ -28,6 +28,13 @@ namespace ExtendedLSC.WheelFitment
         private const int OFF_WHEEL_COUNT = 0xC38;
         private const int OFF_DRAWHANDLER = 0x48;
         private const int OFF_STREAMGFX   = 0x370;
+        private const int OFF_HANDLING    = 0x960;   // CVehicle -> CHandlingData* (b3788)
+        private const int OFF_SUSP_RAISE  = 0xD0;    // CHandlingData.fSuspensionRaise (visual body lift)
+        // CVehicle "fake suspension lowering amount" (b3788) — the RENDER-ONLY visual ride height the game's
+        // suspension mod drives (GET_FAKE_SUSPENSION_LOWERING_AMOUNT reads it). Two adjacent copies; write
+        // both. Per-vehicle (NOT model-shared), no physics/collision effect. +ve lowers, -ve raises.
+        private const int OFF_FAKE_LOWER1 = 0x1A1C;
+        private const int OFF_FAKE_LOWER2 = 0x1A20;
         // ---- CWheel field offsets ----
         public const int OFF_CAMBER     = 0x008;   // raw camber
         public const int OFF_CAMBER_INV = 0x010;   // inverse Y-rotation (VStancer convention)
@@ -66,19 +73,50 @@ namespace ExtendedLSC.WheelFitment
         private const int READABLE = 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80; // RO/RW/WC/ER/ERW/EWC
         private const int WRITABLE = 0x04 | 0x08 | 0x40 | 0x80;              // RW/WC/ERW/EWC
 
+        private static readonly UIntPtr _mbiLen = (UIntPtr)Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION));
+
+        // Validated-region RING cache. VirtualQuery is a kernel syscall measured at ~0.5ms EACH in GTA's huge
+        // address space — calling it for every field access (~85/frame) ate the whole frame. The vehicle/wheel
+        // structs live in a handful of committed regions, so we validate each region ONCE and reuse it. This is
+        // a RING (evict-oldest when full) rather than a per-frame clear: a full clear would re-validate every
+        // region on the next frame, creating a periodic spike WORSE than a constant cost. The ring stays warm
+        // with zero spikes. Crash-safe: we only ever validate addresses of CURRENTLY-EXISTING entities (whose
+        // regions are committed) — a transient/bad pointer is a NEW address that misses the ring and is still
+        // VirtualQuery-checked; a despawned car's stale entry is simply never queried (no stale handles) and
+        // gets overwritten by the ring in time.
+        private const int CACHE_N = 64;
+        private static readonly long[] _cBase = new long[CACHE_N];
+        private static readonly long[] _cEnd = new long[CACHE_N];
+        private static readonly int[]  _cProt = new int[CACHE_N];
+        private static int _cCount = 0;   // populated entries (0..CACHE_N)
+        private static int _cWrite = 0;   // next ring slot to overwrite
+
+        /// <summary>No-op now (the ring self-evicts) — kept so callers don't change. Safe to remove the call.</summary>
+        public static void BeginFrame() { }
+
         private static bool IsValid(long addr, int size, int prot)
         {
             if (addr <= 0x10000 || addr >= 0x7FFFFFFF0000) return false;
+            long endAddr = addr + size;
+
+            // Fast path: a previously-validated region fully contains this span with matching protection.
+            for (int i = 0; i < _cCount; i++)
+                if (addr >= _cBase[i] && endAddr <= _cEnd[i] && (_cProt[i] & prot) != 0) return true;
+
             try
             {
                 MEMORY_BASIC_INFORMATION mbi;
-                UIntPtr len = (UIntPtr)Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION));
-                if (VirtualQuery((IntPtr)addr, out mbi, len) == UIntPtr.Zero) return false;
+                if (VirtualQuery((IntPtr)addr, out mbi, _mbiLen) == UIntPtr.Zero) return false;
                 if (mbi.State != MEM_COMMIT) return false;
                 if ((mbi.Protect & PAGE_GUARD) != 0) return false;
+                long rbase = (long)mbi.BaseAddress, rend = rbase + (long)mbi.RegionSize;
+                // Cache this committed, non-guard region into the ring (with its real protection).
+                int slot = _cWrite % CACHE_N;
+                _cBase[slot] = rbase; _cEnd[slot] = rend; _cProt[slot] = mbi.Protect;
+                _cWrite++;
+                if (_cCount < CACHE_N) _cCount++;
                 if ((mbi.Protect & prot) == 0) return false;
-                long end = (long)mbi.BaseAddress + (long)mbi.RegionSize;
-                return (addr + size) <= end;            // whole span stays inside the region
+                return endAddr <= rend;                 // whole span stays inside the region
             }
             catch { return false; }
         }
@@ -113,6 +151,60 @@ namespace ExtendedLSC.WheelFitment
             long arr = ReadPtr(vehAddr + OFF_WHEELS_PTR);
             if (arr == 0) return 0;
             return ReadPtr(arr + index * 8L);
+        }
+
+        // ====================================================================
+        // Handling (shared per model) — fSuspensionRaise = stable visual body lift
+        // ====================================================================
+        private static long HandlingPtr(Vehicle v)
+        {
+            long a = Addr(v); if (a == 0) return 0;
+            return ReadPtr(a + OFF_HANDLING);
+        }
+        public static bool HasHandling(Vehicle v) => HandlingPtr(v) != 0;
+
+        // CHandlingData float offsets (ikt HandlingInfo.h, b3788) used by the LSC stat bars + live tuning.
+        public const int HOFF_DRIVE_FORCE = 0x60;    // fInitialDriveForce   -> Acceleration
+        public const int HOFF_MAX_FLAT_VEL = 0x64;   // fInitialDriveMaxFlatVel -> Top Speed
+        public const int HOFF_BRAKE_FORCE = 0x6C;    // fBrakeForce          -> Braking
+        public const int HOFF_TRACTION_MAX = 0x88;   // fTractionCurveMax    -> Traction
+        /// <summary>Read a CHandlingData float (model-shared). Returns 0 if the handling ptr is unavailable.</summary>
+        public static float GetHandlingFloat(Vehicle v, int offset)
+        {
+            long h = HandlingPtr(v);
+            return h == 0 ? 0f : ReadF32(h + offset);
+        }
+        /// <summary>Write a CHandlingData float (model-shared) — used by live tuning.</summary>
+        public static bool SetHandlingFloat(Vehicle v, int offset, float val)
+        {
+            long h = HandlingPtr(v);
+            return h != 0 && WriteF32(h + offset, val);
+        }
+
+        public static float GetSuspensionRaise(Vehicle v)
+        {
+            long h = HandlingPtr(v);
+            return h == 0 ? 0f : ReadF32(h + OFF_SUSP_RAISE);
+        }
+        public static bool SetSuspensionRaise(Vehicle v, float val)
+        {
+            long h = HandlingPtr(v);
+            return h != 0 && WriteF32(h + OFF_SUSP_RAISE, val);
+        }
+
+        /// <summary>Render-only visual ride height (the game's "fake suspension lowering"). +ve lowers the
+        /// body, -ve raises it; no physics/collision change. Per-vehicle. Writes both mirror copies.</summary>
+        public static float GetFakeLowering(Vehicle v)
+        {
+            long a = Addr(v);
+            return a == 0 ? 0f : ReadF32(a + OFF_FAKE_LOWER1);
+        }
+        public static bool SetFakeLowering(Vehicle v, float val)
+        {
+            long a = Addr(v); if (a == 0) return false;
+            bool ok = WriteF32(a + OFF_FAKE_LOWER1, val);
+            WriteF32(a + OFF_FAKE_LOWER2, val);
+            return ok;
         }
 
         // ====================================================================

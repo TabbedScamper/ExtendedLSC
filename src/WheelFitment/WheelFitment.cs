@@ -1,183 +1,186 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using GTA;
 using GTA.Math;
 using GTA.Native;
+using Newtonsoft.Json;
 
 namespace ExtendedLSC.WheelFitment
 {
     /// <summary>
-    /// Wheel fitment adjustment system - track width, camber, and basic adjustments.
+    /// Wheel fitment — RAW sliders. Each slider value is written straight to wheel memory every frame:
+    /// camber, track width, ride height (wheel-Z), and (custom rims only) visual size/width. No easing,
+    /// no clamps, no budgets, no collider coupling, no auto-lift — the sliders are the only authority.
     ///
-    /// Uses WheelFitmentAPI.asi (native C++) for safe memory access.
-    /// Falls back to limited functionality if ASI is not installed.
+    /// The only "smart" part left is capturing the NATURAL per-wheel reference (stock X/Z origin + base
+    /// visual size/width) so the offsets/multipliers are measured from the right baseline across rim swaps.
+    /// Everything that used to auto-adjust (collider scaling, float-seating, lift budgets, size caps,
+    /// re-assert gates, oscillation telemetry, suspension-raise) was removed for a clean slate.
     /// </summary>
     public class WheelFitment
     {
         public static Action<string> Log { get; set; }
 
-        // Cached vehicle reference
         private Vehicle _vehicle;
         private bool _nativeApiAvailable = false;
         private bool _initialized = false;
 
-        // Original wheel positions for reset (cached by native API)
+        // Natural per-wheel offsets for the current wheel: X = track origin, Z = height origin.
         private Dictionary<int, Vector3> _originalWheelOffsets = new Dictionary<int, Vector3>();
 
-        // Current fitment values (relative adjustments)
+        // RAW slider values (relative adjustments).
         private float _frontCamber = 0f;
         private float _rearCamber = 0f;
         private float _frontTrackWidth = 0f;
         private float _rearTrackWidth = 0f;
         private float _frontHeight = 0f;
         private float _rearHeight = 0f;
+        private float _rake = 0f;                 // front/rear tilt (per-axle wheel-Z); +front-low, -rear-low
+        private bool _rakeActive = false;         // was rake pinned last frame (for one-time stock-Z release)
+        private bool _camberActive = false;       // was camber written last frame (one-time stock release)
+        private bool _trackActive = false;        // was track/poke written last frame (one-time stock release)
 
-        // Visual wheel size/width (multipliers, 1.0 = stock) via WheelMemory/StreamRenderGfx.
-        // No ASI required for these — pure Marshal memory access.
-        private float _visualSize = 1f;   // multiplier (1.0 = no change from the wheel's stock look)
-        private float _visualWidth = 1f;  // multiplier
-        private float _baseVisualSize = 1f;   // wheel's stock render size (aftermarket wheels are ~0.79)
-        private float _baseVisualWidth = 1f;
+        // Visual wheel size/width (multipliers, 1.0 = stock) via WheelMemory/StreamRenderGfx — custom rims only.
+        private float _visualSize = 1f;
+        private float _visualWidth = 1f;
+        private float _baseVisualSize = 1f;    // wheel's natural render size
+        private float _baseVisualWidth = 1f;   // wheel's natural render width
         private bool _hasVisualWheels = false;
-        // Cached stock collision radii/width so visual size scales the contact to match the look.
-        private float _stockTyreRadius = 0.393f;
-        private float _stockRimRadius = 0.313f;
-        private float _stockTyreWidth = 0.298f;
-        private bool _stockColliderCached = false;
 
-        // Collider scaling is GENUINE-just-in-time: we never touch the colliders at multiplier 1.0 (which
-        // would stamp a possibly-stale cached value and make stock wheels sink). The genuine collider is
-        // read from live memory the instant scaling begins, scaled while active, and restored on return
-        // to 1.0. CWheel colliders don't reset on a wheel swap, so a cached "stock" value can't be trusted.
-        private bool _colliderScaled = false;
-        private float _genuineTyreR, _genuineRimR, _genuineTyreW;
+        // Ride height rides on the game's FAKE (render-only) suspension lowering — CVehicle+0x1A1C/0x1A20,
+        // the value GET_FAKE_SUSPENSION_LOWERING_AMOUNT reads and the suspension mod drives. It's a pure
+        // VISUAL offset: the body drops/raises with NO physics, NO collision change, NO suspension fight (so
+        // it can never buzz or pop-under), and it's PER-VEHICLE (no model-shared traffic bleed). +ve lowers,
+        // -ve raises. _stockFake = whatever the installed suspension mod set (usually 0); our slider adds to it.
+        private float _stockFake = 0f;
+        private bool _fakeApplied = false;
+        /// <summary>While true, our ride-height (fake-lowering) is NOT written — so the game's own suspension
+        /// mod preview shows through. Set by Main while previewing a native suspension level.</summary>
+        public bool SuspendRideHeight { get; set; } = false;
+        private bool _visSizeApplied = false, _visWidthApplied = false; // did we last write a non-stock visual?
+        private bool _sizeColApplied = false, _widthColApplied = false;  // did we last write a non-stock collider?
+        private float[] _baseTyreR = null, _baseRimR = null, _baseTyreW = null; // natural collider radii/width
+        // Change detector -> a small physics nudge so the body re-settles in real time while you adjust.
+        private float _lastSig = float.NaN;
+        // Geometry (camber/track/rake) is only re-asserted up to this time — refreshed while moving or just
+        // after a change. Parked + idle past it = no per-frame geometry writes (the values hold).
+        private int _reassertUntil = 0;
+        // --- Live stability monitor: every frame, look at the recent ~0.4s of body Z + the SOLVER's wheel Z
+        // and flag OSCILLATION (many direction reversals + real amplitude). Reversals are what separate a
+        // freak-out (wheel buzzing back-and-forth) from a fast slider move (wheel travelling one way), so it
+        // can judge THROUGH adjustment instead of only after you stop. ---
+        private readonly float[] _recB = new float[24];        // recent ~0.4s of body Z
+        private readonly float[] _recS = new float[24];        // recent ~0.4s of suspension travel (bone-Z minus body-Z)
+        private int _wheelBoneIdx = -2;                        // -2 = uncached; cached wheel_lf bone index
+        private int _recN = 0;
+        private int _lastChangeAt = 0;                         // last slider-change time (don't snapshot mid-move)
+        private float _oscMs = 0f;                             // accumulated time the wheel/body has been oscillating
+        private bool _hasSafe = false;
+        private float[] _safe = null;                          // last KNOWN-STABLE [fc,rc,ft,rt,fh,rh,vs,vw]
+        public bool InstabilityTripped { get; private set; }
+        public string InstabilityMsg { get; private set; }
 
-        // NATURAL-BASELINE cache, keyed by  model:wheelType:frontWheelModIndex.
-        // Each wheel mod (and each wheel type) has its OWN natural visual size and collider radii, so a
-        // single per-vehicle baseline is wrong the moment the player swaps rims — or enters a car that
-        // already has custom rims. We instead capture the baseline the FIRST time we ever see a given
-        // (model + wheel type + wheel-mod index) in its natural state (right after entry, or right after
-        // the game installs that rim — before we've scaled anything). After that we reuse the record, so
-        // we can never re-capture a value we already enlarged (which made Reset blow up / sizes compound).
+        // NATURAL-BASELINE cache, keyed by model:wheelType:frontWheelModIndex. Each wheel has its own
+        // natural visual size + offsets, so we capture the FIRST time we ever see a given wheel in its
+        // natural state (before we've touched anything) and reuse it — so we never re-capture a value we
+        // already modified.
         private struct StockWheel
         {
             public bool HasVisual;
             public float BaseSize, BaseWidth;
-            public bool ColliderCached;
-            public float TyreRadius, RimRadius, TyreWidth;
             public float[] WheelX;   // natural lateral offset per wheel (track-width origin)
             public float[] WheelZ;   // natural vertical offset per wheel (height origin)
+            public float[] TyreR;    // natural tyre collider radius per wheel (physics ride height)
+            public float[] RimR;     // natural rim collider radius per wheel
+            public float[] TyreW;    // natural tyre collider width per wheel
         }
         private static readonly Dictionary<string, StockWheel> _stockByKey = new Dictionary<string, StockWheel>();
         private string _currentBaselineKey = null;
 
-        // Limits
-        public const float MAX_CAMBER = 0.5f;        // ~28 degrees
-        public const float MIN_CAMBER = -0.5f;
-        public const float MAX_TRACK_WIDTH = 0.3f;   // 0.3 meters wider
-        public const float MIN_TRACK_WIDTH = -0.1f;  // 0.1 meters narrower
-        public const float MAX_HEIGHT = 0.15f;       // 0.15 meters higher
-        public const float MIN_HEIGHT = -0.15f;      // 0.15 meters lower
-        public const float MAX_VISUAL = 1.8f;        // 1.8x wheel size/width
-        public const float MIN_VISUAL = 0.5f;        // 0.5x wheel size/width
+        // Persist the captured NATURAL baselines to disk so a SCRIPT RELOAD (which wipes these statics while the
+        // live wheel memory still holds the applied stance) reuses the clean baseline instead of re-capturing
+        // from already-stanced memory and compounding the offset each reload. Keyed by model:wheelType:wheelMod,
+        // which is stock geometry — valid across reloads AND game restarts.
+        private static bool _baselinesLoaded = false;
+        private static string BaselinePath => Path.Combine(
+            AppDomain.CurrentDomain.BaseDirectory, "ExtendedLSC", "wheel_baselines.json");
+        private static void LoadBaselines()
+        {
+            if (_baselinesLoaded) return;
+            _baselinesLoaded = true;
+            try
+            {
+                if (!File.Exists(BaselinePath)) return;
+                var d = JsonConvert.DeserializeObject<Dictionary<string, StockWheel>>(File.ReadAllText(BaselinePath));
+                if (d != null) foreach (var kv in d) if (!_stockByKey.ContainsKey(kv.Key)) _stockByKey[kv.Key] = kv.Value;
+            }
+            catch { }
+        }
+        private static void SaveBaselines()
+        {
+            try
+            {
+                string dir = Path.GetDirectoryName(BaselinePath);
+                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                File.WriteAllText(BaselinePath, JsonConvert.SerializeObject(_stockByKey));
+            }
+            catch { }
+        }
 
-        // ---- Smooth application (easing) ----
-        // The public properties above are TARGETS. Each frame the applied ("current") values below ease
-        // toward them exponentially (~0.4s settle), so changes glide like hydraulics instead of snapping —
-        // and big collider deltas never shock the physics solver (the cause of the parked-car jumping).
-        private float _curFC, _curRC, _curFT, _curRT, _curFH, _curRH;
-        private float _curVS = 1f, _curVW = 1f;
-        private float _lastAppliedVS = 1f, _lastAppliedVW = 1f;
-        private float _curAutoLift = 0f;
-        private bool _wasActive = false;
-        private const float EASE_RATE = 8f;          // 1/s exponential ease (≈0.4s to settle)
+        // PER-VEHICLE stable origin. The suspension mount X/Z is a property of the VEHICLE, not the rim, so
+        // it is captured ONCE per vehicle and reused for every rim — re-reading it from (mid-settle) memory
+        // on each swap made the captured origin drift. Reset on Initialize (new vehicle).
+        private float[] _vehicleNatX = null;
+        private float[] _vehicleNatZ = null;
 
-        // Auto-adapt: wheels bigger than the arch can clear automatically lift the body (donk rule —
-        // "a wheel that big needs a lift"). NOTE: this is purely AESTHETIC — probing proved GTA wheel
-        // wells are holes in the chassis collision (rays from inside the well hit nothing), so an
-        // oversized wheel never physically catches the arch; without lift it just looks swallowed.
-        // Tuck/poke looks therefore stay completely free.
-        private const float ARCH_CLEARANCE = 0.03f;  // free visual arch space before lift kicks in
-
-        // HEIGHT GOES THROUGH THE SUSPENSION, NOT WHEEL-Z. Telemetry proved that pinning wheel-Z at a
-        // static offset puts the spring permanently outside its tuned band — at big offsets the body
-        // enters a sustained limit-cycle (6-11cm bounce measured at 1.65x + 5.5cm Z pin). The game's own
-        // channel for ride height is fSuspensionRaise (CHandlingData) — the solver re-computes its
-        // equilibrium around it, so any lift is stable on any vehicle. Wheel-Z is now used ONLY for a
-        // small front/rear rake differential, which stays well inside the travel band.
-        private const float MAX_RAKE = 0.06f;        // max per-axle wheel-Z differential (front vs rear)
-
-        // Per-MODEL stock suspension values (raise), persisted to disk so a mid-session script reload
-        // can never re-capture an already-modified raise as "stock" (handling edits survive reloads).
-        private float _stockRaise = 0f;
-        private float _travelRange = 0f;             // fSuspensionUpperLimit - fSuspensionLowerLimit
-        private float _capMult = MAX_VISUAL;         // per-vehicle max size mult (travel-budget limited)
-        private bool _raiseCaptured = false;
-        private float _appliedRaiseDelta = 0f;       // last delta actually written (NaN-free tracking)
-        private static Dictionary<int, float> _stockRaiseByModel = null;
-        private static string _stockHandlingPath = null;
+        // Slider ranges — the UI in Main.cs builds the sliders from these. NOTHING here clamps to them.
+        // Deliberately WIDE (no hard stance limits) — these are the only bound and the raw system applies
+        // whatever you dial in. Big values may bounce/clip; that's expected with limits removed.
+        public const float MAX_CAMBER = 1.0f;        // ~57 degrees
+        public const float MIN_CAMBER = -1.0f;
+        // Poke (track width) is VISUAL ONLY (CWheel+0x030 moves the render wheel, NOT the physics contact —
+        // verified). Clamped so wheels can't tuck way under the car or stick way outside the body.
+        public const float MAX_TRACK_WIDTH = 0.15f;  // 15 cm poke (outward)
+        public const float MIN_TRACK_WIDTH = -0.15f; // 15 cm tuck (inward)
+        public const float MAX_HEIGHT = 0.5f;        // 0.5 meters higher
+        public const float MIN_HEIGHT = -0.5f;       // 0.5 meters lower
+        // Ride-height clamp in FAKE-LOWERING units (+ve = slam/lower, -ve = lift/raise). The visible range is
+        // roughly ±0.30 (a dramatic pump); ±0.25 is a strong stance both ways. Render-only, so this is purely
+        // an aesthetic cap, not a stability limit.
+        public const float MAX_RAISE = 0.25f;        // max slam (body down)
+        public const float MIN_RAISE = -0.25f;       // max lift (body up)
+        // Rake (front/rear tilt) via per-axle visual wheel-Z. +ve = front lower, -ve = rear lower. Small range
+        // — this touches the suspension solver (unlike the render-only fields), so kept tight + monitor-backed.
+        public const float MAX_RAKE = 0.10f;         // 10 cm front-low tilt
+        public const float MIN_RAKE = -0.10f;        // 10 cm rear-low tilt
+        public const float MAX_VISUAL = 3.0f;        // 3.0x wheel size/width
+        public const float MIN_VISUAL = 0.3f;        // 0.3x wheel size/width
 
         #region Properties
 
-        // All setters store TARGETS only — Update() eases the applied values toward them each frame.
+        // RAW slider values — written straight to memory each frame (no easing, no clamps, no auto-adjust).
+        // The slider UI in Main.cs defines the usable range; nothing here second-guesses it.
 
-        public float FrontCamber
-        {
-            get => _frontCamber;
-            set => _frontCamber = Clamp(value, MIN_CAMBER, MAX_CAMBER);
-        }
-
-        public float RearCamber
-        {
-            get => _rearCamber;
-            set => _rearCamber = Clamp(value, MIN_CAMBER, MAX_CAMBER);
-        }
-
-        public float FrontTrackWidth
-        {
-            get => _frontTrackWidth;
-            set => _frontTrackWidth = Clamp(value, MIN_TRACK_WIDTH, MAX_TRACK_WIDTH);
-        }
-
-        public float RearTrackWidth
-        {
-            get => _rearTrackWidth;
-            set => _rearTrackWidth = Clamp(value, MIN_TRACK_WIDTH, MAX_TRACK_WIDTH);
-        }
-
-        public float FrontHeight
-        {
-            get => _frontHeight;
-            set => _frontHeight = Clamp(value, MIN_HEIGHT, MAX_HEIGHT);
-        }
-
-        public float RearHeight
-        {
-            get => _rearHeight;
-            set => _rearHeight = Clamp(value, MIN_HEIGHT, MAX_HEIGHT);
-        }
-
-        /// <summary>Visual wheel size multiplier (1.0 = stock). Also scales the collision radius to match,
-        /// and auto-lifts the body when the wheel outgrows the arch clearance (donk rule).</summary>
-        public float VisualSize
-        {
-            get => _visualSize;
-            set => _visualSize = Clamp(value, MIN_VISUAL, MAX_VISUAL);
-        }
-
-        /// <summary>Visual wheel width multiplier (1.0 = stock). Also scales the collision width to match.</summary>
-        public float VisualWidth
-        {
-            get => _visualWidth;
-            set => _visualWidth = Clamp(value, MIN_VISUAL, MAX_VISUAL);
-        }
+        public float FrontCamber     { get => _frontCamber;     set => _frontCamber = value; }
+        public float RearCamber      { get => _rearCamber;      set => _rearCamber = value; }
+        public float FrontTrackWidth { get => _frontTrackWidth; set => _frontTrackWidth = value; }
+        public float RearTrackWidth  { get => _rearTrackWidth;  set => _rearTrackWidth = value; }
+        public float FrontHeight     { get => _frontHeight;     set => _frontHeight = value; }
+        public float RearHeight      { get => _rearHeight;      set => _rearHeight = value; }
+        public float Rake            { get => _rake;            set => _rake = value; }
+        public float VisualSize      { get => _visualSize;      set => _visualSize = value; }
+        public float VisualWidth     { get => _visualWidth;     set => _visualWidth = value; }
+        /// <summary>The clean suspension-mod base our ride-height offsets from. Saved with the stance and
+        /// restored on entry so we never re-read it from a field that's still holding our slam.</summary>
+        public float StockFake       { get => _stockFake;       set => _stockFake = value; }
 
         /// <summary>The wheel's natural overall diameter in meters (for display: inches = this/0.0254).</summary>
         public float BaseVisualDiameter => _baseVisualSize;
+        public float BaseVisualWidth => _baseVisualWidth;
 
-        /// <summary>This vehicle's max wheel-size multiplier — the suspension-travel stability budget.
-        /// Visual AND collider are both capped here (beyond it the tyre would sink or the body bounce).</summary>
-        public float MaxSizeMult => Math.Max(1f, Math.Min(MAX_VISUAL, _capMult));
+        /// <summary>No auto size cap (raw sliders). Kept for the slider builder; returns the slider max.</summary>
+        public float MaxSizeMult => MAX_VISUAL;
 
         /// <summary>True if the current vehicle has aftermarket wheels (visual size/width available).</summary>
         public bool HasVisualWheels => _hasVisualWheels;
@@ -187,18 +190,13 @@ namespace ExtendedLSC.WheelFitment
 
         public bool IsInitialized => _vehicle != null && _vehicle.Exists() && _initialized;
 
-        /// <summary>
-        /// Check if full wheel fitment is available (native API loaded)
-        /// </summary>
         public bool IsFullFitmentAvailable => _nativeApiAvailable;
 
         #endregion
 
         #region Initialization
 
-        /// <summary>
-        /// Initialize fitment system for a vehicle
-        /// </summary>
+        /// <summary>Bind to a vehicle and capture its natural wheel baseline. Resets all sliders to stock.</summary>
         public bool Initialize(Vehicle vehicle)
         {
             if (vehicle == null || !vehicle.Exists())
@@ -207,62 +205,55 @@ namespace ExtendedLSC.WheelFitment
                 return false;
             }
 
-            // Switching cars: put the OLD car's (shared, per-model) suspension raise back to stock first.
-            if (_vehicle != null && _vehicle != vehicle && _vehicle.Exists())
-            {
-                try { RestoreSuspension(); } catch { }
-            }
-
             _vehicle = vehicle;
             _initialized = false;
-            _camberCached = false;
 
-            // Initialize native API (only once)
             WheelFitmentNative.Log = Log;
             _nativeApiAvailable = WheelFitmentNative.IsAvailable;
 
-            // All fitment (camber/track/height/size/width) now runs through WheelMemory (Marshal) using
-            // the live-verified build-3788 offsets — no ASI required. The flaky WheelFitmentAPI.asi
-            // brute-force offset probe was locking onto the wrong wheel offset and crashing on write.
-            // (The natural X/Z track/height origin is captured inside RefreshBaseline, keyed per wheel,
-            //  so it can never be read back from already-modified memory.)
-
-            // Reset fitment values
+            // Sliders start at stock.
             _frontCamber = 0f;
             _rearCamber = 0f;
             _frontTrackWidth = 0f;
             _rearTrackWidth = 0f;
             _frontHeight = 0f;
             _rearHeight = 0f;
-
-            // Fresh vehicle -> multipliers start at "no change", then resolve the natural baseline for
-            // whatever wheel is currently installed (records it the first time we see this
-            // model+wheelType+wheel-mod; handles cars that already have custom rims on entry).
+            _rake = 0f;
+            _rakeActive = false;
+            _camberActive = false;
+            _trackActive = false;
             _visualSize = 1f;
             _visualWidth = 1f;
-            // Eased values snap to stock on (re)init — a saved stance loaded right after will then
-            // glide in smoothly from stock.
-            _curFC = _curRC = _curFT = _curRT = _curFH = _curRH = 0f;
-            _curVS = _curVW = 1f;
-            _lastAppliedVS = _lastAppliedVW = 1f;
-            _curAutoLift = 0f;
-            _wasActive = false;
+
             _currentBaselineKey = null;
+            _vehicleNatX = null;   // new vehicle: re-capture the stable origin once
+            _vehicleNatZ = null;
+            _wheelBoneIdx = -2;    // re-resolve the wheel bone for the new vehicle
+            _hasSafe = false; _recN = 0; _oscMs = 0f;
+            _lastSig = float.NaN;
+            _reassertUntil = Game.GameTime + 2500;   // re-assert geometry for ~2.5s so a loaded stance applies
+            _visSizeApplied = false; _visWidthApplied = false;
+            _sizeColApplied = false; _widthColApplied = false;
+
             try { _vehicle.Mods.InstallModKit(); } catch { }
-            CaptureStockRaise();
+
+            // Provisional baseline from the current field. This is correct on a FIRST visit (field = the
+            // suspension-mod base). On RE-entry the field is still holding our previous slam (set-and-forget),
+            // so this read is polluted — but the caller immediately overrides _stockFake with the CLEAN value
+            // saved alongside the stance (see StockFake / the load paths), so we never re-stamp the suspension
+            // (which caused an on-entry shake) and the held field never has to change.
+            _stockFake = WheelMemory.GetFakeLowering(vehicle);
+            if (_stockFake < -1f || _stockFake > 1f) _stockFake = 0f;
+            _fakeApplied = false;
             RefreshBaseline();
-            _lastFitmentSig = FitmentSig();   // baseline the settle-detector so entry alone doesn't nudge
-            _settleAtTime = 0;
 
             _initialized = true;
             Log?.Invoke($"[WheelFitment] Initialized for {vehicle.DisplayName}");
             return true;
         }
 
-        /// <summary>
-        /// Identity of the currently-installed wheel: model + wheel type + front wheel-mod index.
-        /// Two different rims (or wheel types) have different natural sizes, so this is the cache key.
-        /// </summary>
+        /// <summary>Identity of the currently-installed wheel: model + wheel type + front wheel-mod index.
+        /// Two different rims (or wheel types) have different natural sizes, so this is the cache key.</summary>
         private string ResolveWheelKey()
         {
             try
@@ -275,73 +266,67 @@ namespace ExtendedLSC.WheelFitment
             catch { return null; }
         }
 
+        #endregion
+
+        #region Baseline + raw application
+
         /// <summary>
-        /// Resolve the natural baseline (visual size/width + collider radii) for the wheel currently
+        /// Resolve the natural baseline (visual size/width + per-wheel X/Z origin) for the wheel currently
         /// installed. Capture it the first time we ever see this model+wheelType+wheel-mod in its natural
-        /// state; reuse the record otherwise. Re-applies the current size/width multiplier so the slider
-        /// value carries over when the player swaps rims. Called on init and (cheaply) every tick — it
-        /// only does work when the wheel identity actually changes.
+        /// state; reuse the record otherwise. Called on init and (cheaply) every tick — it only does work
+        /// when the wheel identity actually changes, then re-stamps the raw slider values so they survive a
+        /// rim swap.
         /// </summary>
         private void RefreshBaseline()
         {
             if (_vehicle == null || !_vehicle.Exists()) return;
+            LoadBaselines();   // pull any disk-persisted clean baselines first (cheap, runs once per session)
             string key = ResolveWheelKey();
             if (key == null || key == _currentBaselineKey) return;   // unchanged -> nothing to do
             _currentBaselineKey = key;
-            _colliderScaled = false;   // new wheel: re-capture its own genuine collider before any scaling
 
             try
             {
                 float[] xs, zs;
                 if (_stockByKey.TryGetValue(key, out StockWheel cached))
                 {
-                    _hasVisualWheels     = cached.HasVisual;
-                    _stockColliderCached = cached.ColliderCached;
-                    _stockTyreRadius     = cached.TyreRadius;
-                    _stockRimRadius      = cached.RimRadius;
-                    _stockTyreWidth      = cached.TyreWidth;
-                    _baseVisualSize      = cached.BaseSize;
-                    _baseVisualWidth     = cached.BaseWidth;
+                    _hasVisualWheels = cached.HasVisual;
+                    _baseVisualSize = cached.BaseSize;
+                    _baseVisualWidth = cached.BaseWidth;
                     xs = cached.WheelX;
                     zs = cached.WheelZ;
-                    Log?.Invoke($"[WheelFitment] Baseline (cached) {key}: base={_baseVisualSize:F3} tyreR={_stockTyreRadius:F3}");
+                    _baseTyreR = cached.TyreR;
+                    _baseRimR = cached.RimR;
+                    _baseTyreW = cached.TyreW;
+                    Log?.Invoke($"[WheelFitment] Baseline (cached) {key}: base={_baseVisualSize:F3} hasVisual={_hasVisualWheels}");
                 }
                 else
                 {
                     // First sight of this rim -> memory currently holds its NATURAL values (we have not
-                    // scaled this structure yet), so it is safe to record them as the baseline.
-                    //
-                    // CRITICAL: the StreamRenderGfx struct EXISTS even on stock wheels, but the renderer
-                    // only USES its size field for aftermarket rims. On stock wheels (front mod == -1) a
-                    // size multiplier would shrink the COLLIDER with no visual change -> tyres sink into
-                    // the ground. So visual size/width is only offered with custom rims installed.
+                    // scaled this structure yet), so it is safe to record them as the baseline. Visual
+                    // size/width is only meaningful for aftermarket rims (front mod != -1).
                     bool customRims = false;
                     try { customRims = Function.Call<int>(Hash.GET_VEHICLE_MOD, _vehicle, 23) != -1; } catch { }
                     _hasVisualWheels = customRims && WheelMemory.HasVisualWheels(_vehicle);
-                    float tr = WheelMemory.GetTyreColliderRadius(_vehicle, 0);
-                    if (tr > 0.05f && tr < 2f)
-                    {
-                        _stockTyreRadius = tr;
-                        _stockRimRadius = WheelMemory.GetRimColliderRadius(_vehicle, 0);
-                        _stockTyreWidth = WheelMemory.GetTyreColliderWidth(_vehicle, 0);
-                        _stockColliderCached = true;
-                    }
-                    else _stockColliderCached = false;
 
                     _baseVisualSize = WheelMemory.GetVisualSize(_vehicle);
                     _baseVisualWidth = WheelMemory.GetVisualWidth(_vehicle);
                     if (_baseVisualSize < 0.1f || _baseVisualSize > 5f) _baseVisualSize = 1f;
                     if (_baseVisualWidth < 0.1f || _baseVisualWidth > 5f) _baseVisualWidth = 1f;
 
-                    // Natural X (track origin) and Z (height origin) per wheel — captured ONCE here so the
-                    // origin can never be a value we already moved (which corrupted track/height/reset).
                     int n = WheelMemory.GetWheelCount(_vehicle);
                     xs = new float[n];
                     zs = new float[n];
+                    _baseTyreR = new float[n];
+                    _baseRimR = new float[n];
+                    _baseTyreW = new float[n];
                     for (int i = 0; i < n; i++)
                     {
                         xs[i] = WheelMemory.GetWheelX(_vehicle, i);
                         zs[i] = WheelMemory.GetWheelZ(_vehicle, i);
+                        _baseTyreR[i] = WheelMemory.GetTyreColliderRadius(_vehicle, i);
+                        _baseRimR[i]  = WheelMemory.GetRimColliderRadius(_vehicle, i);
+                        _baseTyreW[i] = WheelMemory.GetTyreColliderWidth(_vehicle, i);
                     }
 
                     _stockByKey[key] = new StockWheel
@@ -349,460 +334,401 @@ namespace ExtendedLSC.WheelFitment
                         HasVisual = _hasVisualWheels,
                         BaseSize = _baseVisualSize,
                         BaseWidth = _baseVisualWidth,
-                        ColliderCached = _stockColliderCached,
-                        TyreRadius = _stockTyreRadius,
-                        RimRadius = _stockRimRadius,
-                        TyreWidth = _stockTyreWidth,
                         WheelX = xs,
-                        WheelZ = zs
+                        WheelZ = zs,
+                        TyreR = _baseTyreR,
+                        RimR = _baseRimR,
+                        TyreW = _baseTyreW
                     };
-                    Log?.Invoke($"[WheelFitment] Baseline (captured) {key}: hasVisual={_hasVisualWheels} base={_baseVisualSize:F3} tyreR={_stockTyreRadius:F3}");
+                    SaveBaselines();   // persist so a reload reuses this clean capture instead of re-reading memory
+                    Log?.Invoke($"[WheelFitment] Baseline (captured) {key}: hasVisual={_hasVisualWheels} base={_baseVisualSize:F3}");
                 }
 
-                // Rebuild the track/height origin map from the cached natural offsets (never re-read from
-                // possibly-modified memory).
+                // PER-VEHICLE STABLE ORIGIN: reuse the origin captured the first time we baselined THIS
+                // vehicle, instead of the just-read live values, so a rim swap can't drift the origin.
+                if (_vehicleNatZ != null && _vehicleNatX != null && xs != null && zs != null
+                    && _vehicleNatZ.Length == zs.Length && _vehicleNatX.Length == xs.Length)
+                {
+                    xs = _vehicleNatX;
+                    zs = _vehicleNatZ;
+                }
+                else if (xs != null && zs != null)
+                {
+                    _vehicleNatX = (float[])xs.Clone();
+                    _vehicleNatZ = (float[])zs.Clone();
+                }
+
+                // Rebuild the track/height origin map from the cached natural offsets.
                 _originalWheelOffsets.Clear();
                 if (xs != null && zs != null)
                     for (int i = 0; i < xs.Length && i < zs.Length; i++)
                         _originalWheelOffsets[i] = new Vector3(xs[i], 0f, zs[i]);
 
-                // STABILITY BUDGET (measured live, Buffalo b3788): extra collider radius eats suspension
-                // travel; past ~(upper-lower) the body enters a sustained limit-cycle (1.50x stable,
-                // 1.65x bounced — travel 0.21m). This vehicle's max size = 85% of its travel as radius.
-                _capMult = (_travelRange > 0.01f && _baseVisualSize > 0.05f)
-                    ? 1f + (2f * _travelRange * 0.85f) / _baseVisualSize
-                    : MAX_VISUAL;
-
-                // The wheel just changed (or first init): the game built a fresh, natural structure for
-                // it, wiping any scaling we had on the previous wheel. Re-apply the current multipliers so
-                // the size/width the player dialed in sticks across the rim swap.
-                ApplyVisual();
+                // The wheel just changed (or first init): the game built a fresh, natural structure for it,
+                // wiping any scaling we had on the previous wheel. Re-stamp the raw slider values.
+                ApplyRaw();
             }
             catch (Exception ex) { Log?.Invoke($"[WheelFitment] RefreshBaseline error: {ex.Message}"); }
         }
 
-        /// <summary>Apply visual wheel size/width + scale collision so the car rides on the new size.</summary>
-        private void ApplyVisual()
-        {
-            if (!IsInitialized || !_hasVisualWheels) return;
-            try
-            {
-                // Visual size/width live in StreamRenderGfx, which the game rebuilds fresh on every wheel
-                // swap — so _baseVisual* is reliable and writing base*mult (== base at mult 1.0) is harmless.
-                // Uses the EASED values so changes glide instead of snapping.
-                // Visual and collider are capped TOGETHER at the per-vehicle travel budget: a visual
-                // bigger than the collider sinks below the contact point by exactly the difference (body
-                // height can't fix that), and a collider past the budget makes the body bounce.
-                float sizeMult = Math.Min(_curVS, MaxSizeMult);
-                WheelMemory.SetVisualSize(_vehicle, _baseVisualSize * sizeMult);
-                WheelMemory.SetVisualWidth(_vehicle, _baseVisualWidth * _curVW);
-
-                bool scaling = Math.Abs(sizeMult - 1f) > 0.001f || Math.Abs(_curVW - 1f) > 0.001f;
-                if (scaling)
-                {
-                    if (!_colliderScaled)
-                    {
-                        // First scale on this wheel: capture the GENUINE collider from live memory NOW
-                        // (still untouched by us) so we scale the real value, never a stale cached one.
-                        float tr = WheelMemory.GetTyreColliderRadius(_vehicle, 0);
-                        if (tr > 0.05f && tr < 2f)
-                        {
-                            _genuineTyreR = tr;
-                            _genuineRimR = WheelMemory.GetRimColliderRadius(_vehicle, 0);
-                            _genuineTyreW = WheelMemory.GetTyreColliderWidth(_vehicle, 0);
-                            _colliderScaled = true;
-                        }
-                    }
-                    if (_colliderScaled)
-                    {
-                        // Collider scales with the SAME capped multiplier as the visual (sizeMult above),
-                        // so contact point and rendered tyre always agree — no sink, no bounce.
-                        WheelMemory.SetAllColliderRadius(_vehicle, _genuineTyreR * sizeMult, _genuineRimR * sizeMult);
-                        WheelMemory.SetAllColliderWidth(_vehicle, _genuineTyreW * _curVW);
-                    }
-                }
-                else if (_colliderScaled)
-                {
-                    // Back to 1.0x: restore the genuine collider we captured before scaling.
-                    WheelMemory.SetAllColliderRadius(_vehicle, _genuineTyreR, _genuineRimR);
-                    WheelMemory.SetAllColliderWidth(_vehicle, _genuineTyreW);
-                    _colliderScaled = false;
-                }
-                // else (mult 1.0, never scaled): DO NOT touch the colliders — keep the game's genuine
-                // values so stock / unscaled wheels never sink.
-            }
-            catch (Exception ex) { Log?.Invoke($"[WheelFitment] ApplyVisual error: {ex.Message}"); }
-        }
-
-        private void CacheOriginalValues()
-        {
-            _originalWheelOffsets.Clear();
-            try
-            {
-                int numWheels = WheelMemory.GetWheelCount(_vehicle);
-                if (numWheels == 0)
-                {
-                    Log?.Invoke($"[WheelFitment] No wheels detected for {_vehicle.DisplayName}");
-                    return;
-                }
-                for (int i = 0; i < numWheels; i++)
-                {
-                    float x = WheelMemory.GetWheelX(_vehicle, i);
-                    float z = WheelMemory.GetWheelZ(_vehicle, i);
-                    _originalWheelOffsets[i] = new Vector3(x, 0f, z);
-                }
-                Log?.Invoke($"[WheelFitment] Cached {numWheels} wheels (Marshal). W0: X={_originalWheelOffsets[0].X:F3} Z={_originalWheelOffsets[0].Z:F3}");
-            }
-            catch (Exception ex) { Log?.Invoke($"[WheelFitment] CacheOriginalValues error: {ex.Message}"); }
-        }
-
-        #endregion
-
-        #region Fitment Application
-
-        private int _debugCounter = 0;
-
-        // Cache original camber values
-        private float _originalFrontCamber = 0f;
-        private float _originalRearCamber = 0f;
-        private bool _camberCached = false;
-
-        /// <summary>
-        /// Apply all fitment adjustments (uses the EASED current values).
-        /// </summary>
-        public void ApplyFitment()
+        /// <summary>Must be called every frame to maintain fitment.</summary>
+        public void Update()
         {
             if (!IsInitialized) return;
+            RefreshBaseline();   // refresh the reference offsets/base visual on a wheel swap (re-stamps both)
 
-            ApplyCamber();
-            if (_originalWheelOffsets.Count > 0)
+            // RENDER fields (fake-lowering + visual size/width) get wiped by render events like opening the
+            // menu, so re-assert them EVERY frame (they no-op at stock — cheap).
+            ApplyRender();
+
+            float sig = _frontCamber + _rearCamber * 1.7f + _frontTrackWidth * 2.3f + _rearTrackWidth * 3.1f
+                      + _frontHeight * 4.3f + _rearHeight * 5.7f + _visualSize * 6.1f + _visualWidth * 7.9f
+                      + _rake * 8.3f;
+            bool changed = !float.IsNaN(_lastSig) && Math.Abs(sig - _lastSig) > 0.0001f;
+            _lastSig = sig;
+
+            bool moving = false;
+            try { moving = _vehicle.Speed > 0.1f; } catch { }
+
+            // The CWheel SOLVER fields (camber/track/rake) HOLD while parked, but the suspension solver can
+            // reset them under real driving — so only re-assert (and run the stability monitor) while MOVING or
+            // for a short settle window after a change. Parked + idle = zero geometry writes, zero monitor cost.
+            if (changed || moving) _reassertUntil = Game.GameTime + 1500;
+            if (changed)
             {
-                ApplyTrackWidth();
-                ApplyHeight();
+                Nudge();
+                _lastChangeAt = Game.GameTime;
+            }
+
+            if (Game.GameTime < _reassertUntil)
+            {
+                // Capture the SOLVER's wheel-Z BEFORE ApplyGeometry re-pins it — its oscillation is the buzz.
+                float solverWheelZ = WheelMemory.GetWheelZ(_vehicle, 0);
+                ApplyGeometry();
+                MonitorStability(solverWheelZ);
             }
         }
 
-        private void ApplyCamber()
+        /// <summary>Watch the body for a SUSTAINED bounce (the "going nuts" failure) while parked/slow, and
+        /// if it won't settle, revert to the last stable values (or stock) and flag a warning for the UI.
+        /// Triggers only after a change has had time to settle (so it ignores the apply transient + nudge),
+        /// and only at low speed (so driving over bumps never false-trips it).</summary>
+        private void MonitorStability(float solverWheelZ)
         {
-            if (Math.Abs(_curFC) < 0.0005f && Math.Abs(_curRC) < 0.0005f)
-                return;
             try
             {
-                // Front wheels (0,1), rear (2,3). Left/right mirror the sign so it cambers symmetrically.
-                int n = WheelMemory.GetWheelCount(_vehicle);
-                for (int i = 0; i < n; i++)
+                if (_vehicle == null || !_vehicle.Exists()) return;
+                bool active = Math.Abs(_frontCamber) > 1e-4f || Math.Abs(_rearCamber) > 1e-4f
+                           || Math.Abs(_frontTrackWidth) > 1e-4f || Math.Abs(_rearTrackWidth) > 1e-4f
+                           || Math.Abs(_frontHeight) > 1e-4f || Math.Abs(_rearHeight) > 1e-4f
+                           || Math.Abs(_rake) > 1e-4f
+                           || Math.Abs(_visualSize - 1f) > 1e-3f || Math.Abs(_visualWidth - 1f) > 1e-3f;
+                if (!active) { _hasSafe = false; _recN = 0; _oscMs = 0f; return; }
+                // HORIZONTAL speed only — a parked car that's VIBRATING has high vertical velocity but ~0
+                // horizontal, so total Speed would wrongly gate the buzz out. Driving = horizontal motion.
+                Vector3 vel = _vehicle.Velocity;
+                float horiz = (float)Math.Sqrt(vel.X * vel.X + vel.Y * vel.Y);
+                if (horiz > 2.5f) { _recN = 0; _oscMs = 0f; return; }   // driving -> don't judge
+
+                // Suspension travel = wheel bone world-Z relative to body world-Z. This is the RENDERED wheel
+                // position, which moves when the wheels visibly flip up/down (the solver's 0x038 / body-Z may
+                // not show it).
+                if (_wheelBoneIdx == -2)
+                    _wheelBoneIdx = Function.Call<int>(Hash.GET_ENTITY_BONE_INDEX_BY_NAME, _vehicle, "wheel_lf");
+                float susp = solverWheelZ;
+                if (_wheelBoneIdx >= 0)
                 {
-                    bool isFront = (i == 0 || i == 1);
-                    float camber = isFront ? _curFC : _curRC;
-                    bool isLeft = (i % 2 == 0);
-                    WheelMemory.SetWheelCamber(_vehicle, i, isLeft ? camber : -camber);
+                    Vector3 bw = Function.Call<Vector3>(Hash.GET_WORLD_POSITION_OF_ENTITY_BONE, _vehicle, _wheelBoneIdx);
+                    susp = bw.Z - _vehicle.Position.Z;
                 }
-            }
-            catch (Exception ex) { Log?.Invoke($"[WheelFitment] ApplyCamber error: {ex.Message}"); }
-        }
 
-        private void ApplyTrackWidth()
-        {
-            try
-            {
-                foreach (var kvp in _originalWheelOffsets)
+                // Prime the whole ring with the first sample so the window is valid from frame 1 (no 0.4s
+                // blind spot waiting for it to fill — primed slots read flat, so they never false-trip).
+                if (_recN == 0)
+                    for (int k = 0; k < _recB.Length; k++)
+                    { _recB[k] = _vehicle.Position.Z; _recS[k] = susp; }
+                _recB[_recN % _recB.Length] = _vehicle.Position.Z;
+                _recS[_recN % _recS.Length] = susp;
+                _recN++;
+
+                // Detect on the SUSPENSION (rendered wheel vs body) — that's where the flip lives (diagnostic:
+                // suspBone amp~0.11 rev~5 while 0x038/bodyZ were flat). >=3 reversals rules out a monotonic
+                // slider move; amplitude rules out tiny jitter. Body Z is a weak backup.
+                Analyze(_recS, out int sRev, out float sAmp);
+                Analyze(_recB, out int bRev, out float bAmp);
+                bool oscNow = (sRev >= 2 && sAmp > 0.025f) || (bRev >= 2 && bAmp > 0.045f);
+                float dt = Math.Min(Game.LastFrameTime, 0.1f) * 1000f;
+                // A violent buzz climbs the accumulator twice as fast AND trips at a lower threshold, so an
+                // obvious freak-out is caught in ~0.2s while a borderline wobble still needs ~0.4s of evidence.
+                bool violent = sAmp > 0.08f || bAmp > 0.10f;
+                _oscMs = oscNow ? _oscMs + dt * (violent ? 2f : 1f) : Math.Max(0f, _oscMs - dt * 1.5f);
+                float trip = violent ? 200f : 400f;
+
+                if (_oscMs > trip)
                 {
-                    int wheelIndex = kvp.Key;
-                    Vector3 original = kvp.Value;
-                    bool isFront = (wheelIndex == 0 || wheelIndex == 1);
-                    bool isLeft = (wheelIndex % 2 == 0);
-                    float trackWidth = isFront ? _curFT : _curRT;
-                    float trackOffset = isLeft ? -trackWidth : trackWidth;
-                    WheelMemory.SetWheelX(_vehicle, wheelIndex, original.X + trackOffset);
-                }
-            }
-            catch (Exception ex) { Log?.Invoke($"[WheelFitment] ApplyTrackWidth error: {ex.Message}"); }
-        }
-
-        private void ApplyHeight()
-        {
-            if (Math.Abs(_curFH) < 0.0005f && Math.Abs(_curRH) < 0.0005f)
-                return;
-            try
-            {
-                // ONE travel budget per vehicle, shared between wheel size and lift: the extra collider
-                // radius already in play spends part of it; lift (wheel-down, negative height) gets the
-                // remainder. Inside the budget the suspension stays in its band -> never bounces.
-                // Slam (positive height = wheel up) is compression-side and was stable at every value
-                // tested, so only the slider limit applies there.
-                float appliedMult = Math.Min(Math.Max(_curVS, 1f), MaxSizeMult);
-                float extraR = _hasVisualWheels ? _baseVisualSize * (appliedMult - 1f) * 0.5f : 0f;
-                float budget = (_travelRange > 0.01f ? _travelRange : 0.20f) * 0.85f;
-                float liftMax = Math.Max(0f, budget - extraR);
-
-                foreach (var kvp in _originalWheelOffsets)
-                {
-                    int wheelIndex = kvp.Key;
-                    Vector3 original = kvp.Value;
-                    bool isFront = (wheelIndex == 0 || wheelIndex == 1);
-                    float h = isFront ? _curFH : _curRH;
-                    if (h < -liftMax) h = -liftMax;   // lift clamped to the remaining travel budget
-                    WheelMemory.SetWheelZ(_vehicle, wheelIndex, original.Z + h);
-                }
-            }
-            catch (Exception ex) { Log?.Invoke($"[WheelFitment] ApplyHeight error: {ex.Message}"); }
-        }
-
-        // (Auto-lift removed: with visual and collider capped TOGETHER at the travel budget, a bigger
-        //  wheel raises the body naturally — the contact point sits lower, so the body rides higher.)
-
-        // ====================================================================
-        // Suspension raise (stock capture retained for the travel budget; fSuspensionRaise itself is
-        // init-baked and NOT writable live — verified — so height runs through budgeted wheel-Z)
-        // ====================================================================
-        /// <summary>Resolve this model's STOCK fSuspensionRaise — from the on-disk cache if we've ever
-        /// seen the model before (contamination-proof across reloads), else from live handling.</summary>
-        private void CaptureStockRaise()
-        {
-            _raiseCaptured = false;
-            try
-            {
-                if (_stockRaiseByModel == null)
-                {
-                    _stockRaiseByModel = new Dictionary<int, float>();
-                    _stockHandlingPath = System.IO.Path.Combine(
-                        AppDomain.CurrentDomain.BaseDirectory, "ExtendedLSC", "stock_handling.dat");
-                    try
+                    if (_hasSafe && _safe != null)
                     {
-                        if (System.IO.File.Exists(_stockHandlingPath))
-                            foreach (string line in System.IO.File.ReadAllLines(_stockHandlingPath))
-                            {
-                                var parts = line.Split('=');
-                                if (parts.Length == 2 && int.TryParse(parts[0], out int mh) &&
-                                    float.TryParse(parts[1], System.Globalization.NumberStyles.Float,
-                                        System.Globalization.CultureInfo.InvariantCulture, out float rv))
-                                    _stockRaiseByModel[mh] = rv;
-                            }
+                        _frontCamber = _safe[0]; _rearCamber = _safe[1];
+                        _frontTrackWidth = _safe[2]; _rearTrackWidth = _safe[3];
+                        _frontHeight = _safe[4]; _rearHeight = _safe[5];
+                        _visualSize = _safe[6]; _visualWidth = _safe[7];
+                        _rake = _safe[8];
+                        InstabilityMsg = "Setup became unstable — reverted to last stable fitment";
                     }
-                    catch { }
-                }
-
-                var hd = _vehicle.HandlingData;
-                if (hd == null || !hd.IsValid) return;
-                _travelRange = hd.SuspensionUpperLimit - hd.SuspensionLowerLimit;
-
-                int model = _vehicle.Model.Hash;
-                if (_stockRaiseByModel.TryGetValue(model, out float stock))
-                {
-                    _stockRaise = stock;
-                }
-                else
-                {
-                    _stockRaise = hd.SuspensionRaise;
-                    _stockRaiseByModel[model] = _stockRaise;
-                    try
+                    else
                     {
-                        System.IO.File.AppendAllText(_stockHandlingPath,
-                            model + "=" + _stockRaise.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\n");
+                        Reset();
+                        InstabilityMsg = "Setup became unstable — reverted to stock";
                     }
-                    catch { }
+                    InstabilityTripped = true;
+                    _lastSig = float.NaN;     // don't treat the revert as a user change
+                    _recN = 0; _oscMs = 0f;
+                    Nudge();
                 }
-                _raiseCaptured = true;
-                _appliedRaiseDelta = hd.SuspensionRaise - _stockRaise;   // may be nonzero after a reload
-            }
-            catch (Exception ex) { Log?.Invoke($"[WheelFitment] CaptureStockRaise error: {ex.Message}"); }
-        }
-
-        private void WriteRaise(float delta)
-        {
-            if (!_raiseCaptured) return;
-            try
-            {
-                var hd = _vehicle.HandlingData;
-                if (hd == null || !hd.IsValid) return;
-                hd.SuspensionRaise = _stockRaise + delta;
-                _appliedRaiseDelta = delta;
+                else if (_oscMs < 50f && sRev < 2 && bRev < 2 && sAmp < 0.02f && bAmp < 0.02f && Game.GameTime - _lastChangeAt > 400)
+                {
+                    // Settled, quiet, and not mid-adjust -> remember as a known-good fallback.
+                    _safe = new[] { _frontCamber, _rearCamber, _frontTrackWidth, _rearTrackWidth, _frontHeight, _rearHeight, _visualSize, _visualWidth, _rake };
+                    _hasSafe = true;
+                }
             }
             catch { }
         }
 
-        /// <summary>Restore the model's stock suspension raise (Reset / detach / vehicle switch).
-        /// NOTE: handling is SHARED per model — restoring affects all cars of this model.</summary>
-        public void RestoreSuspension()
+        /// <summary>Count significant direction reversals + peak-to-peak amplitude over the recent ring (in
+        /// chronological order). Many reversals = oscillation; few = a monotonic move.</summary>
+        private void Analyze(float[] ring, out int reversals, out float amplitude)
         {
-            if (_raiseCaptured && Math.Abs(_appliedRaiseDelta) > 0.0001f)
-                WriteRaise(0f);
+            int len = ring.Length;
+            int start = _recN % len;     // oldest sample is the next slot to be overwritten
+            float mn = float.MaxValue, mx = float.MinValue;
+            int rev = 0, lastSign = 0;
+            float prev = 0f; bool have = false;
+            for (int k = 0; k < len; k++)
+            {
+                float v = ring[(start + k) % len];
+                if (v < mn) mn = v; if (v > mx) mx = v;
+                if (have)
+                {
+                    float d = v - prev;
+                    if (Math.Abs(d) > 0.004f)
+                    {
+                        int s = d > 0 ? 1 : -1;
+                        if (lastSign != 0 && s != lastSign) rev++;
+                        lastSign = s;
+                    }
+                }
+                prev = v; have = true;
+            }
+            reversals = rev;
+            amplitude = mx - mn;
         }
 
-        /// <summary>One-time exact restore of camber/track/height when easing reaches all-zero.</summary>
-        private void RestoreGeometry()
+        /// <summary>UI polls this each tick — returns a one-shot warning string when a revert just happened.</summary>
+        public string ConsumeInstability()
+        {
+            if (!InstabilityTripped) return null;
+            InstabilityTripped = false;
+            return InstabilityMsg;
+        }
+
+        /// <summary>Full apply — gated wheel GEOMETRY + always-on RENDER fields. Used on a wheel swap
+        /// (RefreshBaseline) to re-stamp everything onto the fresh wheel.</summary>
+        private void ApplyRaw() { ApplyGeometry(); ApplyRender(); }
+
+        /// <summary>CWheel SOLVER fields: camber, track/poke (X), rake (per-axle Z). These HOLD while parked
+        /// but the suspension solver can reset them under real driving, so Update only re-asserts them while
+        /// MOVING or just after a change (see the reassert window). Each writes only while dialed in, with a
+        /// one-time stock write on release — a bone-stock car writes nothing.</summary>
+        private void ApplyGeometry()
         {
             try
             {
-                foreach (var kvp in _originalWheelOffsets)
+                // Rake = per-axle visual wheel-Z tilt (+front-low, -rear-low). Pin only while non-zero;
+                // one-time stock-Z write on release (never pin at stock).
+                float rake = _rake;
+                if (rake > MAX_RAKE) rake = MAX_RAKE;
+                if (rake < MIN_RAKE) rake = MIN_RAKE;
+                bool rakeOn = Math.Abs(rake) > 0.0005f;
+
+                bool camberOn = Math.Abs(_frontCamber) > 0.0005f || Math.Abs(_rearCamber) > 0.0005f;
+                bool trackOn  = Math.Abs(_frontTrackWidth) > 0.0005f || Math.Abs(_rearTrackWidth) > 0.0005f;
+
+                if (camberOn || trackOn || rakeOn || _camberActive || _trackActive || _rakeActive)
                 {
-                    WheelMemory.SetWheelCamber(_vehicle, kvp.Key, 0f);
-                    WheelMemory.SetWheelX(_vehicle, kvp.Key, kvp.Value.X);
-                    WheelMemory.SetWheelZ(_vehicle, kvp.Key, kvp.Value.Z);
+                    foreach (var kvp in _originalWheelOffsets)
+                    {
+                        int i = kvp.Key;
+                        Vector3 o = kvp.Value;
+                        bool isLeft = (i % 2 == 0);
+                        bool isFront = (i == 0 || i == 1);
+                        float camber = isFront ? _frontCamber : _rearCamber;
+                        float track = isFront ? _frontTrackWidth : _rearTrackWidth;
+                        if (track > MAX_TRACK_WIDTH) track = MAX_TRACK_WIDTH;   // clamp poke (visual-only) so
+                        if (track < MIN_TRACK_WIDTH) track = MIN_TRACK_WIDTH;   // saved/preset values stay sane
+
+                        // Camber: write while dialed in; one-time stock (0) write on release.
+                        if (camberOn) WheelMemory.SetWheelCamber(_vehicle, i, isLeft ? camber : -camber);
+                        else if (_camberActive) WheelMemory.SetWheelCamber(_vehicle, i, 0f);
+
+                        // Track/poke: write while dialed in; one-time stock-X write on release.
+                        if (trackOn) WheelMemory.SetWheelX(_vehicle, i, o.X + (isLeft ? -track : track));
+                        else if (_trackActive) WheelMemory.SetWheelX(_vehicle, i, o.X);
+
+                        // Rake: front wheels +rake (up into arch = corner sits lower), rear wheels -rake.
+                        if (rakeOn) WheelMemory.SetWheelZ(_vehicle, i, o.Z + (isFront ? rake : -rake));
+                        else if (_rakeActive) WheelMemory.SetWheelZ(_vehicle, i, o.Z);
+                    }
                 }
+                _camberActive = camberOn;
+                _trackActive = trackOn;
+                _rakeActive = rakeOn;
             }
-            catch (Exception ex) { Log?.Invoke($"[WheelFitment] RestoreGeometry error: {ex.Message}"); }
+            catch (Exception ex) { Log?.Invoke($"[WheelFitment] ApplyGeometry error: {ex.Message}"); }
         }
 
-        /// <summary>
-        /// Reset all fitment to stock
-        /// </summary>
+        /// <summary>RENDER fields: fake-lowering body height (CVehicle, render-only) + visual wheel size/width
+        /// + matching physics colliders. These get reset by RENDER events (opening the menu), NOT by driving,
+        /// so Update re-asserts them EVERY frame — but each writes only while dialed in (stock = no writes).</summary>
+        private void ApplyRender()
+        {
+            try
+            {
+                // Ride height via the game's FAKE (render-only) suspension lowering. The slider stores +cm-lift
+                // as NEGATIVE height; fake-lowering is +ve=lower, so the slam offset is +(_frontHeight). Average
+                // both axles (single whole-body value) and clamp. Restore the mod's baseline once on release.
+                // While previewing a native suspension level, leave the field alone so the game's preview shows.
+                if (!SuspendRideHeight) WriteFakeLowering();
+
+                if (_hasVisualWheels)
+                {
+                    // Only TOUCH the render size/width when the player has actually dialed in a non-stock
+                    // multiplier. At 1.0 we leave the game's natural value alone — writing base*1.0 every
+                    // frame would stamp our captured base, and if that base was read a frame off during a
+                    // wheel swap the wheel renders the wrong size (floats/sinks) on a car you never sized.
+                    bool sizeOn = Math.Abs(_visualSize - 1f) > 0.001f;
+                    bool widthOn = Math.Abs(_visualWidth - 1f) > 0.001f;
+                    if (sizeOn) { WheelMemory.SetVisualSize(_vehicle, _baseVisualSize * _visualSize); _visSizeApplied = true; }
+                    else if (_visSizeApplied) { WheelMemory.SetVisualSize(_vehicle, _baseVisualSize); _visSizeApplied = false; }
+                    if (widthOn) { WheelMemory.SetVisualWidth(_vehicle, _baseVisualWidth * _visualWidth); _visWidthApplied = true; }
+                    else if (_visWidthApplied) { WheelMemory.SetVisualWidth(_vehicle, _baseVisualWidth); _visWidthApplied = false; }
+
+                    // Scale the PHYSICS colliders to match the rendered wheel so the contact patch (and thus
+                    // ride height + collision) tracks the visual size/width. Tyre+rim radius follow size,
+                    // collider width follows width. Restore the captured stock value once on release.
+                    int wn = WheelMemory.GetWheelCount(_vehicle);
+                    if (sizeOn && _baseTyreR != null && _baseRimR != null)
+                    {
+                        for (int i = 0; i < wn && i < _baseTyreR.Length; i++)
+                        {
+                            WheelMemory.SetWheelField(_vehicle, i, WheelMemory.OFF_TYRE_RADIUS, _baseTyreR[i] * _visualSize);
+                            WheelMemory.SetWheelField(_vehicle, i, WheelMemory.OFF_RIM_RADIUS, _baseRimR[i] * _visualSize);
+                        }
+                        _sizeColApplied = true;
+                    }
+                    else if (_sizeColApplied && _baseTyreR != null && _baseRimR != null)
+                    {
+                        for (int i = 0; i < wn && i < _baseTyreR.Length; i++)
+                        {
+                            WheelMemory.SetWheelField(_vehicle, i, WheelMemory.OFF_TYRE_RADIUS, _baseTyreR[i]);
+                            WheelMemory.SetWheelField(_vehicle, i, WheelMemory.OFF_RIM_RADIUS, _baseRimR[i]);
+                        }
+                        _sizeColApplied = false;
+                    }
+                    if (widthOn && _baseTyreW != null)
+                    {
+                        for (int i = 0; i < wn && i < _baseTyreW.Length; i++)
+                            WheelMemory.SetWheelField(_vehicle, i, WheelMemory.OFF_TYRE_WIDTH, _baseTyreW[i] * _visualWidth);
+                        _widthColApplied = true;
+                    }
+                    else if (_widthColApplied && _baseTyreW != null)
+                    {
+                        for (int i = 0; i < wn && i < _baseTyreW.Length; i++)
+                            WheelMemory.SetWheelField(_vehicle, i, WheelMemory.OFF_TYRE_WIDTH, _baseTyreW[i]);
+                        _widthColApplied = false;
+                    }
+                }
+            }
+            catch (Exception ex) { Log?.Invoke($"[WheelFitment] ApplyRender error: {ex.Message}"); }
+        }
+
+        /// <summary>A small upward impulse to break a parked car's rest state so it settles onto the new
+        /// fitment immediately (a resting/"fixed" body ignores ACTIVATE_PHYSICS and velocity writes). No
+        /// teleport — SET_VEHICLE_ON_GROUND_PROPERLY makes offset wheels jump.</summary>
+        public void Nudge()
+        {
+            try
+            {
+                if (_vehicle == null || !_vehicle.Exists()) return;
+                Function.Call(Hash.ACTIVATE_PHYSICS, _vehicle);
+                if (_vehicle.Speed < 0.5f)
+                    Function.Call(Hash.APPLY_FORCE_TO_ENTITY, _vehicle, 1,
+                        0f, 0f, 0.3f, 0f, 0f, 0f, 0, false, true, true, false, true);
+            }
+            catch { }
+        }
+
+        /// <summary>Reset every slider to stock.</summary>
         public void Reset()
         {
-            // Targets to stock — easing glides everything back smoothly; when the eased values reach
-            // zero, Update() does the one-time exact restore (RestoreGeometry + genuine collider).
             _frontCamber = 0f;
             _rearCamber = 0f;
             _frontTrackWidth = 0f;
             _rearTrackWidth = 0f;
             _frontHeight = 0f;
             _rearHeight = 0f;
+            _rake = 0f;
             _visualSize = 1f;
             _visualWidth = 1f;
-            Log?.Invoke("[WheelFitment] Reset to stock (easing)");
+            Log?.Invoke("[WheelFitment] Reset to stock");
         }
 
-        /// <summary>
-        /// Must be called every frame to maintain fitment
-        /// </summary>
-        // One-shot physics re-settle bookkeeping (see Update / SettlePhysics).
-        private int _settleAtTime = 0;
-        private float _lastFitmentSig = 0f;
-
-        private float FitmentSig()
-            => _curFC + _curRC * 1.7f + _curFT * 2.3f + _curRT * 3.1f
-             + _curFH * 4.3f + _curRH * 5.7f + _curVS * 6.1f + _curVW * 7.9f;
-
-        public void Update()
-        {
-            if (!IsInitialized) return;
-
-            // Detect rim / wheel-type swaps (e.g. the player picked a new wheel in the LSC menu) and
-            // re-resolve the natural baseline for the new wheel, re-applying the current multipliers.
-            RefreshBaseline();
-
-            // Ease the applied values toward their targets (smooth, framerate-independent).
-            float dt = Game.LastFrameTime;
-            float k = 1f - (float)Math.Exp(-EASE_RATE * Math.Max(dt, 0.001f));
-            _curFC = Ease(_curFC, _frontCamber, k);
-            _curRC = Ease(_curRC, _rearCamber, k);
-            _curFT = Ease(_curFT, _frontTrackWidth, k);
-            _curRT = Ease(_curRT, _rearTrackWidth, k);
-            _curFH = Ease(_curFH, _frontHeight, k);
-            _curRH = Ease(_curRH, _rearHeight, k);
-            _curVS = Ease(_curVS, _visualSize, k);
-            _curVW = Ease(_curVW, _visualWidth, k);
-
-            // Camber/track/height reset every frame, so re-apply continuously while anything is non-stock
-            // (Marshal, VirtualQuery-guarded). On the frame everything reaches stock, restore exactly once.
-            bool active = Math.Abs(_curFC) > 0.0005f || Math.Abs(_curRC) > 0.0005f
-                       || Math.Abs(_curFT) > 0.0005f || Math.Abs(_curRT) > 0.0005f
-                       || Math.Abs(_curFH) > 0.0005f || Math.Abs(_curRH) > 0.0005f;
-
-            // NOTE: fSuspensionRaise is baked into wheel geometry at wheel-init only (verified live —
-            // edits + SET_VEHICLE_MOD re-applies never propagate), so height runs through wheel-Z,
-            // budgeted against suspension travel in ApplyHeight. Body height from SIZE comes free:
-            // a bigger (capped) collider radius lowers the contact point, riding the body up naturally.
-
-            // Oscillation telemetry (logs 1Hz when DebugLogging on)
-            DebugOscillation(active, _curFH);
-
-            if (active)
-            {
-                ApplyFitment();
-                _wasActive = true;
-            }
-            else if (_wasActive)
-            {
-                _wasActive = false;
-                RestoreGeometry();
-                RestoreSuspension();
-            }
-
-            // Visual size/width: write only while their eased values are still moving (or on first apply).
-            if (Math.Abs(_curVS - _lastAppliedVS) > 0.0005f || Math.Abs(_curVW - _lastAppliedVW) > 0.0005f)
-            {
-                _lastAppliedVS = _curVS;
-                _lastAppliedVW = _curVW;
-                ApplyVisual();
-            }
-
-            // After any fitment change the car can sit "floating" until physics next runs (it only drops
-            // when you drive off). Schedule a single re-settle ~0.12s after the easing stops moving.
-            float sig = FitmentSig();
-            if (Math.Abs(sig - _lastFitmentSig) > 0.0001f)
-            {
-                _lastFitmentSig = sig;
-                _settleAtTime = Game.GameTime + 120;
-            }
-            if (_settleAtTime != 0 && Game.GameTime >= _settleAtTime)
-            {
-                _settleAtTime = 0;
-                SettlePhysics();
-            }
-        }
-
-        private static float Ease(float cur, float target, float k)
-        {
-            float next = cur + (target - cur) * k;
-            return Math.Abs(target - next) < 0.0004f ? target : next;
-        }
-
-        // ---- per-frame oscillation telemetry (active only while DebugLogging is on) ----
-        // Reads what the GAME left in wheel-Z this frame (before our pin) and the body Z; logs the
-        // 1-second spread so we can see exactly which component vibrates and by how much.
-        private float _dbgGZmin, _dbgGZmax, _dbgBmin, _dbgBmax, _dbgFightMax;
-        private int _dbgFrames = 0, _dbgNextLog = 0;
-
-        private void DebugOscillation(bool active, float zOffFront)
-        {
-            try
-            {
-                float gameZ = WheelMemory.GetWheelZ(_vehicle, 0);
-                float bodyZ = _vehicle.Position.Z;
-                if (_dbgFrames == 0)
-                {
-                    _dbgGZmin = _dbgGZmax = gameZ;
-                    _dbgBmin = _dbgBmax = bodyZ;
-                    _dbgFightMax = 0f;
-                }
-                _dbgGZmin = Math.Min(_dbgGZmin, gameZ); _dbgGZmax = Math.Max(_dbgGZmax, gameZ);
-                _dbgBmin = Math.Min(_dbgBmin, bodyZ);  _dbgBmax = Math.Max(_dbgBmax, bodyZ);
-                if (_originalWheelOffsets.TryGetValue(0, out Vector3 o))
-                    _dbgFightMax = Math.Max(_dbgFightMax, Math.Abs(gameZ - (o.Z + zOffFront)));
-                _dbgFrames++;
-                if (Game.GameTime >= _dbgNextLog && _dbgFrames > 10)
-                {
-                    Log?.Invoke($"[WF osc] f={_dbgFrames} gameZ spread={_dbgGZmax - _dbgGZmin:F4} fight={_dbgFightMax:F4} body spread={_dbgBmax - _dbgBmin:F4} curVS={_curVS:F2} raiseDelta={zOffFront:F3} active={active}");
-                    _dbgFrames = 0;
-                    _dbgNextLog = Game.GameTime + 1000;
-                }
-            }
-            catch { }
-        }
-
-        /// <summary>
-        /// Force the vehicle's physics to re-evaluate so wheel-offset/collider edits settle immediately
-        /// instead of leaving the body floating until the player drives off.
-        /// </summary>
-        private void SettlePhysics()
+        /// <summary>Clear our ride-height offset, restoring the car's fake-lowering to the suspension mod's
+        /// baseline. Called on wheel-preview and vehicle handoff. Render-only + per-vehicle, so there's no
+        /// model-shared bleed to undo — this just removes our visual slam so a previewed/handed-off car sits
+        /// at its mod-defined height. The stance re-applies from save on re-entry.</summary>
+        public void RestoreSuspension()
         {
             try
             {
                 if (_vehicle == null || !_vehicle.Exists()) return;
-                // Wake the body for real: a resting/"fixed" vehicle ignores ACTIVATE_PHYSICS and even
-                // velocity writes (measured), so the body never rises onto raised suspension / bigger
-                // wheels until driven. A small upward impulse breaks the rest state; gravity + the
-                // suspension then settle the body to its new natural height. No teleporting
-                // (SET_VEHICLE_ON_GROUND_PROPERLY made offset wheels jump).
-                Function.Call(Hash.ACTIVATE_PHYSICS, _vehicle);
-                if (_vehicle.Speed < 0.5f)
-                {
-                    Function.Call(Hash.APPLY_FORCE_TO_ENTITY, _vehicle, 1,
-                        0f, 0f, 0.5f, 0f, 0f, 0f, 0, false, true, true, false, true);
-                }
+                WheelMemory.SetFakeLowering(_vehicle, _stockFake);
+                _fakeApplied = false;
             }
-            catch (Exception ex) { Log?.Invoke($"[WheelFitment] SettlePhysics error: {ex.Message}"); }
+            catch { }
+        }
+
+        /// <summary>Write the ride-height (fake-lowering) field right now — used to apply our stance on the
+        /// SAME frame as a menu transition (e.g. landing on "Custom Suspension and Camber") so there's no
+        /// one-frame gap where the field sits at the base.</summary>
+        public void ApplyRideHeightNow()
+        {
+            try { if (_vehicle != null && _vehicle.Exists()) WriteFakeLowering(); } catch { }
+        }
+
+        // Compute + write the fake-lowering (ride height) field. Shared by ApplyRender + ApplyRideHeightNow.
+        private void WriteFakeLowering()
+        {
+            float slamOffset = (_frontHeight + _rearHeight) * 0.5f;
+            if (slamOffset > MAX_RAISE) slamOffset = MAX_RAISE;
+            if (slamOffset < MIN_RAISE) slamOffset = MIN_RAISE;
+            bool fakeOn = Math.Abs(slamOffset) > 0.0005f;
+            if (fakeOn) { WheelMemory.SetFakeLowering(_vehicle, _stockFake + slamOffset); _fakeApplied = true; }
+            else if (_fakeApplied) { WheelMemory.SetFakeLowering(_vehicle, _stockFake); _fakeApplied = false; }
+        }
+
+        /// <summary>Re-read the car's current fake-lowering as our new baseline — call after the game's own
+        /// suspension mod changes the ride height (so our slider offsets from the new level, not the old).</summary>
+        public void RefreshStockFake()
+        {
+            try
+            {
+                if (_vehicle == null || !_vehicle.Exists()) return;
+                _stockFake = WheelMemory.GetFakeLowering(_vehicle);
+                if (_stockFake < -1f || _stockFake > 1f) _stockFake = 0f;
+                _fakeApplied = false;
+            }
+            catch { }
         }
 
         #endregion
@@ -819,6 +745,7 @@ namespace ExtendedLSC.WheelFitment
             public float RearTrackWidth { get; set; }
             public float FrontHeight { get; set; }
             public float RearHeight { get; set; }
+            public float Rake { get; set; }               // front/rear tilt (+front-low, -rear-low)
             public float VisualSize { get; set; } = 1f;   // wheel size multiplier (needs custom rims)
             public float VisualWidth { get; set; } = 1f;  // wheel width multiplier (needs custom rims)
         }
@@ -834,6 +761,7 @@ namespace ExtendedLSC.WheelFitment
                 RearTrackWidth = _rearTrackWidth,
                 FrontHeight = _frontHeight,
                 RearHeight = _rearHeight,
+                Rake = _rake,
                 VisualSize = _visualSize,
                 VisualWidth = _visualWidth
             };
@@ -841,24 +769,23 @@ namespace ExtendedLSC.WheelFitment
 
         public void ApplyPreset(FitmentPreset preset)
         {
-            // Targets only — easing glides the whole look in over ~0.4s.
             FrontCamber = preset.FrontCamber;
             RearCamber = preset.RearCamber;
             FrontTrackWidth = preset.FrontTrackWidth;
             RearTrackWidth = preset.RearTrackWidth;
             FrontHeight = preset.FrontHeight;
             RearHeight = preset.RearHeight;
+            Rake = preset.Rake;
             if (_hasVisualWheels)
             {
                 VisualSize = preset.VisualSize;
                 VisualWidth = preset.VisualWidth;
             }
-
             Log?.Invoke($"[WheelFitment] Applied preset: {preset.Name}");
         }
 
-        // Style presets: a coherent, stable combination per build culture. Wheel size beyond the arch
-        // auto-lifts the body (AutoLift), so Donk "just works" — crank size, body rises with it.
+        // Style presets: a coherent combination per build culture. These are just raw slider values now —
+        // re-tune freely.
         public static readonly FitmentPreset[] BuiltInPresets = new[]
         {
             new FitmentPreset
@@ -917,13 +844,6 @@ namespace ExtendedLSC.WheelFitment
         #endregion
 
         #region Helpers
-
-        private static float Clamp(float value, float min, float max)
-        {
-            if (value < min) return min;
-            if (value > max) return max;
-            return value;
-        }
 
         public static float ToDegrees(float radians)
         {

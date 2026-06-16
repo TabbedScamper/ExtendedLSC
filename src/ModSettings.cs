@@ -50,6 +50,10 @@ namespace ExtendedLSC
         /// OFF by default — the simple corner HUD is the default; this is an opt-in option.</summary>
         public static bool DragHudEnabled { get; set; } = false;
 
+        /// <summary>Install NOS/nitrous on the manual-transmission vehicle (temporary test toggle until
+        /// it becomes a purchasable LSC upgrade). Off by default.</summary>
+        public static bool NosEnabled { get; set; } = false;
+
         /// <summary>Per-vehicle manual transmission upgrade option</summary>
         public static bool ManualTransmission { get; set; } = true;
 
@@ -86,7 +90,7 @@ namespace ExtendedLSC
         public static bool EditorMode { get; set; } = false;
 
         /// <summary>Enable debug logging to ExtendedLSC.log</summary>
-        public static bool DebugLogging { get; set; } = true;
+        public static bool DebugLogging { get; set; } = false;
 
         #endregion
 
@@ -168,6 +172,10 @@ namespace ExtendedLSC
                                 case "drag_hud":
                                 case "draghud":
                                     DragHudEnabled = ParseBool(value);
+                                    break;
+                                case "nosenabled":
+                                case "nos":
+                                    NosEnabled = ParseBool(value);
                                     break;
                                 case "manualtransmission":
                                 case "manual_transmission":
@@ -311,6 +319,12 @@ namespace ExtendedLSC
 
                     writer.WriteLine("; Wheel Fitment Pro Mode: per-axle camber/track/height sliders (off = simple menu)");
                     writer.WriteLine($"WheelFitmentProMode = {BoolToString(WheelFitmentProMode)}");
+                    writer.WriteLine();
+
+                    writer.WriteLine("; NFS-style drag gauge HUD for manual transmission (off = simple corner HUD)");
+                    writer.WriteLine($"DragHud = {BoolToString(DragHudEnabled)}");
+                    writer.WriteLine("; Install NOS/nitrous on the manual-transmission car (test toggle; X on Xbox / N key to spray)");
+                    writer.WriteLine($"Nos = {BoolToString(NosEnabled)}");
                     writer.WriteLine();
 
                     writer.WriteLine("; Per-vehicle manual transmission upgrade");

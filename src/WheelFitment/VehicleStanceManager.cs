@@ -25,6 +25,8 @@ namespace ExtendedLSC.WheelFitment
         public float FrontCamber, RearCamber;
         public float FrontTrackWidth, RearTrackWidth;
         public float FrontHeight, RearHeight;
+        public float Rake;
+        public float StockFake;   // clean suspension-mod base for ride height (anti-drift on re-entry)
         public float VisualSize = 1f, VisualWidth = 1f;
 
         [JsonIgnore]
@@ -32,6 +34,7 @@ namespace ExtendedLSC.WheelFitment
             Math.Abs(FrontCamber) < 0.001f && Math.Abs(RearCamber) < 0.001f &&
             Math.Abs(FrontTrackWidth) < 0.001f && Math.Abs(RearTrackWidth) < 0.001f &&
             Math.Abs(FrontHeight) < 0.001f && Math.Abs(RearHeight) < 0.001f &&
+            Math.Abs(Rake) < 0.001f &&
             Math.Abs(VisualSize - 1f) < 0.001f && Math.Abs(VisualWidth - 1f) < 0.001f;
     }
 
@@ -225,6 +228,8 @@ namespace ExtendedLSC.WheelFitment
             fit.RearTrackWidth = rec.RearTrackWidth;
             fit.FrontHeight = rec.FrontHeight;
             fit.RearHeight = rec.RearHeight;
+            fit.Rake = rec.Rake;
+            fit.StockFake = rec.StockFake;   // restore the clean ride-height baseline (anti-drift, no re-stamp)
             if (fit.HasVisualWheels)
             {
                 fit.VisualSize = rec.VisualSize;
@@ -290,6 +295,8 @@ namespace ExtendedLSC.WheelFitment
                 rec.RearTrackWidth = fit.RearTrackWidth;
                 rec.FrontHeight = fit.FrontHeight;
                 rec.RearHeight = fit.RearHeight;
+                rec.Rake = fit.Rake;
+                rec.StockFake = fit.StockFake;
                 rec.VisualSize = fit.VisualSize;
                 rec.VisualWidth = fit.VisualWidth;
 
@@ -305,6 +312,7 @@ namespace ExtendedLSC.WheelFitment
             Math.Abs(f.FrontCamber) < 0.001f && Math.Abs(f.RearCamber) < 0.001f &&
             Math.Abs(f.FrontTrackWidth) < 0.001f && Math.Abs(f.RearTrackWidth) < 0.001f &&
             Math.Abs(f.FrontHeight) < 0.001f && Math.Abs(f.RearHeight) < 0.001f &&
+            Math.Abs(f.Rake) < 0.001f &&
             Math.Abs(f.VisualSize - 1f) < 0.001f && Math.Abs(f.VisualWidth - 1f) < 0.001f;
 
         // ====================================================================

@@ -18,3 +18,9 @@ ExtendedLSC_backup_/
 # Native ASI build artifacts (ASI is unused; source kept for reference)
 native/**/build/
 native/ScriptHookV_SDK/
+
+# Runtime backup of deployed game-dir save data (local only)
+GameDataBackup/
+
+# DLC build intermediates (the packaged dlc_elsc/ IS committed)
+DLC/_build/
