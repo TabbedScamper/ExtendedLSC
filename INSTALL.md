@@ -21,55 +21,40 @@ and fully **remappable controls with on-screen device glyphs**. SHVDN3 / .NET Fr
 ---
 
 ## Install (copy files)
-Copy these into your GTA **`scripts\`** folder:
+Copy these three DLLs (from `bin\Release\net48\`) into your GTA **`scripts\`** folder:
 ```
 scripts\
   ExtendedLSC.dll
-  ExtendedLSC.ini
   LemonUI.SHVDN3.dll
   Newtonsoft.Json.dll
 ```
-(All four are in `bin\Release\net48\`. `ScriptHookVDotNet3.dll` is also there for reference but normally
-comes from your SHVDN3 install — don't duplicate it if you already have it.)
+(`ScriptHookVDotNet3.dll` is also in that folder for reference but normally comes from your SHVDN3
+install — don't duplicate it if you already have it.)
 
-Then copy the **`hud\`** folder (the drag-HUD gauge art) next to `GTA5.exe` so the path is:
-```
-<GTA install>\ExtendedLSC\hud\        ← tach_face.png, tach_needle.png, gear_tab.png,
-                                         nos_dot.png, nos_dot_off.png, gd_0..9 / gd_N / gd_R, …
-```
-Without this folder the drag HUD won't draw (everything else still works; the log will say
-`[DragHUD] assets MISSING`).
-
-The mod also creates this same **`ExtendedLSC\`** folder for saved builds (`ExtendedLSC\Packages\*.json`)
-and an optional custom banner (`ExtendedLSC\banner.png`) on its own.
+The mod creates its own **`scripts\ExtendedLSC\`** folder on first run for its settings, saved builds
+(`Packages\*.json`), and an optional custom banner (`banner.png`). Nothing else to copy.
 
 That's it — launch GTA, load into story mode, and the mod is active.
 
 ---
 
-## Configure (`ExtendedLSC.ini`)
-```ini
-[General]
-MenuKey=F5            ; open the menu when near / in a vehicle
-AutoOpenInLSC=true    ; auto-open inside Los Santos Customs zones
+## Configure (`scripts\ExtendedLSC\settings.ini`)
+On first run the mod generates **`scripts\ExtendedLSC\settings.ini`** — a documented INI with four sections.
+Edit it and reload the script (or restart) to apply.
 
-[Menu]
-Position=TopLeft      ; TopLeft | TopRight | BottomLeft | BottomRight
-BannerPath=           ; optional custom banner image
+- **`[Features]`** — toggle optional systems on/off: `CustomCamera`, `ManualTransmission`, `VehicleTuning`,
+  `LightCustomization`, `VStancerIntegration`, `WheelFitmentProMode`, `Nos`, and the manual-transmission feel
+  values (`MtKickForce`, `MtLimiterRpm`, …). Set the ones you don't want to `false`.
+- **`[Controls]`** — remap **every** binding: `MenuKey` (default `F5`), the edit-mode keys
+  (`EditModeKey=F6`, `RenameCategoryKey=F2`, `DeleteCategoryKey=Delete`, `DebugMenuKey=F7`), walk-around and
+  shift/nitrous bindings. Keyboard keys by name (`F5`, `Delete`, `NumPad0`…); controller buttons by index.
+  On-screen glyphs auto-match your device. You can also remap everything **in-game** from the CONTROLS menu
+  in Edit Mode.
+- **`[UI]`** — `ScrollIndicators`, `ShowRPM`.
+- **`[Developer]`** — `EditorMode` (Edit Mode for modders; default `false`) and `DebugLogging`
+  (writes `ExtendedLSC.log`; default `false`).
 
-[Debug]
-EnableLogging=false   ; leave off for normal play (on = writes ExtendedLSC.log)
-ShowDebugInfo=false
-```
-
----
-
-## Controls & features (`ExtendedLSC\settings.ini`)
-On first run the mod also creates `ExtendedLSC\settings.ini`, which has a **`[Controls]`** section where you
-can remap **every** binding (menu key, edit-mode keys, walk-around, manual transmission, nitrous) — keyboard
-keys by name, controller buttons by index. The on-screen button glyphs auto-match your device. You can also
-remap everything **in-game** from the CONTROLS menu (in Edit Mode). Toggle optional features (camera,
-fitment, manual transmission, etc.) in the same file.
+> There is no separate `ExtendedLSC.ini` — `settings.ini` is the only config file.
 
 ## Edit Mode (for modders)
 Set `EditorMode = true` in `settings.ini` (`[Developer]`), open the menu, and press **F6**. You can create
@@ -81,8 +66,9 @@ Full guide: [docs/CUSTOM-MENUS.md](docs/CUSTOM-MENUS.md).
 ## Verify it loaded
 1. Get in a vehicle (or drive into an LSC).
 2. Press **F5** — the ExtendedLSC menu should appear.
-3. If nothing happens: confirm ScriptHookV + ScriptHookVDotNet3 load other mods, and that all four DLLs
-   above are in `scripts\`. Set `EnableLogging=true` and check `ExtendedLSC.log` (next to `GTA5.exe`).
+3. If nothing happens: confirm ScriptHookV + ScriptHookVDotNet3 load other mods, and that the three DLLs
+   above are in `scripts\`. Set `DebugLogging = true` in `settings.ini` (`[Developer]`) and check
+   `ExtendedLSC.log` (next to `GTA5.exe`).
 
 ---
 
