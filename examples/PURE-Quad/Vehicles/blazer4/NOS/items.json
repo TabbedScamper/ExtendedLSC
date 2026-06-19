@@ -1,0 +1,20 @@
+{
+  "MenuTitle": "NOS",
+  "Description": "PURE nos.",
+  "Items": [
+    {
+      "Name": "NOS 1",
+      "Description": "PURE nos 1.",
+      "Price": 4000,
+      "Value": 0,
+      "SourceModType": 4
+    },
+    {
+      "Name": "NOS 2",
+      "Description": "PURE nos 2.",
+      "Price": 4000,
+      "Value": 1,
+      "SourceModType": 4
+    }
+  ]
+}

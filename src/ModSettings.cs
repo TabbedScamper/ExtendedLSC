@@ -37,6 +37,18 @@ namespace ExtendedLSC
         /// <summary>Live handling.meta editing with sliders (not yet implemented)</summary>
         public static bool VehicleTuning { get; set; } = true;
 
+        /// <summary>While moving with Manual Transmission, restrict the player to melee (no drive-by shooting),
+        /// which also frees the weapon controls so they can't interfere with shifting.</summary>
+        public static bool MeleeOnlyInMotion { get; set; } = true;
+
+        // ---- Manual Transmission feel (live-tunable; edit the INI then reload to apply) ----
+        public static bool MtRumble { get; set; } = true;            // controller rumble on shifts + limiter
+        public static bool MtExhaustPops { get; set; } = true;       // backfire pop on upshift + decel crackle
+        public static float MtKickForce { get; set; } = 30f;         // perfect-shift forward lunge strength
+        public static float MtLimiterRpm { get; set; } = 0.985f;     // rev-limiter engage point (0..1)
+        public static float MtNosRefillPerSec { get; set; } = 0.015f; // passive NOS regen rate
+        public static float MtNosPerfectBump { get; set; } = 0.06f;  // NOS added per great shift
+
         /// <summary>Headlight and neon color/brightness customization (not yet implemented)</summary>
         public static bool LightCustomization { get; set; } = true;
 
@@ -45,10 +57,6 @@ namespace ExtendedLSC
 
         /// <summary>Wheel Fitment Pro Mode: per-axle camber/track/height sliders. Off = simple menu.</summary>
         public static bool WheelFitmentProMode { get; set; } = false;
-
-        /// <summary>NFS-style drag gauge HUD for the manual transmission (rev tach + gear + NOS).
-        /// OFF by default — the simple corner HUD is the default; this is an opt-in option.</summary>
-        public static bool DragHudEnabled { get; set; } = false;
 
         /// <summary>Install NOS/nitrous on the manual-transmission vehicle (temporary test toggle until
         /// it becomes a purchasable LSC upgrade). Off by default.</summary>
@@ -71,6 +79,53 @@ namespace ExtendedLSC
 
         /// <summary>Keyboard key for neutral toggle. Default: X</summary>
         public static Keys NeutralKey { get; set; } = Keys.X;
+
+        /// <summary>Keyboard key to spray nitrous (NOS). Bound when NOS is purchased. Default: N</summary>
+        public static Keys NosKey { get; set; } = Keys.N;
+
+        /// <summary>Controller control index to spray nitrous. Default: 76 (Xbox X / handbrake).</summary>
+        public static int NosButton { get; set; } = 76;
+
+        /// <summary>Nitrous exhaust-flame colour (ARGB). Default: blue.</summary>
+        public static int NosFlameColorArgb { get; set; } = unchecked((int)0xFF3C78FF);
+
+        /// <summary>Which exhaust-FX catalog entry the nitrous spray uses (NOS 1 = index 0).</summary>
+        public static int NosFxIndex { get; set; } = 0;
+
+        /// <summary>Play the nitrous boost effect (whoosh + screen blur) on spray. Default: on.</summary>
+        public static bool NosBoostFx { get; set; } = true;
+
+        /// <summary>Bitmask of purchased nitrous tiers (bit 0 = NOS 1 … bit 3 = NOS 4). 0 = none owned.</summary>
+        public static int NosOwnedTiers { get; set; } = 0;
+
+        #endregion
+
+        #region Controls (remappable — keyboard keys + controller GTA.Control indices)
+
+        // ---- Keyboard ----
+        /// <summary>Open / close the ELSC menu. Default: F5</summary>
+        public static Keys MenuKey { get; set; } = Keys.F5;
+        /// <summary>Open the debug tools menu (dev). Default: F7</summary>
+        public static Keys DebugMenuKey { get; set; } = Keys.F7;
+        /// <summary>Toggle modder edit mode (requires EditorMode). Default: F6</summary>
+        public static Keys EditModeKey { get; set; } = Keys.F6;
+        /// <summary>Rename the highlighted category in edit mode. Default: F2</summary>
+        public static Keys RenameCategoryKey { get; set; } = Keys.F2;
+        /// <summary>Delete / restore the highlighted category in edit mode. Default: Delete</summary>
+        public static Keys DeleteCategoryKey { get; set; } = Keys.Delete;
+        // (ShiftUpKey / ShiftDownKey / NeutralKey / NosKey live in the Manual Transmission region above.)
+
+        // ---- Controller (stored as GTA.Control index so the on-screen glyphs auto-match the player's device) ----
+        /// <summary>Enter / exit the walk-around camera. Default: Y (VehicleExit).</summary>
+        public static int WalkAroundButton { get; set; } = (int)GTA.Control.VehicleExit;
+        /// <summary>Walk-around: previous camera preset. Default: LB (FrontendLb).</summary>
+        public static int CamPrevButton { get; set; } = (int)GTA.Control.FrontendLb;
+        /// <summary>Walk-around: next camera preset. Default: RB (FrontendRb).</summary>
+        public static int CamNextButton { get; set; } = (int)GTA.Control.FrontendRb;
+        /// <summary>Walk-around: open / close the nearest door. Default: X (FrontendX).</summary>
+        public static int DoorButton { get; set; } = (int)GTA.Control.FrontendX;
+        /// <summary>Hold to preview the highlighted horn. Default: L3 (FrontendLs).</summary>
+        public static int HornPreviewButton { get; set; } = (int)GTA.Control.FrontendLs;
 
         #endregion
 
@@ -116,8 +171,10 @@ namespace ExtendedLSC
                 if (File.Exists(ConfigPath))
                 {
                     string[] lines = File.ReadAllLines(ConfigPath);
+                    bool hasControlsSection = false;
                     foreach (string line in lines)
                     {
+                        if (line.Trim().Equals("[Controls]", StringComparison.OrdinalIgnoreCase)) hasControlsSection = true;
                         string trimmed = line.Trim();
 
                         // Skip comments and empty lines
@@ -154,6 +211,28 @@ namespace ExtendedLSC
                                 case "vehicle_tuning":
                                     VehicleTuning = ParseBool(value);
                                     break;
+                                case "meleeonlyinmotion":
+                                case "melee_only_in_motion":
+                                    MeleeOnlyInMotion = ParseBool(value);
+                                    break;
+                                case "mtrumble":
+                                    MtRumble = ParseBool(value);
+                                    break;
+                                case "mtexhaustpops":
+                                    MtExhaustPops = ParseBool(value);
+                                    break;
+                                case "mtkickforce":
+                                    if (float.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float mtKf)) MtKickForce = mtKf;
+                                    break;
+                                case "mtlimiterrpm":
+                                    if (float.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float mtLr)) MtLimiterRpm = mtLr;
+                                    break;
+                                case "mtnosrefillpersec":
+                                    if (float.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float mtNr)) MtNosRefillPerSec = mtNr;
+                                    break;
+                                case "mtnosperfectbump":
+                                    if (float.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float mtNb)) MtNosPerfectBump = mtNb;
+                                    break;
                                 case "lightcustomization":
                                 case "light_customization":
                                     LightCustomization = ParseBool(value);
@@ -167,11 +246,6 @@ namespace ExtendedLSC
                                 case "wheel_fitment_pro_mode":
                                 case "promode":
                                     WheelFitmentProMode = ParseBool(value);
-                                    break;
-                                case "draghudenabled":
-                                case "drag_hud":
-                                case "draghud":
-                                    DragHudEnabled = ParseBool(value);
                                     break;
                                 case "nosenabled":
                                 case "nos":
@@ -207,6 +281,77 @@ namespace ExtendedLSC
                                     if (Enum.TryParse<Keys>(trimmed.Substring(eqIndex + 1).Trim(), true, out Keys neutralKey))
                                         NeutralKey = neutralKey;
                                     break;
+                                case "noskey":
+                                case "nos_key":
+                                    if (Enum.TryParse<Keys>(trimmed.Substring(eqIndex + 1).Trim(), true, out Keys nosKey))
+                                        NosKey = nosKey;
+                                    break;
+                                case "nosbutton":
+                                case "nos_button":
+                                    if (int.TryParse(value, out int nosBtn))
+                                        NosButton = nosBtn;
+                                    break;
+                                case "nosflamecolor":
+                                case "nos_flame_color":
+                                    if (int.TryParse(value, out int nosCol))
+                                        NosFlameColorArgb = nosCol;
+                                    break;
+                                case "nosfx":
+                                case "nos_fx":
+                                    if (int.TryParse(value, out int nosFx))
+                                        NosFxIndex = nosFx;
+                                    break;
+                                case "nosboostfx":
+                                case "nos_boost_fx":
+                                    NosBoostFx = ParseBool(value);
+                                    break;
+                                case "nosownedtiers":
+                                case "nos_owned_tiers":
+                                    if (int.TryParse(value, out int nosTiers))
+                                        NosOwnedTiers = nosTiers;
+                                    break;
+
+                                // Controls (remappable)
+                                case "menukey":
+                                case "menu_key":
+                                    if (Enum.TryParse<Keys>(trimmed.Substring(eqIndex + 1).Trim(), true, out Keys mKey)) MenuKey = mKey;
+                                    break;
+                                case "debugmenukey":
+                                case "debug_menu_key":
+                                    if (Enum.TryParse<Keys>(trimmed.Substring(eqIndex + 1).Trim(), true, out Keys dKey)) DebugMenuKey = dKey;
+                                    break;
+                                case "editmodekey":
+                                case "edit_mode_key":
+                                    if (Enum.TryParse<Keys>(trimmed.Substring(eqIndex + 1).Trim(), true, out Keys eKey)) EditModeKey = eKey;
+                                    break;
+                                case "renamecategorykey":
+                                case "rename_category_key":
+                                    if (Enum.TryParse<Keys>(trimmed.Substring(eqIndex + 1).Trim(), true, out Keys rKey)) RenameCategoryKey = rKey;
+                                    break;
+                                case "deletecategorykey":
+                                case "delete_category_key":
+                                    if (Enum.TryParse<Keys>(trimmed.Substring(eqIndex + 1).Trim(), true, out Keys delKey)) DeleteCategoryKey = delKey;
+                                    break;
+                                case "walkaroundbutton":
+                                case "walk_around_button":
+                                    if (int.TryParse(value, out int waBtn)) WalkAroundButton = waBtn;
+                                    break;
+                                case "camprevbutton":
+                                case "cam_prev_button":
+                                    if (int.TryParse(value, out int cpBtn)) CamPrevButton = cpBtn;
+                                    break;
+                                case "camnextbutton":
+                                case "cam_next_button":
+                                    if (int.TryParse(value, out int cnBtn)) CamNextButton = cnBtn;
+                                    break;
+                                case "doorbutton":
+                                case "door_button":
+                                    if (int.TryParse(value, out int doorBtn)) DoorButton = doorBtn;
+                                    break;
+                                case "hornpreviewbutton":
+                                case "horn_preview_button":
+                                    if (int.TryParse(value, out int hpBtn)) HornPreviewButton = hpBtn;
+                                    break;
 
                                 // UI Settings
                                 case "scrollindicators":
@@ -237,6 +382,14 @@ namespace ExtendedLSC
                         }
                     }
                     Log?.Invoke($"[ModSettings] Loaded settings from {ConfigPath}");
+
+                    // Migrate older INIs: if they predate the [Controls] section, rewrite the file once so the
+                    // new remappable bindings appear (all existing values were just loaded, so nothing is lost).
+                    if (!hasControlsSection)
+                    {
+                        Save();
+                        Log?.Invoke("[ModSettings] Upgraded settings.ini with the [Controls] section");
+                    }
                 }
                 else
                 {
@@ -309,6 +462,19 @@ namespace ExtendedLSC
                     writer.WriteLine($"VehicleTuning = {BoolToString(VehicleTuning)}");
                     writer.WriteLine();
 
+                    writer.WriteLine("; Restrict to melee (no drive-by shooting) while moving with Manual Transmission");
+                    writer.WriteLine($"MeleeOnlyInMotion = {BoolToString(MeleeOnlyInMotion)}");
+                    writer.WriteLine();
+
+                    writer.WriteLine("; Manual Transmission feel (live-tunable). KickForce ~30, LimiterRpm 0..1 (~0.985).");
+                    writer.WriteLine($"MtRumble = {BoolToString(MtRumble)}");
+                    writer.WriteLine($"MtExhaustPops = {BoolToString(MtExhaustPops)}");
+                    writer.WriteLine($"MtKickForce = {MtKickForce.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
+                    writer.WriteLine($"MtLimiterRpm = {MtLimiterRpm.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
+                    writer.WriteLine($"MtNosRefillPerSec = {MtNosRefillPerSec.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
+                    writer.WriteLine($"MtNosPerfectBump = {MtNosPerfectBump.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
+                    writer.WriteLine();
+
                     writer.WriteLine("; Headlight and neon color/brightness customization");
                     writer.WriteLine($"LightCustomization = {BoolToString(LightCustomization)}");
                     writer.WriteLine();
@@ -321,8 +487,6 @@ namespace ExtendedLSC
                     writer.WriteLine($"WheelFitmentProMode = {BoolToString(WheelFitmentProMode)}");
                     writer.WriteLine();
 
-                    writer.WriteLine("; NFS-style drag gauge HUD for manual transmission (off = simple corner HUD)");
-                    writer.WriteLine($"DragHud = {BoolToString(DragHudEnabled)}");
                     writer.WriteLine("; Install NOS/nitrous on the manual-transmission car (test toggle; X on Xbox / N key to spray)");
                     writer.WriteLine($"Nos = {BoolToString(NosEnabled)}");
                     writer.WriteLine();
@@ -349,6 +513,54 @@ namespace ExtendedLSC
 
                     writer.WriteLine("; Keyboard key for neutral toggle. Default: X");
                     writer.WriteLine($"NeutralKey = {NeutralKey}");
+                    writer.WriteLine("; Nitrous (NOS) spray key/button — bound when NOS is purchased");
+                    writer.WriteLine($"NosKey = {NosKey}");
+                    writer.WriteLine($"NosButton = {NosButton}");
+                    writer.WriteLine("; Nitrous exhaust-flame colour (ARGB integer)");
+                    writer.WriteLine($"NosFlameColor = {NosFlameColorArgb}");
+                    writer.WriteLine("; Nitrous exhaust effect (catalog index; NOS 1 = 0)");
+                    writer.WriteLine($"NosFx = {NosFxIndex}");
+                    writer.WriteLine("; Nitrous boost effect (whoosh + screen blur) on spray");
+                    writer.WriteLine($"NosBoostFx = {BoolToString(NosBoostFx)}");
+                    writer.WriteLine("; Purchased nitrous tiers (bitmask: bit0=NOS1 .. bit3=NOS4)");
+                    writer.WriteLine($"NosOwnedTiers = {NosOwnedTiers}");
+                    writer.WriteLine();
+
+                    writer.WriteLine("; ============================================================");
+                    writer.WriteLine("; CONTROLS  (remap any binding below)");
+                    writer.WriteLine("; ============================================================");
+                    writer.WriteLine("; Keyboard keys: use .NET key names (F5, F6, Delete, Enter, NumPad0, OemTilde, D1...).");
+                    writer.WriteLine("; Controller buttons: GTA control index numbers (the defaults below already map to the");
+                    writer.WriteLine(";   right buttons). The on-screen button glyphs automatically match your device");
+                    writer.WriteLine(";   (Xbox / PlayStation / keyboard) — change a number only if you know the index you want.");
+                    writer.WriteLine("[Controls]");
+                    writer.WriteLine();
+                    writer.WriteLine("; --- Normal use ---");
+                    writer.WriteLine("; Open / close the ELSC menu");
+                    writer.WriteLine($"MenuKey = {MenuKey}");
+                    writer.WriteLine("; Hold to enter the walk-around camera (controller)");
+                    writer.WriteLine($"WalkAroundButton = {WalkAroundButton}");
+                    writer.WriteLine("; Walk-around: cycle camera presets (controller)");
+                    writer.WriteLine($"CamPrevButton = {CamPrevButton}");
+                    writer.WriteLine($"CamNextButton = {CamNextButton}");
+                    writer.WriteLine("; Walk-around: open / close nearest door (controller)");
+                    writer.WriteLine($"DoorButton = {DoorButton}");
+                    writer.WriteLine("; Hold to preview the highlighted horn (controller)");
+                    writer.WriteLine($"HornPreviewButton = {HornPreviewButton}");
+                    writer.WriteLine();
+                    writer.WriteLine("; --- Manual Transmission / Nitrous (see [Features] above for the rest) ---");
+                    writer.WriteLine($"; Shift Up: {ShiftUpKey} (key) / {ShiftUpButton} (button)   Shift Down: {ShiftDownKey} / {ShiftDownButton}");
+                    writer.WriteLine($"; Neutral: {NeutralKey}    Nitrous: {NosKey} (key) / {NosButton} (button)");
+                    writer.WriteLine();
+                    writer.WriteLine("; --- Edit mode (modders; requires EditorMode = true in [Developer]) ---");
+                    writer.WriteLine("; Toggle edit mode");
+                    writer.WriteLine($"EditModeKey = {EditModeKey}");
+                    writer.WriteLine("; Rename the highlighted category");
+                    writer.WriteLine($"RenameCategoryKey = {RenameCategoryKey}");
+                    writer.WriteLine("; Delete / restore the highlighted category");
+                    writer.WriteLine($"DeleteCategoryKey = {DeleteCategoryKey}");
+                    writer.WriteLine("; Open the debug tools menu");
+                    writer.WriteLine($"DebugMenuKey = {DebugMenuKey}");
                     writer.WriteLine();
 
                     writer.WriteLine("; ============================================================");

@@ -1,0 +1,46 @@
+{
+  "label": "nfsgear_dominator",
+  "topspeed_mph": 107.8,
+  "topspeed_ms": 48.17,
+  "0-60mph_s": 4.107,
+  "0-100mph_s": 13.242,
+  "dist_m": 604.8,
+  "final_gear": 4,
+  "top_gear_seen": 4,
+  "duration_s": 17.82,
+  "shifts": [
+    {
+      "gear": "1->2",
+      "ms": 1687,
+      "mph": 15.7,
+      "rpm": 1.0
+    },
+    {
+      "gear": "2->3",
+      "ms": 2843,
+      "mph": 42.8,
+      "rpm": 0.959
+    },
+    {
+      "gear": "3->4",
+      "ms": 9203,
+      "mph": 85.5,
+      "rpm": 0.994
+    }
+  ],
+  "samples": 1898,
+  "maxFlatVel": 48.333,
+  "topGear": 5,
+  "driveGears": 5,
+  "ratios": [
+    0.0,
+    -3.3333,
+    3.3333,
+    2.4028,
+    1.732,
+    1.2485,
+    0.9,
+    0.0,
+    0.0
+  ]
+}

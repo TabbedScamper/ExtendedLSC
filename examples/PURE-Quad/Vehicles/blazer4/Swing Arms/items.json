@@ -1,0 +1,27 @@
+{
+  "MenuTitle": "Swing Arms",
+  "Description": "PURE swing arms.",
+  "Items": [
+    {
+      "Name": "Swing Arm 2",
+      "Description": "PURE swing arm 2.",
+      "Price": 2500,
+      "Value": 0,
+      "SourceModType": 32
+    },
+    {
+      "Name": "Swing Arm 3",
+      "Description": "PURE swing arm 3.",
+      "Price": 2500,
+      "Value": 1,
+      "SourceModType": 32
+    },
+    {
+      "Name": "Swing Arm 5",
+      "Description": "PURE swing arm 5.",
+      "Price": 2500,
+      "Value": 2,
+      "SourceModType": 32
+    }
+  ]
+}

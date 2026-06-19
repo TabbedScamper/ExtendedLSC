@@ -1,0 +1,38 @@
+{
+  "label": "baseline_dominator",
+  "topspeed_mph": 106.5,
+  "topspeed_ms": 47.61,
+  "0-60mph_s": 4.772,
+  "0-100mph_s": 13.828,
+  "dist_m": 604.7,
+  "final_gear": 5,
+  "top_gear_seen": 5,
+  "duration_s": 18.19,
+  "shifts": [
+    {
+      "gear": "1->2",
+      "ms": 1685,
+      "mph": 15.7,
+      "rpm": 1.0
+    },
+    {
+      "gear": "2->3",
+      "ms": 3706,
+      "mph": 51.2,
+      "rpm": 0.919
+    },
+    {
+      "gear": "3->4",
+      "ms": 6718,
+      "mph": 72.7,
+      "rpm": 0.92
+    },
+    {
+      "gear": "4->5",
+      "ms": 11415,
+      "mph": 93.7,
+      "rpm": 0.92
+    }
+  ],
+  "samples": 2049
+}

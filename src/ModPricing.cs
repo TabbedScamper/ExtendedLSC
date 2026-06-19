@@ -52,7 +52,15 @@ namespace ExtendedLSC
 
         // Toggle mod prices (turbo, etc.)
         public static readonly int TurboPrice = 2500;
+        public static readonly int NosPrice = 10000;   // legacy single-NOS price (kept for compatibility)
+        // Nitrous tiers — each a separate purchase, rising in cost (NOS 1..4 => index 0..3).
+        public static readonly int[] NosTierPrices = { 5000, 12000, 25000, 45000 };
         public static readonly int XenonLightsPrice = 1500;
+        public static readonly int CustomTiresPrice = 600;   // Aftermarket (low-profile) tire design
+
+        // Speedometer skins (bought once, global)
+        public static readonly int SpeedoLeFixPrice = 4500;
+        public static readonly int SpeedoNfsuPrice = 6500;
 
         // Service prices
         public static readonly int RepairPrice = 200;

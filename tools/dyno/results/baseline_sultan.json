@@ -1,0 +1,38 @@
+{
+  "label": "baseline_sultan",
+  "topspeed_mph": 99.1,
+  "topspeed_ms": 44.29,
+  "0-60mph_s": 4.242,
+  "0-100mph_s": null,
+  "dist_m": 603.7,
+  "final_gear": 5,
+  "top_gear_seen": 5,
+  "duration_s": 18.41,
+  "shifts": [
+    {
+      "gear": "1->2",
+      "ms": 3042,
+      "mph": 51.5,
+      "rpm": 0.92
+    },
+    {
+      "gear": "2->3",
+      "ms": 6509,
+      "mph": 73.0,
+      "rpm": 0.92
+    },
+    {
+      "gear": "3->4",
+      "ms": 7114,
+      "mph": 75.2,
+      "rpm": 0.948
+    },
+    {
+      "gear": "4->5",
+      "ms": 14642,
+      "mph": 94.0,
+      "rpm": 0.92
+    }
+  ],
+  "samples": 2074
+}

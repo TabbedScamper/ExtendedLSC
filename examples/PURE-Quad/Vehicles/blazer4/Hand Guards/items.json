@@ -1,0 +1,41 @@
+{
+  "MenuTitle": "Hand Guards",
+  "Description": "PURE hand guards.",
+  "Items": [
+    {
+      "Name": "Hand Guard 1",
+      "Description": "PURE hand guard 1.",
+      "Price": 700,
+      "Value": 0,
+      "SourceModType": 8
+    },
+    {
+      "Name": "Hand Guard 2",
+      "Description": "PURE hand guard 2.",
+      "Price": 700,
+      "Value": 1,
+      "SourceModType": 8
+    },
+    {
+      "Name": "Hand Guard 3",
+      "Description": "PURE hand guard 3.",
+      "Price": 700,
+      "Value": 2,
+      "SourceModType": 8
+    },
+    {
+      "Name": "Hand Guard 4",
+      "Description": "PURE hand guard 4.",
+      "Price": 700,
+      "Value": 3,
+      "SourceModType": 8
+    },
+    {
+      "Name": "Hand Guard 5",
+      "Description": "PURE hand guard 5.",
+      "Price": 700,
+      "Value": 4,
+      "SourceModType": 8
+    }
+  ]
+}

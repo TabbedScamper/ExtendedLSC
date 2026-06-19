@@ -1,0 +1,52 @@
+{
+  "label": "nfsgear_elegy2",
+  "topspeed_mph": 106.9,
+  "topspeed_ms": 47.79,
+  "0-60mph_s": 2.596,
+  "0-100mph_s": 10.296,
+  "dist_m": 603.9,
+  "final_gear": 5,
+  "top_gear_seen": 5,
+  "duration_s": 16.43,
+  "shifts": [
+    {
+      "gear": "1->2",
+      "ms": 1451,
+      "mph": 19.6,
+      "rpm": 0.844
+    },
+    {
+      "gear": "2->3",
+      "ms": 2051,
+      "mph": 42.7,
+      "rpm": 0.971
+    },
+    {
+      "gear": "3->4",
+      "ms": 3638,
+      "mph": 69.5,
+      "rpm": 0.936
+    },
+    {
+      "gear": "4->5",
+      "ms": 9255,
+      "mph": 93.8,
+      "rpm": 0.971
+    }
+  ],
+  "samples": 1765,
+  "maxFlatVel": 50.667,
+  "topGear": 6,
+  "driveGears": 6,
+  "ratios": [
+    0.0,
+    -3.3333,
+    3.3333,
+    2.5654,
+    1.9743,
+    1.5195,
+    1.1694,
+    0.9,
+    0.0
+  ]
+}

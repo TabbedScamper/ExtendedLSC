@@ -1,0 +1,38 @@
+{
+  "label": "baseline_blista",
+  "topspeed_mph": 94.1,
+  "topspeed_ms": 42.08,
+  "0-60mph_s": 6.002,
+  "0-100mph_s": null,
+  "dist_m": 604.1,
+  "final_gear": 5,
+  "top_gear_seen": 5,
+  "duration_s": 19.98,
+  "shifts": [
+    {
+      "gear": "1->2",
+      "ms": 1505,
+      "mph": 15.7,
+      "rpm": 1.0
+    },
+    {
+      "gear": "2->3",
+      "ms": 4217,
+      "mph": 47.6,
+      "rpm": 0.919
+    },
+    {
+      "gear": "3->4",
+      "ms": 7821,
+      "mph": 67.6,
+      "rpm": 0.92
+    },
+    {
+      "gear": "4->5",
+      "ms": 13917,
+      "mph": 87.0,
+      "rpm": 0.92
+    }
+  ],
+  "samples": 2262
+}

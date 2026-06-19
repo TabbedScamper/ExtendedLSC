@@ -1,0 +1,13 @@
+{
+  "MenuTitle": "Brake Kits",
+  "Description": "PURE brake kits.",
+  "Items": [
+    {
+      "Name": "Brake 2",
+      "Description": "PURE brake 2.",
+      "Price": 2800,
+      "Value": 0,
+      "SourceModType": 43
+    }
+  ]
+}

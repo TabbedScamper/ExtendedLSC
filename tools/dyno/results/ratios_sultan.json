@@ -1,0 +1,34 @@
+{
+  "label": "ratios_sultan",
+  "topspeed_mph": 70.4,
+  "topspeed_ms": 31.49,
+  "0-60mph_s": 4.262,
+  "0-100mph_s": null,
+  "dist_m": 114.2,
+  "final_gear": 2,
+  "top_gear_seen": 2,
+  "duration_s": 5.99,
+  "shifts": [
+    {
+      "gear": "1->2",
+      "ms": 3026,
+      "mph": 51.5,
+      "rpm": 0.919
+    }
+  ],
+  "samples": 656,
+  "maxFlatVel": 48.333,
+  "topGear": 5,
+  "driveGears": 5,
+  "ratios": [
+    0.0,
+    -3.3333,
+    3.3333,
+    1.9245,
+    1.358,
+    1.0541,
+    0.9,
+    0.0,
+    0.0
+  ]
+}

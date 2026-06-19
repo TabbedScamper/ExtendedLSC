@@ -1,0 +1,48 @@
+================================================================
+  ExtendedLSC (ELSC)  —  PRE-RELEASE / WORK IN PROGRESS
+================================================================
+
+A single-player GTA V mod that rebuilds Los Santos Customs and lets vehicle
+modders organize custom parts into their own named categories.
+
+⚠️  This is a WORK IN PROGRESS. Expect rough edges. Single-player only.
+
+----------------------------------------------------------------
+REQUIREMENTS
+----------------------------------------------------------------
+1. GTA V (story mode)
+2. ScriptHookV (Alexander Blade)
+3. ScriptHookVDotNet 3
+4. .NET Framework 4.8 (built into Windows 10/11)
+
+----------------------------------------------------------------
+INSTALL
+----------------------------------------------------------------
+Copy the THREE DLLs from this "scripts" folder into your game's
+"scripts" folder:
+
+    scripts\ExtendedLSC.dll
+    scripts\LemonUI.SHVDN3.dll
+    scripts\Newtonsoft.Json.dll
+
+(Do NOT copy ScriptHookVDotNet3.dll — it comes with your SHVDN3 install.)
+
+Launch story mode, get in a vehicle, press F5.
+
+----------------------------------------------------------------
+OPTIONAL: the PURE Quad example menu
+----------------------------------------------------------------
+The repo's  examples\PURE-Quad\Vehicles\blazer4\  folder is a ready-made
+ELSC menu for the PURE quad add-on. Drop it into
+    scripts\ExtendedLSC\Vehicles\
+(requires the PURE vehicle, distributed separately).
+
+----------------------------------------------------------------
+ANTIVIRUS
+----------------------------------------------------------------
+Like all memory-editing SHVDN mods, ELSC may trip a false positive. It is
+single-player only and makes NO network connections. Add your GTA folder to
+your AV exclusions, or build the DLL yourself from source.
+
+Full docs, controls, and the modder guide are in the GitHub repo:
+README.md, INSTALL.md, docs/CUSTOM-MENUS.md, docs/DISCOVERIES.md

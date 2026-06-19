@@ -1,8 +1,12 @@
 # ExtendedLSC — Install
 
-A single-player GTA V mod that supercharges **Los Santos Customs**: a deep vehicle-customization menu,
-**wheel fitment / stance** (offset, camber, width), a **manual transmission** with a clutch, and a
-custom **NFS-style drag HUD** with a NOS mechanic. SHVDN3 / .NET Framework 4.8.
+A single-player GTA V mod that supercharges **Los Santos Customs**: a deep vehicle-customization menu that
+lets modders **organize custom parts into their own named categories** (Edit Mode), **wheel fitment /
+stance** (offset, camber, width), a **manual transmission** with a clutch + NOS, a **walk-around camera**,
+and fully **remappable controls with on-screen device glyphs**. SHVDN3 / .NET Framework 4.8.
+
+> **⚠️ Work in progress / pre-release** — expect rough edges. See the [README](README.md) for the full
+> feature list, and [docs/CUSTOM-MENUS.md](docs/CUSTOM-MENUS.md) if you're a modder shipping a menu.
 
 > Single-player only. Run offline in story mode.
 
@@ -57,6 +61,20 @@ BannerPath=           ; optional custom banner image
 EnableLogging=false   ; leave off for normal play (on = writes ExtendedLSC.log)
 ShowDebugInfo=false
 ```
+
+---
+
+## Controls & features (`ExtendedLSC\settings.ini`)
+On first run the mod also creates `ExtendedLSC\settings.ini`, which has a **`[Controls]`** section where you
+can remap **every** binding (menu key, edit-mode keys, walk-around, manual transmission, nitrous) — keyboard
+keys by name, controller buttons by index. The on-screen button glyphs auto-match your device. You can also
+remap everything **in-game** from the CONTROLS menu (in Edit Mode). Toggle optional features (camera,
+fitment, manual transmission, etc.) in the same file.
+
+## Edit Mode (for modders)
+Set `EditorMode = true` in `settings.ini` (`[Developer]`), open the menu, and press **F6**. You can create
+your own categories, re-shelve/rename parts, hide default categories, and ship the result with your vehicle.
+Full guide: [docs/CUSTOM-MENUS.md](docs/CUSTOM-MENUS.md).
 
 ---
 

@@ -1,0 +1,52 @@
+{
+  "label": "feat_dom",
+  "topspeed_mph": 110.5,
+  "topspeed_ms": 49.42,
+  "0-60mph_s": 2.914,
+  "0-100mph_s": 6.618,
+  "dist_m": 603.6,
+  "final_gear": 5,
+  "top_gear_seen": 5,
+  "duration_s": 15.6,
+  "shifts": [
+    {
+      "gear": "1->2",
+      "ms": 1658,
+      "mph": 19.1,
+      "rpm": 0.899
+    },
+    {
+      "gear": "2->3",
+      "ms": 2270,
+      "mph": 44.8,
+      "rpm": 0.879
+    },
+    {
+      "gear": "3->4",
+      "ms": 2876,
+      "mph": 58.6,
+      "rpm": 0.944
+    },
+    {
+      "gear": "4->5",
+      "ms": 4288,
+      "mph": 79.7,
+      "rpm": 0.927
+    }
+  ],
+  "samples": 898,
+  "maxFlatVel": 48.333,
+  "topGear": 5,
+  "driveGears": 5,
+  "ratios": [
+    0.0,
+    -3.3333,
+    3.3333,
+    2.4028,
+    1.732,
+    1.2485,
+    0.9,
+    0.0,
+    0.0
+  ]
+}

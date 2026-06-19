@@ -1,0 +1,34 @@
+{
+  "MenuTitle": "Front Fenders",
+  "Description": "Front Fenders for Body 2.",
+  "Items": [
+    {
+      "Name": "Front Fender 2",
+      "Description": "Front Fenders for Body 2.",
+      "Price": 1500,
+      "Value": 4,
+      "SourceModType": 2
+    },
+    {
+      "Name": "Front Fender 3",
+      "Description": "Front Fenders for Body 2.",
+      "Price": 1500,
+      "Value": 5,
+      "SourceModType": 2
+    },
+    {
+      "Name": "Front Fender 4",
+      "Description": "Front Fenders for Body 2.",
+      "Price": 1500,
+      "Value": 6,
+      "SourceModType": 2
+    },
+    {
+      "Name": "Front Fender 5",
+      "Description": "Front Fenders for Body 2.",
+      "Price": 1500,
+      "Value": 7,
+      "SourceModType": 2
+    }
+  ]
+}

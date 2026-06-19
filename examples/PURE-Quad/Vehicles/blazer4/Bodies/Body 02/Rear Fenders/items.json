@@ -1,0 +1,34 @@
+{
+  "MenuTitle": "Rear Fenders",
+  "Description": "Rear Fenders for Body 2.",
+  "Items": [
+    {
+      "Name": "Rear Fender 2",
+      "Description": "Rear Fenders for Body 2.",
+      "Price": 1500,
+      "Value": 4,
+      "SourceModType": 0
+    },
+    {
+      "Name": "Rear Fender 3",
+      "Description": "Rear Fenders for Body 2.",
+      "Price": 1500,
+      "Value": 5,
+      "SourceModType": 0
+    },
+    {
+      "Name": "Rear Fender 4",
+      "Description": "Rear Fenders for Body 2.",
+      "Price": 1500,
+      "Value": 6,
+      "SourceModType": 0
+    },
+    {
+      "Name": "Rear Fender 5",
+      "Description": "Rear Fenders for Body 2.",
+      "Price": 1500,
+      "Value": 7,
+      "SourceModType": 0
+    }
+  ]
+}

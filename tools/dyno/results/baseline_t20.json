@@ -1,0 +1,38 @@
+{
+  "label": "baseline_t20",
+  "topspeed_mph": 109.3,
+  "topspeed_ms": 48.88,
+  "0-60mph_s": 2.679,
+  "0-100mph_s": 9.829,
+  "dist_m": 605.6,
+  "final_gear": 5,
+  "top_gear_seen": 5,
+  "duration_s": 16.08,
+  "shifts": [
+    {
+      "gear": "1->2",
+      "ms": 1315,
+      "mph": 26.8,
+      "rpm": 0.918
+    },
+    {
+      "gear": "2->3",
+      "ms": 2277,
+      "mph": 55.8,
+      "rpm": 0.918
+    },
+    {
+      "gear": "3->4",
+      "ms": 4608,
+      "mph": 77.9,
+      "rpm": 0.915
+    },
+    {
+      "gear": "4->5",
+      "ms": 9618,
+      "mph": 99.5,
+      "rpm": 0.92
+    }
+  ],
+  "samples": 1763
+}

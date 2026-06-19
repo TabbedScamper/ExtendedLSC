@@ -1,0 +1,38 @@
+{
+  "label": "baseline_futo",
+  "topspeed_mph": 103.1,
+  "topspeed_ms": 46.11,
+  "0-60mph_s": 5.074,
+  "0-100mph_s": 14.805,
+  "dist_m": 603.7,
+  "final_gear": 5,
+  "top_gear_seen": 5,
+  "duration_s": 18.5,
+  "shifts": [
+    {
+      "gear": "1->2",
+      "ms": 1743,
+      "mph": 15.7,
+      "rpm": 1.0
+    },
+    {
+      "gear": "2->3",
+      "ms": 3599,
+      "mph": 47.4,
+      "rpm": 0.915
+    },
+    {
+      "gear": "3->4",
+      "ms": 5679,
+      "mph": 67.6,
+      "rpm": 0.919
+    },
+    {
+      "gear": "4->5",
+      "ms": 10701,
+      "mph": 87.2,
+      "rpm": 0.92
+    }
+  ],
+  "samples": 2081
+}

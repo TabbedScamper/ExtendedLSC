@@ -1,0 +1,69 @@
+{
+  "MenuTitle": "Front Bumpers",
+  "Description": "PURE front bumpers.",
+  "Items": [
+    {
+      "Name": "Bumper 2",
+      "Description": "PURE bumper 2.",
+      "Price": 2000,
+      "Value": 0,
+      "SourceModType": 1
+    },
+    {
+      "Name": "Bumper 3",
+      "Description": "PURE bumper 3.",
+      "Price": 2000,
+      "Value": 1,
+      "SourceModType": 1
+    },
+    {
+      "Name": "Bumper 4",
+      "Description": "PURE bumper 4.",
+      "Price": 2000,
+      "Value": 2,
+      "SourceModType": 1
+    },
+    {
+      "Name": "Bumper 5",
+      "Description": "PURE bumper 5.",
+      "Price": 2000,
+      "Value": 3,
+      "SourceModType": 1
+    },
+    {
+      "Name": "Bumper 6",
+      "Description": "PURE bumper 6.",
+      "Price": 2000,
+      "Value": 4,
+      "SourceModType": 1
+    },
+    {
+      "Name": "Bumper 7",
+      "Description": "PURE bumper 7.",
+      "Price": 2000,
+      "Value": 5,
+      "SourceModType": 1
+    },
+    {
+      "Name": "Bumper 8",
+      "Description": "PURE bumper 8.",
+      "Price": 2000,
+      "Value": 6,
+      "SourceModType": 1
+    },
+    {
+      "Name": "Bumper 9",
+      "Description": "PURE bumper 9.",
+      "Price": 2000,
+      "Value": 7,
+      "SourceModType": 1
+    },
+    {
+      "Name": "Bumper 10",
+      "Description": "PURE bumper 10.",
+      "Price": 2000,
+      "Value": 8,
+      "SourceModType": 1
+    }
+  ]
+}

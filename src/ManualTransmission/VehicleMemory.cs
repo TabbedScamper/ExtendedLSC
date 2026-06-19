@@ -430,6 +430,18 @@ namespace ExtendedLSC.ManualTransmission
 
         #region Write Functions
 
+        /// <summary>Write a gear's ratio (index 0 = reverse-area, 2 = 1st, 3 = 2nd, ... top = N+1). Used by
+        /// the NFS gearing template to space gears for a consistent RPM drop per shift.</summary>
+        public static void SetGearRatio(Vehicle vehicle, int gear, float ratio)
+        {
+            if (!_available || _gearRatiosOffset == 0 || gear < 0 || gear > 10) return;
+            IntPtr addr = GetVehicleAddress(vehicle);
+            if (addr == IntPtr.Zero) return;
+            byte[] buffer = BitConverter.GetBytes(ratio);
+            int bytesWritten;
+            WriteProcessMemory(GetCurrentProcess(), addr + _gearRatiosOffset + gear * 4, buffer, 4, out bytesWritten);
+        }
+
         public static void SetCurrentGear(Vehicle vehicle, ushort gear)
         {
             if (!_available || _currentGearOffset == 0) return;

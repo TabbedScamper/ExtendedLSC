@@ -1,0 +1,13 @@
+{
+  "MenuTitle": "Sprockets",
+  "Description": "PURE sprockets.",
+  "Items": [
+    {
+      "Name": "Sprocket 2",
+      "Description": "PURE sprocket 2.",
+      "Price": 600,
+      "Value": 0,
+      "SourceModType": 40
+    }
+  ]
+}

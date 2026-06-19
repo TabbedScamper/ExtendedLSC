@@ -1,0 +1,52 @@
+{
+  "label": "spk_dominator",
+  "topspeed_mph": 107.5,
+  "topspeed_ms": 48.05,
+  "0-60mph_s": 4.122,
+  "0-100mph_s": 12.449,
+  "dist_m": 604.6,
+  "final_gear": 5,
+  "top_gear_seen": 5,
+  "duration_s": 17.66,
+  "shifts": [
+    {
+      "gear": "1->2",
+      "ms": 1709,
+      "mph": 15.7,
+      "rpm": 0.878
+    },
+    {
+      "gear": "2->3",
+      "ms": 2836,
+      "mph": 41.8,
+      "rpm": 0.939
+    },
+    {
+      "gear": "3->4",
+      "ms": 3563,
+      "mph": 53.9,
+      "rpm": 0.871
+    },
+    {
+      "gear": "4->5",
+      "ms": 7004,
+      "mph": 77.8,
+      "rpm": 0.905
+    }
+  ],
+  "samples": 1909,
+  "maxFlatVel": 48.333,
+  "topGear": 5,
+  "driveGears": 5,
+  "ratios": [
+    0.0,
+    -3.3333,
+    3.3333,
+    2.4028,
+    1.732,
+    1.2485,
+    0.9,
+    0.0,
+    0.0
+  ]
+}

@@ -49,6 +49,9 @@ namespace ExtendedLSC
             // Wheel fitment data
             public FitmentData Fitment { get; set; } = new FitmentData();
 
+            // Handling fine-tune data (Vehicle Tuning category)
+            public TuningData Tuning { get; set; } = new TuningData();
+
             // Custom config-based items: Key = category path (e.g. "Wheels/Tires/Tire Smoke"), Value = list of purchased item values
             public Dictionary<string, List<int>> PurchasedCustomItems { get; set; } = new Dictionary<string, List<int>>();
 
@@ -75,6 +78,24 @@ namespace ExtendedLSC
             public float StockFake { get; set; } = 0f;    // clean suspension-mod base for ride height (anti-drift)
             public float VisualSize { get; set; } = 1f;   // wheel size multiplier (1 = stock)
             public float VisualWidth { get; set; } = 1f;  // wheel width multiplier (1 = stock)
+        }
+
+        // Handling fine-tune: multipliers vs factory stock for force fields (1 = stock), absolute for the
+        // bias/lock fields (-1 = "leave at stock"). Unlocked = the one-time dyno fee has been paid for this car.
+        public class TuningData
+        {
+            public bool Unlocked { get; set; } = false;
+            public float TorqueMult { get; set; } = 1f;       // fInitialDriveForce
+            public float TopSpeedMult { get; set; } = 1f;     // fInitialDriveMaxFlatVel
+            public float GripMult { get; set; } = 1f;         // fTractionCurveMax
+            public float BrakeForceMult { get; set; } = 1f;   // fBrakeForce
+            public float SteerLockMult { get; set; } = 1f;    // fSteeringLock
+            public float DriveBias { get; set; } = -1f;       // fDriveBiasFront 0..1 (-1 = stock)
+            public float BrakeBias { get; set; } = -1f;       // fBrakeBiasFront 0..1 (-1 = stock)
+            public int GearCount { get; set; } = 0;            // extra gears over stock (0 = stock; gated by engine)
+            // Absolute overrides for extended handling fields (keyed by handling.meta tag, e.g. "fSuspensionForce").
+            // Reserved for the suspension/anti-roll controls + setup save/load. Empty = all stock.
+            public Dictionary<string, float> Fields { get; set; } = new Dictionary<string, float>();
         }
 
         #endregion
@@ -266,6 +287,25 @@ namespace ExtendedLSC
             data.Fitment = fitment;
             _isDirty = true;
             Log?.Invoke($"[SaveData] Saved fitment for {vehicleName}: FC={fitment.FrontCamber:F3} RC={fitment.RearCamber:F3}");
+        }
+
+        /// <summary>Get saved handling-tuning data for a vehicle (defaults = stock).</summary>
+        public static TuningData GetTuningData(string vehicleName)
+        {
+            if (_saveData == null) Load();
+            vehicleName = vehicleName.ToLowerInvariant();
+            if (_saveData.Vehicles.TryGetValue(vehicleName, out var data))
+                return data.Tuning ?? new TuningData();
+            return new TuningData();
+        }
+
+        /// <summary>Save handling-tuning data for a vehicle.</summary>
+        public static void SetTuningData(string vehicleName, TuningData tuning)
+        {
+            if (_saveData == null) Load();
+            vehicleName = vehicleName.ToLowerInvariant();
+            EnsureVehicle(vehicleName).Tuning = tuning;
+            _isDirty = true;
         }
 
         /// <summary>

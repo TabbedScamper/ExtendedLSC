@@ -1,0 +1,13 @@
+{
+  "MenuTitle": "Body 8",
+  "Description": "Body 8 shell + its fitment.",
+  "Items": [
+    {
+      "Name": "Body 8",
+      "Description": "PURE custom body 8.",
+      "Price": 8000,
+      "Value": 6,
+      "SourceModType": 10
+    }
+  ]
+}

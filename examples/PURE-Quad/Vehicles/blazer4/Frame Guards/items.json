@@ -1,0 +1,41 @@
+{
+  "MenuTitle": "Frame Guards",
+  "Description": "PURE frame guards.",
+  "Items": [
+    {
+      "Name": "Frame Guard 1",
+      "Description": "PURE frame guard 1.",
+      "Price": 700,
+      "Value": 0,
+      "SourceModType": 44
+    },
+    {
+      "Name": "Frame Guard 2",
+      "Description": "PURE frame guard 2.",
+      "Price": 700,
+      "Value": 1,
+      "SourceModType": 44
+    },
+    {
+      "Name": "Frame Guard 3",
+      "Description": "PURE frame guard 3.",
+      "Price": 700,
+      "Value": 2,
+      "SourceModType": 44
+    },
+    {
+      "Name": "Frame Guard 4",
+      "Description": "PURE frame guard 4.",
+      "Price": 700,
+      "Value": 3,
+      "SourceModType": 44
+    },
+    {
+      "Name": "Frame Guard 5",
+      "Description": "PURE frame guard 5.",
+      "Price": 700,
+      "Value": 4,
+      "SourceModType": 44
+    }
+  ]
+}

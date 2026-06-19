@@ -1,0 +1,20 @@
+{
+  "MenuTitle": "Radiator Scoops",
+  "Description": "Radiator Scoops for Body 4.",
+  "Items": [
+    {
+      "Name": "Radiator Scoop 2",
+      "Description": "Radiator Scoops for Body 4.",
+      "Price": 1200,
+      "Value": 5,
+      "SourceModType": 6
+    },
+    {
+      "Name": "Radiator Scoop 3",
+      "Description": "Radiator Scoops for Body 4.",
+      "Price": 1200,
+      "Value": 6,
+      "SourceModType": 6
+    }
+  ]
+}

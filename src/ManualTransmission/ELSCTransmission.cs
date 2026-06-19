@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Drawing;
 using GTA;
 using GTA.Native;
 
@@ -53,8 +55,8 @@ namespace ExtendedLSC.ManualTransmission
 
         // Perfect shift (NFS drag style): shifting up in the sweet spot is rewarded ONLY with a
         // "GREAT SHIFT!" callout — no power boost (we want skill-feedback, not a Forza torque cheat).
-        public float PerfectShiftMin { get; set; } = 0.80f;
-        public float PerfectShiftMax { get; set; } = 0.97f;
+        public float PerfectShiftMin { get; set; } = 0.90f;
+        public float PerfectShiftMax { get; set; } = 0.98f;
         private int _perfectFlashUntil = 0;                     // "GREAT SHIFT!" popup window
         public bool LastShiftPerfect { get; private set; } = false;
 
@@ -63,10 +65,36 @@ namespace ExtendedLSC.ManualTransmission
         public float NosLevel { get; set; } = 1f;              // 0..1 bottle fill
         public bool NosActive { get; private set; } = false;
         public float NosDrainPerSec { get; set; } = 0.40f;     // ~2.5s of continuous boost
-        public float NosRefillPerSec { get; set; } = 0.09f;    // slow passive refill
+        public float NosRefillPerSec { get; set; } = 0.015f;   // super-slow passive refill (~65s to fill)
+        public float PerfectShiftNosBump { get; set; } = 0.06f; // a great shift tops up the bottle a little
         public float NosPowerMult { get; set; } = 1.85f;       // torque multiplier while spraying
         public float NosShove { get; set; } = 4.0f;            // extra forward m/s^2 kick while spraying
+        public bool NosBoostFx { get; set; } = true;           // SET_VEHICLE_BOOST_ACTIVE whoosh + screen blur
+        public Color NosFlameColor { get; set; } = Color.FromArgb(255, 60, 120, 255); // exhaust flame tint (blue)
         private System.Windows.Forms.Keys _nosKey = System.Windows.Forms.Keys.N;
+        private bool _nosWasActive = false;
+        private static readonly string[] _exhaustBones =
+            { "exhaust", "exhaust_2", "exhaust_3", "exhaust_4", "exhaust_5", "exhaust_6", "exhaust_7" };
+        private const ulong SET_VEHICLE_BOOST_ACTIVE_HASH = 0x4A04DE7CAB2739A1;
+        // Real LS Tuners nitrous flame (proper lifecycle: install on spray edge, uninstall on release).
+        private const ulong SET_OVERRIDE_NITROUS_LEVEL_HASH = 0xC8E9B6B71B8E660D;
+        private const ulong SET_NITROUS_IS_VISIBLE_HASH = 0x465EEA70AF251045;
+        private const ulong SET_NITROUS_IS_ACTIVE_HASH = 0x9E566EA551F4F1A6;
+        private const ulong FULLY_CHARGE_NITROUS_HASH = 0x1A2BCC8C636F9226;
+        private const ulong CLEAR_NITROUS_HASH = 0xC889AE921400E1ED;
+        private bool _nitrousOn = false;            // true while the native nitrous flame is running
+        private Vehicle _nitrousVeh = null;         // the vehicle it's installed on (to strip on release)
+        private const string NITROUS_SENTINEL = "@nitrous";  // catalog Dict marker for the native-nitrous entry
+
+        /// <summary>Fully strip the game's nitrous system off a vehicle (uninstall override + hide + deactivate + clear).</summary>
+        private void StripNitrous(Vehicle veh)
+        {
+            if (veh == null || !veh.Exists()) return;
+            Function.Call((Hash)SET_NITROUS_IS_ACTIVE_HASH, veh.Handle, false);
+            Function.Call((Hash)SET_OVERRIDE_NITROUS_LEVEL_HASH, veh.Handle, false, 0f, 0f, 0f, true);
+            Function.Call((Hash)SET_NITROUS_IS_VISIBLE_HASH, veh.Handle, false);
+            Function.Call((Hash)CLEAR_NITROUS_HASH, veh.Handle);
+        }
 
         // Anti-bog (arcade forgiveness): too high a gear at low RPM never stalls — a hidden torque
         // assist keeps the car pulling away, just lazily.
@@ -89,14 +117,66 @@ namespace ExtendedLSC.ManualTransmission
         // brakes hard once the car gets within this range of it (no more desert excursions).
         private GTA.Math.Vector3 _runwayEnd = default(GTA.Math.Vector3);
         private bool _runwayEndLoaded = false;
+        // Dyno start: if scripts/ExtendedLSC/runway_start.txt exists ("x;y;z;heading"), an autorun first
+        // teleports the car here, zeroes velocity, and settles for a moment so every run starts identical.
+        private GTA.Math.Vector3 _runwayStart = default(GTA.Math.Vector3);
+        private float _runwayStartHeading = 0f;
+        private bool _runwayStartLoaded = false;
+        private bool _staging = false;       // teleported, holding still, letting suspension settle
+        private int _stageUntil = 0;         // settle window end
+        private int _stageSecs = 8;          // run length to start once staging completes
         private int _autoBrakeUntil = 0;
         private float _lastTorqueMult = 1f;
+        // NFS-style upshift "kick": a brief power surge the moment a new gear engages, so every shift has a
+        // satisfying punch (stronger when timed at the sweet spot). Identical on every car = consistent feel.
+        private int _shiftKickUntil = 0;
+        private float _shiftKickForce = 0f;      // forward lunge (m/s^2) — the punch you FEEL, set per shift
+        private float _shiftKickPower = 0f;      // small added engine power for the note (kept low so the
+                                                 // tires don't break loose → no post-shift RPM spike)
+        private const int ShiftKickMs = 380;
+        public float ShiftKickForceBase { get; set; } = 16f;       // tunable (INI)
+        public float ShiftKickForcePerfect { get; set; } = 30f;    // tunable (INI)
+        private const float ShiftKickPowerBase = 0.25f;
+        private const float ShiftKickPowerPerfect = 0.45f;
+        // Shift feedback: controller rumble + exhaust pop + downshift over-rev guard (all tunable).
+        public bool RumbleEnabled { get; set; } = true;
+        public bool ExhaustPops { get; set; } = true;
+        public float OverRevLimit { get; set; } = 1.02f;   // downshift refused if it would exceed this RPM
+        private int _shiftPopUntil = 0;
+        private int _popTick = 0;
+        private const int ShiftPopMs = 130;
+        // Dyno realism: a human never shifts at the exact same RPM twice, so randomize the auto-shift point
+        // each gear (early-lug .. redline). This exercises imperfect shifts and surfaces any "acts strange
+        // when not perfect" gearing behavior the old fixed-point harness always hid.
+        private readonly Random _dynoRng = new Random();
+        private float _dynoShiftRpm = 0.92f;
+        // Rev limiter (bounce): hold each gear AT its redline instead of mushing past the ratio ceiling. The
+        // engine "bounces" off the limiter (NFS feel) and the car stops gaining speed → a clear shift point.
+        // Non-latching: a TIME-based cut/on cycle (not RPM-based) so the forced on-phase keeps it from dying,
+        // and the moment you upshift (RPM drops below the limit) it releases on its own.
+        public float LimiterRpm { get; set; } = 0.985f;   // tunable (INI)
+        private const int LimiterCutMs = 130;   // mostly cut: the brief on-phase is just for the audible bounce,
+        private const int LimiterOnMs = 12;     // not enough power to keep accelerating past the ceiling
+        private const float LimiterMinSpeed = 6f;  // don't limit at launch (wheelspin reads false-high RPM)
+        private bool _limiterCut = false;
         private const ulong SET_CONTROL_VALUE_NEXT_FRAME_HASH = 0xE8A25867FBA3B05E;
         private const ulong SET_VEHICLE_CHEAT_POWER_INCREASE_HASH = 0xB59E4BD37AE292DB;
         private static string DataDir => System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ExtendedLSC");
 
         // Read-only state
         public bool IsEnabled => _enabled;
+
+        // Dyno (dev tool): cheap throttled poll for a pending autorun trigger, so Main can force-enable MT
+        // on ANY car (even without MT purchased) and the dyno harness can run on it.
+        private int _dynoPollTick = 0;
+        private bool _dynoPendingCached = false;
+        public bool DynoPending()
+        {
+            if ((++_dynoPollTick % 20) != 0) return _dynoPendingCached;
+            try { _dynoPendingCached = System.IO.File.Exists(System.IO.Path.Combine(DataDir, "autorun.txt")); }
+            catch { _dynoPendingCached = false; }
+            return _dynoPendingCached;
+        }
         public bool InNeutral => _inNeutral;
         public bool InReverse => _inReverse;
         public ushort CurrentGear => _targetGear;
@@ -127,6 +207,9 @@ namespace ExtendedLSC.ManualTransmission
             _vehicle = vehicle;
             if (vehicle != null && vehicle.Exists())
             {
+                // Strip any game nitrous a prior build installed on this car (it would auto-trigger + never stop).
+                StripNitrous(vehicle);
+
                 // Read current gear state
                 _targetGear = VehicleMemory.GetCurrentGear(vehicle);
                 if (_targetGear == 0) _targetGear = 1;
@@ -166,7 +249,32 @@ namespace ExtendedLSC.ManualTransmission
             // fights the pinned gear every physics step and torque dies (see VehicleMemory patches).
             VehicleMemory.ApplyShiftPatches();
 
+            // NFS gearing: re-space the gears so every upshift drops RPM by the same satisfying amount.
+            ApplyNfsGearing(_vehicle);
+
+            // Natural exhaust crackle/pops on deceleration (off-throttle) — the NFS anti-lag sound.
+            Function.Call((Hash)0x2BE4BC731D039D5A, true);   // ENABLE_VEHICLE_EXHAUST_POPS
+
             Log?.Invoke($"[ELSCTransmission] Enabled (Arcade Mode), gear: {_targetGear}, top gear: {_cachedTopGear}");
+        }
+
+        // Stock GTA gear ratios bunch up at the top (4th->5th is only a ~15% RPM drop), so upper-gear upshifts
+        // barely move the tach and the shift kick is wasted. Re-space every gear GEOMETRICALLY between the
+        // universal 1st (3.33) and top (0.90) ratios → a constant ~RPM drop per shift on EVERY car, so shifts
+        // feel meaty and consistent (the NFS feel). 1st and top stay stock, so launch + top speed are unchanged.
+        private const float NfsGearFirst = 3.3333f;
+        private const float NfsGearTop = 0.90f;
+        public void ApplyNfsGearing(Vehicle v)
+        {
+            if (v == null || !v.Exists()) return;
+            int n = VehicleMemory.GetTopGear(v);   // drive gear count
+            if (n < 2 || n > 10) return;
+            for (int g = 1; g <= n; g++)
+            {
+                float t = (g - 1) / (float)(n - 1);                                   // 0..1 across the gears
+                float ratio = NfsGearFirst * (float)Math.Pow(NfsGearTop / NfsGearFirst, t);
+                VehicleMemory.SetGearRatio(v, g + 1, ratio);                          // array index 2 = 1st gear
+            }
         }
 
         /// <summary>
@@ -183,10 +291,138 @@ namespace ExtendedLSC.ManualTransmission
             // Give the game its automatic gearbox back
             VehicleMemory.RestoreShiftPatches();
 
+            if (_nosWasActive && _vehicle != null && _vehicle.Exists())
+                Function.Call((Hash)SET_VEHICLE_BOOST_ACTIVE_HASH, _vehicle.Handle, false);
+            _nosWasActive = false;
+            StopExhaustFlames();      // kill any looped exhaust flames
+            StripNitrous(_vehicle);   // strip any game nitrous left installed
+
             _enabled = false;
             _inNeutral = false;
             _inReverse = false;
             Log?.Invoke("[ELSCTransmission] Disabled");
+        }
+
+        /// <summary>
+        /// Fire one short "veh_backfire" flame out of every exhaust bone, tinted to <paramref name="color"/>.
+        /// veh_backfire is a brief pop (it doesn't truly loop), so this must be called EVERY FRAME to read as a
+        /// continuous flame — auto-disposing non-looped FX, so there are no handles to leak. Public so the LSC
+        /// menu can use it to preview the flame colour while the player holds the NOS button. The "core" asset is
+        /// requested on first use and the flames begin once it is resident.
+        /// </summary>
+        // ---- Exhaust-FX showcase ----
+        // A catalog of candidate exhaust effects (fire / fireworks / flare / spark) for the player to preview and
+        // pick from in the LSC menu, labelled NOS 1..N. Each entry carries its asset dict, effect name, a rearward
+        // rotation, and a scale. The fireworks entries are fully tint-aware; the baked-fire ones ignore colour.
+        // (Effects can't be bridge-tested — PTFX only start from the script tick — so these are evaluated live.)
+        public class ExhaustFx
+        {
+            public string Name, Dict, Effect;
+            public float RotX, RotY, RotZ, Scale;
+            public bool Looped;            // continuous effects only start LOOPED; quick pops don't
+            public float Drain;            // bottle drain per second (higher = faster burn / shorter)
+            public float Power;            // engine torque multiplier while spraying (sustained accel)
+            public float Shove;            // extra forward m/s^2 kick while spraying (instant push)
+            public bool Colorable;         // true if the flame honours the chosen colour (tint-aware)
+            public string Buff;            // short description of this tier's unique buff
+            public ExhaustFx(string name, string dict, string effect, float rx, float ry, float rz, float scale,
+                             bool looped, float drain, float power, float shove, bool colorable, string buff)
+            {
+                Name = name; Dict = dict; Effect = effect; RotX = rx; RotY = ry; RotZ = rz; Scale = scale;
+                Looped = looped; Drain = drain; Power = power; Shove = shove; Colorable = colorable; Buff = buff;
+            }
+        }
+
+        public static readonly ExhaustFx[] FxCatalog =
+        {
+            //                name                 dict             effect                           rX rY  rZ   scl    loop  drain   power  shove color  buff
+            // drain scaled so the LONGEST variant (NOS 3) lasts 5s on a full bottle; others kept proportional.
+            new ExhaustFx("NOS 1: Muzzle Flash",  "scr_carsteal4", "scr_carsteal5_car_muzzle_flash", 0f, 0f, -90f, 1.5f, false, 0.85f,  1.18f, 9.0f, false, "Launch kick - huge instant push, burns out fast (~1.2s)"),
+            new ExhaustFx("NOS 2: Backfire",      "core",          "veh_backfire",                   0f, 0f,  0f,  1.3f, false, 0.46f,  1.60f, 1.5f, false, "Acceleration - strong sustained pull, low kick (~2.2s)"),
+            new ExhaustFx("NOS 3: Nitrous Flame", "veh_xs_vehicle_mods", "veh_nitrous",              0f, 0f,  0f,  1.3f, true,  0.20f,  1.35f, 3.5f, false, "Endurance - moderate boost that lasts longest (~5s)"),
+            // NOS 4 (custom-colour tier) + the colour picker are deferred to a future update — they need a
+            // tint-respecting flame asset (veh_nitrous is baked blue; veh_backfire doesn't tint reliably).
+        };
+
+        public int ActiveFxIndex { get; set; } = 0;   // which catalog entry the live NOS spray uses
+        private const int FlameThrottle = 3;           // non-looped: emit every Nth call so pops don't stack each frame
+        private int _flameTick = 0;
+        private readonly List<int> _loopHandles = new List<int>();
+        private int _loopActiveFx = -1;                // catalog index of the looped effect currently running, or -1
+
+        /// <summary>Emit catalog effect <paramref name="fxIndex"/> out of every exhaust bone, tinted to colour.
+        /// Looped effects start once and stay until StopExhaustFlames(); non-looped pops are re-fired per call.</summary>
+        public void EmitExhaustFlames(Vehicle veh, Color color, int fxIndex)
+        {
+            if (veh == null || !veh.Exists()) return;
+            if (fxIndex < 0 || fxIndex >= FxCatalog.Length) fxIndex = 0;
+            ExhaustFx fx = FxCatalog[fxIndex];
+            if (fx.Dict == NITROUS_SENTINEL)
+            {
+                // Real nitrous flame: install on the first frame, keep it charged + active every frame so the
+                // GAME renders its own nitrous flames; StripNitrous() (on release) uninstalls so nothing persists.
+                if (!_nitrousOn)
+                {
+                    StopExhaustFlames();   // clear any prior particle
+                    Function.Call((Hash)SET_OVERRIDE_NITROUS_LEVEL_HASH, veh.Handle, true, 1f, 1f, 10f, true);
+                    _nitrousOn = true; _nitrousVeh = veh;
+                }
+                Function.Call((Hash)FULLY_CHARGE_NITROUS_HASH, veh.Handle);
+                Function.Call((Hash)SET_NITROUS_IS_ACTIVE_HASH, veh.Handle, true);
+                return;
+            }
+            if (_nitrousOn) { StripNitrous(_nitrousVeh); _nitrousOn = false; }     // switched off the nitrous effect
+            if (string.IsNullOrEmpty(fx.Dict)) { StopExhaustFlames(); return; }    // no-particle entry
+            if (!Function.Call<bool>(Hash.HAS_NAMED_PTFX_ASSET_LOADED, fx.Dict))
+            {
+                Function.Call(Hash.REQUEST_NAMED_PTFX_ASSET, fx.Dict);
+                return;
+            }
+            float r = color.R / 255f, g = color.G / 255f, b = color.B / 255f;
+
+            if (fx.Looped)
+            {
+                if (_loopActiveFx == fxIndex) return;   // already running this effect — leave it on
+                StopExhaustFlames();                    // switching effects: clear the old handles first
+                foreach (string bone in _exhaustBones)
+                {
+                    int bi = Function.Call<int>(Hash.GET_ENTITY_BONE_INDEX_BY_NAME, veh, bone);
+                    if (bi < 0) continue;
+                    Function.Call(Hash.USE_PARTICLE_FX_ASSET, fx.Dict);
+                    int h = Function.Call<int>(Hash.START_PARTICLE_FX_LOOPED_ON_ENTITY_BONE,
+                        fx.Effect, veh, 0f, 0f, 0f, fx.RotX, fx.RotY, fx.RotZ, bi, fx.Scale, false, false, false);
+                    if (h != 0)
+                    {
+                        Function.Call(Hash.SET_PARTICLE_FX_LOOPED_COLOUR, h, r, g, b, 0);
+                        _loopHandles.Add(h);
+                    }
+                }
+                _loopActiveFx = fxIndex;
+                return;
+            }
+
+            // Non-looped (brief pops) — re-fired every few frames for a continuous look.
+            if (_loopActiveFx != -1) StopExhaustFlames();
+            if (++_flameTick % FlameThrottle != 0) return;
+            foreach (string bone in _exhaustBones)
+            {
+                int bi = Function.Call<int>(Hash.GET_ENTITY_BONE_INDEX_BY_NAME, veh, bone);
+                if (bi < 0) continue;
+                Function.Call(Hash.USE_PARTICLE_FX_ASSET, fx.Dict);
+                Function.Call(Hash.SET_PARTICLE_FX_NON_LOOPED_COLOUR, r, g, b);
+                Function.Call(Hash.START_PARTICLE_FX_NON_LOOPED_ON_ENTITY_BONE,
+                    fx.Effect, veh, 0f, 0f, 0f, fx.RotX, fx.RotY, fx.RotZ, bi, fx.Scale, false, false, false);
+            }
+        }
+
+        /// <summary>Stop any looped exhaust-flame handles (call when the spray / preview ends).</summary>
+        public void StopExhaustFlames()
+        {
+            for (int i = 0; i < _loopHandles.Count; i++)
+                Function.Call(Hash.STOP_PARTICLE_FX_LOOPED, _loopHandles[i], 0);
+            _loopHandles.Clear();
+            _loopActiveFx = -1;
+            if (_nitrousOn) { StripNitrous(_nitrousVeh); _nitrousOn = false; }   // deactivate + uninstall native nitrous
         }
 
         /// <summary>
@@ -258,7 +494,10 @@ namespace ExtendedLSC.ManualTransmission
             float rpmAtShift = VehicleMemory.GetCurrentRPM(_vehicle);
             LastShiftPerfect = rpmAtShift >= PerfectShiftMin && rpmAtShift <= PerfectShiftMax;
             if (LastShiftPerfect)
+            {
                 _perfectFlashUntil = Game.GameTime + 800;   // "GREAT SHIFT!" callout (drawn in Update)
+                NosLevel = Math.Min(1f, NosLevel + PerfectShiftNosBump);   // reward: top up the NOS bottle
+            }
 
             // Instant shift (arcade - no clutch delay)
             _targetGear++;
@@ -266,6 +505,15 @@ namespace ExtendedLSC.ManualTransmission
             // Set the new gear immediately
             VehicleMemory.SetCurrentGear(_vehicle, _targetGear);
             VehicleMemory.SetNextGear(_vehicle, _targetGear);
+
+            // NFS-style shift kick: a forward lunge (+ small power bump) on the new gear, bigger on a perfect shift.
+            _shiftKickForce = LastShiftPerfect ? ShiftKickForcePerfect : ShiftKickForceBase;
+            _shiftKickPower = LastShiftPerfect ? ShiftKickPowerPerfect : ShiftKickPowerBase;
+            _shiftKickUntil = Game.GameTime + ShiftKickMs;
+
+            // Feedback: controller rumble (bigger on a perfect shift) + an exhaust backfire pop.
+            Rumble(LastShiftPerfect ? 200 : 110, LastShiftPerfect ? 230 : 150);
+            if (ExhaustPops && !NosActive) _shiftPopUntil = Game.GameTime + ShiftPopMs;
 
             // REV-MATCH SNAP: with the clutch dips patched out, the game only LERPS the rpm toward the
             // new gear's value (~0.8s glide that parks the tach at the top of every gear). Snap it from
@@ -320,8 +568,22 @@ namespace ExtendedLSC.ManualTransmission
                 return;
             }
 
+            // OVER-REV PROTECTION: refuse a downshift that would spin the engine past redline at this speed
+            // (e.g. slamming 5th->1st at 100mph). Same ratio convention as the rev-match below.
+            {
+                float rpmNow = VehicleMemory.GetCurrentRPM(_vehicle);
+                float rCur = VehicleMemory.GetGearRatio(_vehicle, _targetGear);
+                float rBelow = VehicleMemory.GetGearRatio(_vehicle, _targetGear - 1);
+                if (rCur > 0.01f && rBelow > rCur && rpmNow * (rBelow / rCur) > OverRevLimit)
+                {
+                    Rumble(130, 90);   // buzz to signal the blocked downshift
+                    return;
+                }
+            }
+
             // Instant shift
             _targetGear--;
+            Rumble(90, 110);
 
             // TRUE REV-MATCH from the real gear ratios (blip to exactly where the shorter gear puts
             // the revs at this speed; falls back to the old fixed bump if ratios are unreadable).
@@ -469,27 +731,23 @@ namespace ExtendedLSC.ManualTransmission
             // Owning the throttle field every frame ends the fight for good (same approach as ikt's MT).
             // (throttlePedal is computed below; the write happens after it's read.)
 
-            // Block auto-reverse in 1st gear when stopped
-            if (_targetGear == 1 && _vehicle.Speed < 0.5f)
+            // Block reverse while in a forward gear — you must shift to R to back up. The game reverses
+            // whenever the brake is held at a standstill; the old speed<0.5 guard let it slip through once the
+            // car rolled back past 0.5 m/s. Instead clamp ANY backward motion to a stop, every frame, any speed.
+            if (!_inReverse && !_inNeutral)
             {
-                // Disable brake to prevent reverse trigger, use handbrake instead
-                bool isBraking = Function.Call<bool>(Hash.IS_CONTROL_PRESSED, 0, INPUT_VEH_BRAKE);
-                if (isBraking)
-                {
-                    Function.Call(Hash.DISABLE_CONTROL_ACTION, 0, INPUT_VEH_BRAKE, true);
-                    // Apply handbrake to stop without reversing
-                    Function.Call(Hash.SET_VEHICLE_HANDBRAKE, _vehicle.Handle, true);
-                }
-                else
-                {
-                    Function.Call(Hash.SET_VEHICLE_HANDBRAKE, _vehicle.Handle, false);
-                }
+                var relVel = Function.Call<GTA.Math.Vector3>(Hash.GET_ENTITY_SPEED_VECTOR, _vehicle.Handle, true);
+                if (relVel.Y < -0.08f)   // moving backward in a forward gear -> snap the reverse out
+                    Function.Call(Hash.SET_VEHICLE_FORWARD_SPEED, _vehicle.Handle, 0f);
             }
 
             // === ENGINE FEEL (every frame) ===
             _cachedRPM = VehicleMemory.GetCurrentRPM(_vehicle);
             if (_updateCounter % 60 == 0)
+            {
                 _cachedTopGear = VehicleMemory.GetTopGear(_vehicle);
+                ApplyNfsGearing(_vehicle);   // re-assert the gearing template (cheap) in case the game reset it
+            }
             int now = Game.GameTime;
 
             // 1) NO LIMITER CUT — full power to each gear's ratio ceiling (see RedlineStart comment:
@@ -503,8 +761,20 @@ namespace ExtendedLSC.ManualTransmission
             _injectedGas = false;   // re-set by HandleAutorun at the end of this frame if still injecting
             float speedNow = _vehicle.Speed;
 
+            // REV LIMITER (bounce): when RPM reaches the limit under power, cut the engine on a short time
+            // cycle so the car HOLDS at redline instead of lugging past the gear's ceiling. Re-evaluated every
+            // frame and releases the instant a shift drops the RPM — so it never latches.
+            _limiterCut = false;
+            if (throttlePedal > 0.5f && speedNow > LimiterMinSpeed && _cachedRPM >= LimiterRpm)
+            {
+                int phase = now % (LimiterCutMs + LimiterOnMs);
+                _limiterCut = phase < LimiterCutMs;
+            }
+
             // Throttle takeover (see comment at the gear pin): pedal drives the engine, period.
-            if (throttlePedal > 0.05f)
+            if (_limiterCut)
+                VehicleMemory.SetThrottle(_vehicle, 0f);
+            else if (throttlePedal > 0.05f)
                 VehicleMemory.SetThrottle(_vehicle, throttlePedal);
 
             // 1a) (Removed gear-ceiling RPM hold: the clutch-drop patch fixes power delivery so RPM now
@@ -536,8 +806,23 @@ namespace ExtendedLSC.ManualTransmission
                 txt.Draw();
             }
 
-            // 2) TORQUE PIPELINE (anti-bog assist only — perfect shift gives NO power boost now).
+            // 2) TORQUE PIPELINE (anti-bog assist + NFS upshift kick).
             float mult = 1f;
+            // Shift kick: a decaying forward LUNGE (impulse force) — the punch you feel — plus a small power
+            // bump for the engine note. Delivering the punch as force (not raw engine power) means the wheels
+            // don't break loose, so there's no post-shift RPM spike (the old power-only kick spun the tires).
+            if (now < _shiftKickUntil)
+            {
+                float k = (_shiftKickUntil - now) / (float)ShiftKickMs;   // 1 -> 0
+                mult *= 1f + _shiftKickPower * k;
+                Function.Call(Hash.APPLY_FORCE_TO_ENTITY, _vehicle.Handle, 1,
+                    0f, _shiftKickForce * k * Game.LastFrameTime, 0f, 0f, 0f, 0f, 0, true, true, true, false, true);
+            }
+
+            // Exhaust backfire pop for a moment after an upshift, and a light rumble buzz while bouncing
+            // off the rev limiter.
+            if (now < _shiftPopUntil) EmitBackfirePop();
+            if (_limiterCut) Rumble(70, 70);
             // Anti-bog: in too high a gear at low RPM the GAME's drive force is literally ZERO
             // (measured: full pedal in 3rd at 6 m/s -> rpm pinned at idle, car decays to a stop),
             // so a torque multiplier can't help (0 x N = 0). Instead: a direct physical push that
@@ -566,23 +851,36 @@ namespace ExtendedLSC.ManualTransmission
             // handbrake itself only while NOS is eligible (throttle down + moving) so normal handbraking
             // still works at low/zero throttle. Keyboard N is the secondary fallback.
             bool nosBtn = NosInstalled &&
-                          (Function.Call<bool>(Hash.IS_CONTROL_PRESSED, 0, 76) || Game.IsKeyPressed(_nosKey));
+                          (Function.Call<bool>(Hash.IS_CONTROL_PRESSED, 0, ModSettings.NosButton) || Game.IsKeyPressed(ModSettings.NosKey));
             NosActive = nosBtn && NosLevel > 0.02f && throttlePedal > 0.45f && speedNow > 1.5f;
             if (NosActive)
             {
                 // Spraying under throttle: this is NOS, not a handbrake — suppress the handbrake input.
                 Function.Call(Hash.DISABLE_CONTROL_ACTION, 0, 76, true);
-                NosLevel = Math.Max(0f, NosLevel - NosDrainPerSec * dt);
-                mult *= NosPowerMult;
-                float dvN = NosShove * dt;
+                // Per-tier burn rate + boost from the selected NOS effect.
+                ExhaustFx tier = FxCatalog[(ActiveFxIndex >= 0 && ActiveFxIndex < FxCatalog.Length) ? ActiveFxIndex : 0];
+                NosLevel = Math.Max(0f, NosLevel - tier.Drain * dt);
+                mult *= tier.Power;
+                float dvN = tier.Shove * dt;
                 Function.Call(Hash.APPLY_FORCE_TO_ENTITY, _vehicle.Handle, 1,
                     0f, dvN, 0f, 0f, 0f, 0f, 0, true, true, true, false, true);
+                EmitExhaustFlames(_vehicle, NosFlameColor, ActiveFxIndex);   // selected catalog effect
+                // Boost whoosh + screen blur + its own flame — ALWAYS on while spraying, regardless of effect.
+                Function.Call((Hash)SET_VEHICLE_BOOST_ACTIVE_HASH, _vehicle.Handle, true);
             }
-            else if (!nosBtn && NosLevel < 1f)
+            else
             {
-                NosLevel = Math.Min(1f, NosLevel + NosRefillPerSec * dt);
+                if (_nosWasActive)
+                {
+                    StopExhaustFlames();
+                    Function.Call((Hash)SET_VEHICLE_BOOST_ACTIVE_HASH, _vehicle.Handle, false);
+                }
+                if (!nosBtn && NosLevel < 1f)
+                    NosLevel = Math.Min(1f, NosLevel + NosRefillPerSec * dt);
             }
+            _nosWasActive = NosActive;
 
+            if (_limiterCut) mult = 0f;   // rev-limiter fuel cut: no drive force this frame
             _lastTorqueMult = mult;
             Function.Call((Hash)SET_VEHICLE_CHEAT_POWER_INCREASE_HASH, _vehicle.Handle, mult);
 
@@ -612,6 +910,58 @@ namespace ExtendedLSC.ManualTransmission
         /// mode = auto | hold1), hold full throttle for that long, optionally auto-shifting in the
         /// perfect window, while logging per-frame CSV telemetry to run_telemetry.csv.
         /// </summary>
+        /// <summary>Dump the current car's gearbox to last_ratios.txt so the dyno tool can inspect the
+        /// per-gear ratio scale before we impose a normalized template. Format:
+        /// "maxFlatVel;topGear;driveGears;r0,r1,...,r8".</summary>
+        private void DumpRatios()
+        {
+            try
+            {
+                if (_vehicle == null || !_vehicle.Exists()) return;
+                float maxVel = WheelFitment.WheelMemory.GetHandlingFloat(_vehicle, WheelFitment.WheelMemory.HOFF_MAX_FLAT_VEL);
+                int topGear = VehicleMemory.GetTopGear(_vehicle);
+                int driveGears = WheelFitment.WheelMemory.GetHandlingGears(_vehicle);
+                var sb = new System.Text.StringBuilder();
+                sb.Append(maxVel.ToString("F3", System.Globalization.CultureInfo.InvariantCulture)).Append(';');
+                sb.Append(topGear).Append(';').Append(driveGears).Append(';');
+                for (int g = 0; g <= 8; g++)
+                {
+                    if (g > 0) sb.Append(',');
+                    sb.Append(VehicleMemory.GetGearRatio(_vehicle, g).ToString("F4", System.Globalization.CultureInfo.InvariantCulture));
+                }
+                System.IO.File.WriteAllText(System.IO.Path.Combine(DataDir, "last_ratios.txt"), sb.ToString());
+            }
+            catch (Exception ex) { Log?.Invoke($"[ELSC MT] DumpRatios error: {ex.Message}"); }
+        }
+
+        /// <summary>Controller rumble pulse (no-op if disabled or on keyboard). intensity 0..256.</summary>
+        private void Rumble(int durationMs, int intensity)
+        {
+            if (RumbleEnabled) Function.Call((Hash)0x48B3886C1358D0D5, 0, durationMs, intensity);   // SET_PAD_SHAKE
+        }
+
+        /// <summary>A quick orange backfire pop out of the exhausts (used on upshift). Independent of the NOS
+        /// flame state — non-looped, auto-disposing, so nothing to clean up.</summary>
+        private void EmitBackfirePop()
+        {
+            if (_vehicle == null || !_vehicle.Exists()) return;
+            if (!Function.Call<bool>(Hash.HAS_NAMED_PTFX_ASSET_LOADED, "core"))
+            {
+                Function.Call(Hash.REQUEST_NAMED_PTFX_ASSET, "core");
+                return;
+            }
+            if (++_popTick % 2 != 0) return;   // throttle so pops don't stack every frame
+            foreach (string bone in _exhaustBones)
+            {
+                int bi = Function.Call<int>(Hash.GET_ENTITY_BONE_INDEX_BY_NAME, _vehicle, bone);
+                if (bi < 0) continue;
+                Function.Call(Hash.USE_PARTICLE_FX_ASSET, "core");
+                Function.Call(Hash.SET_PARTICLE_FX_NON_LOOPED_COLOUR, 1f, 0.45f, 0.1f);   // orange flame pop
+                Function.Call(Hash.START_PARTICLE_FX_NON_LOOPED_ON_ENTITY_BONE,
+                    "veh_backfire", _vehicle, 0f, 0f, 0f, 0f, 0f, 0f, bi, 0.9f, false, false, false);
+            }
+        }
+
         private void HandleAutorun(int now)
         {
             try
@@ -621,6 +971,26 @@ namespace ExtendedLSC.ManualTransmission
                 {
                     Function.Call(Hash.ENABLE_CONTROL_ACTION, 0, INPUT_VEH_BRAKE, true);
                     Function.Call((Hash)SET_CONTROL_VALUE_NEXT_FRAME_HASH, 0, INPUT_VEH_BRAKE, 1.0f);
+                }
+
+                // Staging: car has been teleported to the start; hold it still until the suspension settles,
+                // then begin the timed full-throttle run from an identical launch every time.
+                if (_staging)
+                {
+                    Function.Call(Hash.SET_ENTITY_VELOCITY, _vehicle.Handle, 0f, 0f, 0f);
+                    Function.Call(Hash.SET_VEHICLE_HANDBRAKE, _vehicle.Handle, true);
+                    if (now >= _stageUntil)
+                    {
+                        _staging = false;
+                        Function.Call(Hash.SET_VEHICLE_HANDBRAKE, _vehicle.Handle, false);
+                        _autorunUntil = now + Math.Max(1, _stageSecs) * 1000;
+                        _runStartTime = now;
+                        _csv = new System.Text.StringBuilder("ms,speed,rpm,gear,throttle,mult\n");
+                        _dynoShiftRpm = 0.83f + (float)_dynoRng.NextDouble() * 0.14f;   // varied 1st->2nd point
+                        DumpRatios();
+                        Log?.Invoke($"[ELSC MT] AUTORUN launch: {_stageSecs}s mode={_autorunMode}");
+                    }
+                    return;
                 }
 
                 if (_autorunUntil == 0)
@@ -633,11 +1003,9 @@ namespace ExtendedLSC.ManualTransmission
                     int secs = 8;
                     int.TryParse(parts[0], out secs);
                     _autorunMode = parts.Length > 1 ? parts[1].Trim() : "auto";
-                    _autorunUntil = now + Math.Max(1, secs) * 1000;
-                    _runStartTime = now;
-                    _csv = new System.Text.StringBuilder("ms,speed,rpm,gear,throttle,mult\n");
-                    Function.Call(Hash.SET_VEHICLE_HANDBRAKE, _vehicle.Handle, false);
-                    // Load the runway end marker (if recorded) for proximity auto-stop
+                    _stageSecs = Math.Max(1, secs);
+
+                    // Load the runway start + end markers (once) for teleport-to-start and proximity auto-stop.
                     if (!_runwayEndLoaded)
                     {
                         _runwayEndLoaded = true;
@@ -656,7 +1024,44 @@ namespace ExtendedLSC.ManualTransmission
                         }
                         catch { }
                     }
-                    Log?.Invoke($"[ELSC MT] AUTORUN start: {secs}s mode={_autorunMode}");
+                    if (!_runwayStartLoaded)
+                    {
+                        _runwayStartLoaded = true;
+                        try
+                        {
+                            string startFile = System.IO.Path.Combine(DataDir, "runway_start.txt");
+                            if (System.IO.File.Exists(startFile))
+                            {
+                                var ps = System.IO.File.ReadAllText(startFile).Trim().Split(';');
+                                _runwayStart = new GTA.Math.Vector3(
+                                    float.Parse(ps[0], System.Globalization.CultureInfo.InvariantCulture),
+                                    float.Parse(ps[1], System.Globalization.CultureInfo.InvariantCulture),
+                                    float.Parse(ps[2], System.Globalization.CultureInfo.InvariantCulture));
+                                if (ps.Length > 3) float.TryParse(ps[3], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out _runwayStartHeading);
+                                Log?.Invoke($"[ELSC MT] Runway start marker loaded: {_runwayStart} hdg={_runwayStartHeading}");
+                            }
+                        }
+                        catch { }
+                    }
+
+                    // Teleport to the recorded start and stage, OR (no marker) launch from here immediately.
+                    if (_runwayStart != default(GTA.Math.Vector3))
+                    {
+                        Function.Call(Hash.SET_ENTITY_VELOCITY, _vehicle.Handle, 0f, 0f, 0f);
+                        Function.Call(Hash.SET_ENTITY_COORDS_NO_OFFSET, _vehicle.Handle, _runwayStart.X, _runwayStart.Y, _runwayStart.Z, false, false, false);
+                        Function.Call(Hash.SET_ENTITY_HEADING, _vehicle.Handle, _runwayStartHeading);
+                        Function.Call(Hash.SET_VEHICLE_HANDBRAKE, _vehicle.Handle, true);
+                        _staging = true;
+                        _stageUntil = now + 900;   // settle suspension before launch
+                        Log?.Invoke($"[ELSC MT] AUTORUN: teleported to start, staging {_stageSecs}s run");
+                        return;
+                    }
+
+                    _autorunUntil = now + _stageSecs * 1000;
+                    _runStartTime = now;
+                    _csv = new System.Text.StringBuilder("ms,speed,rpm,gear,throttle,mult\n");
+                    Function.Call(Hash.SET_VEHICLE_HANDBRAKE, _vehicle.Handle, false);
+                    Log?.Invoke($"[ELSC MT] AUTORUN start (no teleport): {secs}s mode={_autorunMode}");
                     return;
                 }
 
@@ -693,10 +1098,13 @@ namespace ExtendedLSC.ManualTransmission
                     // a minimum ground speed per gear before shifting (else 1->2->3 fires instantly and
                     // the run dies in a bogged high gear).
                     if (!coasting && (_autorunMode == "auto" || _autorunMode == "downs")
-                        && _cachedRPM >= 0.92f && _targetGear < _cachedTopGear
+                        && _cachedRPM >= _dynoShiftRpm && _targetGear < _cachedTopGear
                         && _vehicle.Speed > 7f * _targetGear
                         && (DateTime.Now - _lastShiftTime).TotalMilliseconds > 600)
+                    {
                         ShiftUp();
+                        _dynoShiftRpm = 0.83f + (float)_dynoRng.NextDouble() * 0.14f;   // next shift: 0.83..1.00
+                    }
 
                     _csv?.AppendFormat(System.Globalization.CultureInfo.InvariantCulture,
                         "{0},{1:F2},{2:F4},{3},{4:F3},{5:F2}\n",

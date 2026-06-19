@@ -1,0 +1,55 @@
+{
+  "MenuTitle": "Grips",
+  "Description": "PURE grips.",
+  "Items": [
+    {
+      "Name": "Grip 2",
+      "Description": "PURE grip 2.",
+      "Price": 400,
+      "Value": 0,
+      "SourceModType": 34
+    },
+    {
+      "Name": "Grip 3",
+      "Description": "PURE grip 3.",
+      "Price": 400,
+      "Value": 1,
+      "SourceModType": 34
+    },
+    {
+      "Name": "Grip 4",
+      "Description": "PURE grip 4.",
+      "Price": 400,
+      "Value": 2,
+      "SourceModType": 34
+    },
+    {
+      "Name": "Grip 5",
+      "Description": "PURE grip 5.",
+      "Price": 400,
+      "Value": 3,
+      "SourceModType": 34
+    },
+    {
+      "Name": "Grip 6",
+      "Description": "PURE grip 6.",
+      "Price": 400,
+      "Value": 4,
+      "SourceModType": 34
+    },
+    {
+      "Name": "Grip 7",
+      "Description": "PURE grip 7.",
+      "Price": 400,
+      "Value": 5,
+      "SourceModType": 34
+    },
+    {
+      "Name": "Grip 8",
+      "Description": "PURE grip 8.",
+      "Price": 400,
+      "Value": 6,
+      "SourceModType": 34
+    }
+  ]
+}

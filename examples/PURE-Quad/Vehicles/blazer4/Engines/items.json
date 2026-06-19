@@ -1,0 +1,34 @@
+{
+  "MenuTitle": "Engines",
+  "Description": "PURE engines.",
+  "Items": [
+    {
+      "Name": "Engine 2",
+      "Description": "PURE engine 2.",
+      "Price": 5500,
+      "Value": 0,
+      "SourceModType": 5
+    },
+    {
+      "Name": "Engine 3",
+      "Description": "PURE engine 3.",
+      "Price": 5500,
+      "Value": 1,
+      "SourceModType": 5
+    },
+    {
+      "Name": "Engine 4",
+      "Description": "PURE engine 4.",
+      "Price": 5500,
+      "Value": 2,
+      "SourceModType": 5
+    },
+    {
+      "Name": "Engine 5",
+      "Description": "PURE engine 5.",
+      "Price": 5500,
+      "Value": 3,
+      "SourceModType": 5
+    }
+  ]
+}

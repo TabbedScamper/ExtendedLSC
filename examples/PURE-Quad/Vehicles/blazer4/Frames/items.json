@@ -1,0 +1,27 @@
+{
+  "MenuTitle": "Frames",
+  "Description": "PURE frames.",
+  "Items": [
+    {
+      "Name": "Frame 2",
+      "Description": "PURE frame 2.",
+      "Price": 3000,
+      "Value": 0,
+      "SourceModType": 39
+    },
+    {
+      "Name": "Frame 3",
+      "Description": "PURE frame 3.",
+      "Price": 3000,
+      "Value": 1,
+      "SourceModType": 39
+    },
+    {
+      "Name": "Frame 4",
+      "Description": "PURE frame 4.",
+      "Price": 3000,
+      "Value": 2,
+      "SourceModType": 39
+    }
+  ]
+}

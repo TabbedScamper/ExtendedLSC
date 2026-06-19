@@ -1,0 +1,69 @@
+{
+  "MenuTitle": "Nerf Bars",
+  "Description": "PURE nerf bars.",
+  "Items": [
+    {
+      "Name": "Nerf Bar 2",
+      "Description": "PURE nerf bar 2.",
+      "Price": 1000,
+      "Value": 0,
+      "SourceModType": 9
+    },
+    {
+      "Name": "Nerf Bar 3",
+      "Description": "PURE nerf bar 3.",
+      "Price": 1000,
+      "Value": 1,
+      "SourceModType": 9
+    },
+    {
+      "Name": "Nerf Bar 4",
+      "Description": "PURE nerf bar 4.",
+      "Price": 1000,
+      "Value": 2,
+      "SourceModType": 9
+    },
+    {
+      "Name": "Nerf Bar 5",
+      "Description": "PURE nerf bar 5.",
+      "Price": 1000,
+      "Value": 3,
+      "SourceModType": 9
+    },
+    {
+      "Name": "Nerf Bar 6",
+      "Description": "PURE nerf bar 6.",
+      "Price": 1000,
+      "Value": 4,
+      "SourceModType": 9
+    },
+    {
+      "Name": "Nerf Bar 7",
+      "Description": "PURE nerf bar 7.",
+      "Price": 1000,
+      "Value": 5,
+      "SourceModType": 9
+    },
+    {
+      "Name": "Nerf Bar 8",
+      "Description": "PURE nerf bar 8.",
+      "Price": 1000,
+      "Value": 6,
+      "SourceModType": 9
+    },
+    {
+      "Name": "Nerf Bar 9",
+      "Description": "PURE nerf bar 9.",
+      "Price": 1000,
+      "Value": 7,
+      "SourceModType": 9
+    },
+    {
+      "Name": "Nerf Bar 10",
+      "Description": "PURE nerf bar 10.",
+      "Price": 1000,
+      "Value": 8,
+      "SourceModType": 9
+    }
+  ]
+}

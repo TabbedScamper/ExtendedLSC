@@ -1,0 +1,38 @@
+{
+  "label": "baseline_kuruma",
+  "topspeed_mph": 102.1,
+  "topspeed_ms": 45.66,
+  "0-60mph_s": 3.395,
+  "0-100mph_s": 16.85,
+  "dist_m": 604.9,
+  "final_gear": 5,
+  "top_gear_seen": 5,
+  "duration_s": 17.62,
+  "shifts": [
+    {
+      "gear": "1->2",
+      "ms": 1445,
+      "mph": 22.8,
+      "rpm": 0.917
+    },
+    {
+      "gear": "2->3",
+      "ms": 2306,
+      "mph": 50.2,
+      "rpm": 0.919
+    },
+    {
+      "gear": "3->4",
+      "ms": 4798,
+      "mph": 70.2,
+      "rpm": 0.92
+    },
+    {
+      "gear": "4->5",
+      "ms": 10060,
+      "mph": 89.3,
+      "rpm": 0.92
+    }
+  ],
+  "samples": 1972
+}

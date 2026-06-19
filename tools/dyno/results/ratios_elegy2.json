@@ -1,0 +1,46 @@
+{
+  "label": "ratios_elegy2",
+  "topspeed_mph": 79.7,
+  "topspeed_ms": 35.64,
+  "0-60mph_s": 3.118,
+  "0-100mph_s": null,
+  "dist_m": 130.1,
+  "final_gear": 4,
+  "top_gear_seen": 4,
+  "duration_s": 6.0,
+  "shifts": [
+    {
+      "gear": "1->2",
+      "ms": 1617,
+      "mph": 25.2,
+      "rpm": 0.92
+    },
+    {
+      "gear": "2->3",
+      "ms": 2457,
+      "mph": 53.4,
+      "rpm": 0.919
+    },
+    {
+      "gear": "3->4",
+      "ms": 5004,
+      "mph": 74.6,
+      "rpm": 0.92
+    }
+  ],
+  "samples": 640,
+  "maxFlatVel": 50.667,
+  "topGear": 6,
+  "driveGears": 6,
+  "ratios": [
+    0.0,
+    -3.3333,
+    3.3333,
+    1.9488,
+    1.3925,
+    1.0945,
+    0.9463,
+    0.9,
+    0.0
+  ]
+}

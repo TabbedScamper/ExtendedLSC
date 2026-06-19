@@ -1,0 +1,52 @@
+{
+  "label": "limtest_dom",
+  "topspeed_mph": 109.5,
+  "topspeed_ms": 48.97,
+  "0-60mph_s": 4.193,
+  "0-100mph_s": 11.748,
+  "dist_m": 603.8,
+  "final_gear": 5,
+  "top_gear_seen": 5,
+  "duration_s": 17.52,
+  "shifts": [
+    {
+      "gear": "1->2",
+      "ms": 2867,
+      "mph": 41.0,
+      "rpm": 0.92
+    },
+    {
+      "gear": "2->3",
+      "ms": 3512,
+      "mph": 51.9,
+      "rpm": 0.839
+    },
+    {
+      "gear": "3->4",
+      "ms": 4124,
+      "mph": 58.9,
+      "rpm": 0.952
+    },
+    {
+      "gear": "4->5",
+      "ms": 6888,
+      "mph": 78.9,
+      "rpm": 0.917
+    }
+  ],
+  "samples": 1890,
+  "maxFlatVel": 48.333,
+  "topGear": 5,
+  "driveGears": 5,
+  "ratios": [
+    300.0,
+    -3.3333,
+    3.3333,
+    2.4028,
+    1.732,
+    1.2485,
+    0.9,
+    0.0,
+    0.0
+  ]
+}

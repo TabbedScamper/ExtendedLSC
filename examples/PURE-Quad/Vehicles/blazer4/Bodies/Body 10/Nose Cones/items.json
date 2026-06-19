@@ -1,0 +1,41 @@
+{
+  "MenuTitle": "Nose Cones",
+  "Description": "Nose Cones for Body 10.",
+  "Items": [
+    {
+      "Name": "Nose Cone 1",
+      "Description": "Nose Cones for Body 10.",
+      "Price": 1200,
+      "Value": 43,
+      "SourceModType": 3
+    },
+    {
+      "Name": "Nose Cone 2",
+      "Description": "Nose Cones for Body 10.",
+      "Price": 1200,
+      "Value": 44,
+      "SourceModType": 3
+    },
+    {
+      "Name": "Nose Cone 3",
+      "Description": "Nose Cones for Body 10.",
+      "Price": 1200,
+      "Value": 45,
+      "SourceModType": 3
+    },
+    {
+      "Name": "Nose Cone 4",
+      "Description": "Nose Cones for Body 10.",
+      "Price": 1200,
+      "Value": 46,
+      "SourceModType": 3
+    },
+    {
+      "Name": "Nose Cone 5",
+      "Description": "Nose Cones for Body 10.",
+      "Price": 1200,
+      "Value": 47,
+      "SourceModType": 3
+    }
+  ]
+}

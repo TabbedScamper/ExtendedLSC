@@ -1,0 +1,13 @@
+{
+  "MenuTitle": "Body 4",
+  "Description": "Body 4 shell + its fitment.",
+  "Items": [
+    {
+      "Name": "Body 4",
+      "Description": "PURE custom body 4.",
+      "Price": 8000,
+      "Value": 2,
+      "SourceModType": 10
+    }
+  ]
+}

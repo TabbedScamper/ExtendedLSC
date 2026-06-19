@@ -1,0 +1,38 @@
+{
+  "label": "baseline_comet2",
+  "topspeed_mph": 113.9,
+  "topspeed_ms": 50.92,
+  "0-60mph_s": 3.766,
+  "0-100mph_s": 12.078,
+  "dist_m": 603.5,
+  "final_gear": 5,
+  "top_gear_seen": 5,
+  "duration_s": 16.99,
+  "shifts": [
+    {
+      "gear": "1->2",
+      "ms": 1500,
+      "mph": 15.8,
+      "rpm": 1.0
+    },
+    {
+      "gear": "2->3",
+      "ms": 3177,
+      "mph": 53.6,
+      "rpm": 0.918
+    },
+    {
+      "gear": "3->4",
+      "ms": 5592,
+      "mph": 76.2,
+      "rpm": 0.92
+    },
+    {
+      "gear": "4->5",
+      "ms": 11227,
+      "mph": 98.3,
+      "rpm": 0.92
+    }
+  ],
+  "samples": 1903
+}

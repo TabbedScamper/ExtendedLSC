@@ -329,19 +329,31 @@ namespace ExtendedLSC.WheelFitment
                         _baseTyreW[i] = WheelMemory.GetTyreColliderWidth(_vehicle, i);
                     }
 
-                    _stockByKey[key] = new StockWheel
+                    // CRITICAL: a baseline read is only TRUE NATURAL when no stance is currently applied. If a
+                    // stance is active, the live read is polluted by our own scaling/poke, so we must NOT cache or
+                    // persist it (that's what corrupted the file and broke reloads). Capture it for this frame so
+                    // the wheel still renders, but leave the key UN-cached so a later clean encounter records the
+                    // true natural. Visual size/width are the per-vehicle stateful fields that pollute worst.
+                    bool stanceActive = Math.Abs(_visualSize - 1f) > 0.001f || Math.Abs(_visualWidth - 1f) > 0.001f
+                        || Math.Abs(_frontTrackWidth) > 1e-4f || Math.Abs(_rearTrackWidth) > 1e-4f
+                        || Math.Abs(_frontHeight) > 1e-4f || Math.Abs(_rearHeight) > 1e-4f
+                        || Math.Abs(_rake) > 1e-4f || Math.Abs(_frontCamber) > 1e-4f || Math.Abs(_rearCamber) > 1e-4f;
+                    if (!stanceActive)
                     {
-                        HasVisual = _hasVisualWheels,
-                        BaseSize = _baseVisualSize,
-                        BaseWidth = _baseVisualWidth,
-                        WheelX = xs,
-                        WheelZ = zs,
-                        TyreR = _baseTyreR,
-                        RimR = _baseRimR,
-                        TyreW = _baseTyreW
-                    };
-                    SaveBaselines();   // persist so a reload reuses this clean capture instead of re-reading memory
-                    Log?.Invoke($"[WheelFitment] Baseline (captured) {key}: hasVisual={_hasVisualWheels} base={_baseVisualSize:F3}");
+                        _stockByKey[key] = new StockWheel
+                        {
+                            HasVisual = _hasVisualWheels,
+                            BaseSize = _baseVisualSize,
+                            BaseWidth = _baseVisualWidth,
+                            WheelX = xs,
+                            WheelZ = zs,
+                            TyreR = _baseTyreR,
+                            RimR = _baseRimR,
+                            TyreW = _baseTyreW
+                        };
+                        SaveBaselines();   // persist ONLY clean captures so reloads reuse a real natural baseline
+                    }
+                    Log?.Invoke($"[WheelFitment] Baseline ({(stanceActive ? "live-polluted, not cached" : "captured")}) {key}: base={_baseVisualSize:F3}");
                 }
 
                 // PER-VEHICLE STABLE ORIGIN: reuse the origin captured the first time we baselined THIS
@@ -371,10 +383,136 @@ namespace ExtendedLSC.WheelFitment
             catch (Exception ex) { Log?.Invoke($"[WheelFitment] RefreshBaseline error: {ex.Message}"); }
         }
 
+        // ---- Preview lock: hold the player's EXACT applied stance (absolute memory values) while they scroll
+        // rims, so every previewed rim shows the same width/size/height instead of the fitment re-deriving an
+        // unreliable per-rim baseline (which compounds the wheels wider or skinnier as you scroll). ----
+        private bool _previewLock = false;
+        private bool _lockHasVisual;
+        private float _lockVisSize, _lockVisWidth, _lockFake;
+        private float[] _lockTyreR, _lockRimR, _lockTyreW;
+
+        public void BeginPreviewLock()
+        {
+            try
+            {
+                if (_vehicle == null || !_vehicle.Exists()) return;
+                _lockHasVisual = _hasVisualWheels;
+                _lockVisSize = WheelMemory.GetVisualSize(_vehicle);
+                _lockVisWidth = WheelMemory.GetVisualWidth(_vehicle);
+                _lockFake = WheelMemory.GetFakeLowering(_vehicle);
+                int n = WheelMemory.GetWheelCount(_vehicle);
+                _lockTyreR = new float[n]; _lockRimR = new float[n]; _lockTyreW = new float[n];
+                for (int i = 0; i < n; i++)
+                {
+                    _lockTyreR[i] = WheelMemory.GetTyreColliderRadius(_vehicle, i);
+                    _lockRimR[i] = WheelMemory.GetRimColliderRadius(_vehicle, i);
+                    _lockTyreW[i] = WheelMemory.GetTyreColliderWidth(_vehicle, i);
+                }
+                _previewLock = true;
+            }
+            catch { }
+        }
+        public void EndPreviewLock()
+        {
+            try
+            {
+                // The locked field value = clean_base * current_mult. Restore the CLEAN base so the resuming
+                // fitment re-applies the SAME absolute stance (base*mult) instead of squaring the multiplier
+                // (which balloons the width when you back out / buy). Pin the current key so RefreshBaseline
+                // won't immediately re-capture the still-scaled live value and re-pollute it.
+                if (_previewLock && _lockHasVisual && _vehicle != null && _vehicle.Exists())
+                {
+                    if (Math.Abs(_visualWidth) > 0.01f) _baseVisualWidth = _lockVisWidth / _visualWidth;
+                    if (Math.Abs(_visualSize) > 0.01f) _baseVisualSize = _lockVisSize / _visualSize;
+                    if (_baseTyreR != null && _lockTyreR != null && _baseRimR != null && _lockRimR != null
+                        && _baseTyreW != null && _lockTyreW != null)
+                        for (int i = 0; i < _baseTyreR.Length && i < _lockTyreR.Length; i++)
+                        {
+                            if (Math.Abs(_visualSize) > 0.01f) { _baseTyreR[i] = _lockTyreR[i] / _visualSize; _baseRimR[i] = _lockRimR[i] / _visualSize; }
+                            if (Math.Abs(_visualWidth) > 0.01f) _baseTyreW[i] = _lockTyreW[i] / _visualWidth;
+                        }
+                    _currentBaselineKey = ResolveWheelKey();
+                }
+            }
+            catch { }
+            _previewLock = false;
+        }
+
+        private void ReassertPreviewLock()
+        {
+            try
+            {
+                if (_vehicle == null || !_vehicle.Exists()) return;
+                if (_lockHasVisual)
+                {
+                    WheelMemory.SetVisualSize(_vehicle, _lockVisSize);
+                    WheelMemory.SetVisualWidth(_vehicle, _lockVisWidth);
+                    int n = WheelMemory.GetWheelCount(_vehicle);
+                    if (_lockTyreR != null)
+                        for (int i = 0; i < n && i < _lockTyreR.Length; i++)
+                        {
+                            WheelMemory.SetWheelField(_vehicle, i, WheelMemory.OFF_TYRE_RADIUS, _lockTyreR[i]);
+                            WheelMemory.SetWheelField(_vehicle, i, WheelMemory.OFF_RIM_RADIUS, _lockRimR[i]);
+                            WheelMemory.SetWheelField(_vehicle, i, WheelMemory.OFF_TYRE_WIDTH, _lockTyreW[i]);
+                        }
+                }
+                WheelMemory.SetFakeLowering(_vehicle, _lockFake);
+            }
+            catch { }
+        }
+
+        // Opportunistic self-heal: whenever the stance is at STOCK, the live wheel IS its true natural, so
+        // re-capture the cached baseline from it. This auto-corrects any baseline that was recorded polluted
+        // (the cause of reload-corrupted stances) — the player just needs to be at stock for a moment.
+        private int _lastHealAt = 0;
+        private void HealBaselineIfStock()
+        {
+            try
+            {
+                if (_vehicle == null || !_vehicle.Exists() || !_hasVisualWheels) return;
+                // Visual size/width + colliders are clean when the VISUAL is at stock (size & width = 1). The
+                // X/Z origin is clean only when the GEOMETRY (track/rake/camber) is also at stock.
+                bool visStock = Math.Abs(_visualSize - 1f) < 0.001f && Math.Abs(_visualWidth - 1f) < 0.001f;
+                bool geomStock = Math.Abs(_frontTrackWidth) < 1e-4f && Math.Abs(_rearTrackWidth) < 1e-4f
+                    && Math.Abs(_frontHeight) < 1e-4f && Math.Abs(_rearHeight) < 1e-4f && Math.Abs(_rake) < 1e-4f
+                    && Math.Abs(_frontCamber) < 1e-4f && Math.Abs(_rearCamber) < 1e-4f;
+                if (!visStock) return;   // can't trust the visual baseline while a size/width mult is applied
+                if (Game.GameTime - _lastHealAt < 500) return;
+                _lastHealAt = Game.GameTime;
+                string key = ResolveWheelKey();
+                if (key == null) return;
+                float ns = WheelMemory.GetVisualSize(_vehicle), nw = WheelMemory.GetVisualWidth(_vehicle);
+                if (ns < 0.1f || ns > 5f || nw < 0.1f || nw > 5f) return;
+                bool cached = _stockByKey.TryGetValue(key, out var cur) && cur.HasVisual;
+                if (cached && Math.Abs(cur.BaseWidth - nw) < 0.004f && Math.Abs(cur.BaseSize - ns) < 0.004f
+                    && cur.WheelX != null && cur.TyreW != null) return; // already clean
+                _baseVisualSize = ns; _baseVisualWidth = nw;
+                int n = WheelMemory.GetWheelCount(_vehicle);
+                // colliders: clean now (visual at stock). origin: clean only if geometry also stock, else keep cached.
+                _baseTyreR = new float[n]; _baseRimR = new float[n]; _baseTyreW = new float[n];
+                float[] xs = (geomStock || !cached || cur.WheelX == null) ? new float[n] : cur.WheelX;
+                float[] zs = (geomStock || !cached || cur.WheelZ == null) ? new float[n] : cur.WheelZ;
+                for (int i = 0; i < n; i++)
+                {
+                    if (geomStock || !cached || cur.WheelX == null) { xs[i] = WheelMemory.GetWheelX(_vehicle, i); zs[i] = WheelMemory.GetWheelZ(_vehicle, i); }
+                    _baseTyreR[i] = WheelMemory.GetTyreColliderRadius(_vehicle, i);
+                    _baseRimR[i] = WheelMemory.GetRimColliderRadius(_vehicle, i);
+                    _baseTyreW[i] = WheelMemory.GetTyreColliderWidth(_vehicle, i);
+                }
+                _stockByKey[key] = new StockWheel { HasVisual = true, BaseSize = ns, BaseWidth = nw,
+                    WheelX = xs, WheelZ = zs, TyreR = _baseTyreR, RimR = _baseRimR, TyreW = _baseTyreW };
+                SaveBaselines();
+                Log?.Invoke($"[WheelFitment] Baseline healed (vis stock, geom {(geomStock ? "stock" : "active")}) {key}: size={ns:F3} width={nw:F3}");
+            }
+            catch { }
+        }
+
         /// <summary>Must be called every frame to maintain fitment.</summary>
         public void Update()
         {
             if (!IsInitialized) return;
+            if (_previewLock) { ReassertPreviewLock(); return; }  // hold the exact stance while previewing rims
+            HealBaselineIfStock();   // self-correct any polluted baseline whenever the player is at stock
             RefreshBaseline();   // refresh the reference offsets/base visual on a wheel swap (re-stamps both)
 
             // RENDER fields (fake-lowering + visual size/width) get wiped by render events like opening the
@@ -694,6 +832,28 @@ namespace ExtendedLSC.WheelFitment
                 if (_vehicle == null || !_vehicle.Exists()) return;
                 WheelMemory.SetFakeLowering(_vehicle, _stockFake);
                 _fakeApplied = false;
+
+                // Also clear the VISUAL wheel size/width + their colliders back to natural — otherwise a stance's
+                // scale stays baked into the wheels while previewing rims (wheels look skinny + ride height drifts
+                // rim-to-rim). The per-wheel CWheel fields rebuild on a swap, but the StreamRenderGfx visual scale
+                // is per-vehicle and persists, so it MUST be reset here.
+                if (_hasVisualWheels)
+                {
+                    if (_visSizeApplied)  { WheelMemory.SetVisualSize(_vehicle, _baseVisualSize);  _visSizeApplied = false; }
+                    if (_visWidthApplied) { WheelMemory.SetVisualWidth(_vehicle, _baseVisualWidth); _visWidthApplied = false; }
+                    int n = WheelMemory.GetWheelCount(_vehicle);
+                    if (_sizeColApplied && _baseTyreR != null && _baseRimR != null)
+                        for (int i = 0; i < n && i < _baseTyreR.Length; i++)
+                        {
+                            WheelMemory.SetWheelField(_vehicle, i, WheelMemory.OFF_TYRE_RADIUS, _baseTyreR[i]);
+                            WheelMemory.SetWheelField(_vehicle, i, WheelMemory.OFF_RIM_RADIUS, _baseRimR[i]);
+                        }
+                    _sizeColApplied = false;
+                    if (_widthColApplied && _baseTyreW != null)
+                        for (int i = 0; i < n && i < _baseTyreW.Length; i++)
+                            WheelMemory.SetWheelField(_vehicle, i, WheelMemory.OFF_TYRE_WIDTH, _baseTyreW[i]);
+                    _widthColApplied = false;
+                }
             }
             catch { }
         }

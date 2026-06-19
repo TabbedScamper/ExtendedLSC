@@ -1,0 +1,41 @@
+{
+  "MenuTitle": "A-Arms",
+  "Description": "PURE a-arms.",
+  "Items": [
+    {
+      "Name": "A-Arm 2",
+      "Description": "PURE a-arm 2.",
+      "Price": 1800,
+      "Value": 0,
+      "SourceModType": 46
+    },
+    {
+      "Name": "A-Arm 3",
+      "Description": "PURE a-arm 3.",
+      "Price": 1800,
+      "Value": 1,
+      "SourceModType": 46
+    },
+    {
+      "Name": "A-Arm 4",
+      "Description": "PURE a-arm 4.",
+      "Price": 1800,
+      "Value": 2,
+      "SourceModType": 46
+    },
+    {
+      "Name": "A-Arm 5",
+      "Description": "PURE a-arm 5.",
+      "Price": 1800,
+      "Value": 3,
+      "SourceModType": 46
+    },
+    {
+      "Name": "A-Arm 6",
+      "Description": "PURE a-arm 6.",
+      "Price": 1800,
+      "Value": 4,
+      "SourceModType": 46
+    }
+  ]
+}

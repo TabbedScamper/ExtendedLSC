@@ -1,0 +1,34 @@
+{
+  "MenuTitle": "Shocks",
+  "Description": "PURE shocks.",
+  "Items": [
+    {
+      "Name": "Shock 3",
+      "Description": "PURE shock 3.",
+      "Price": 2200,
+      "Value": 0,
+      "SourceModType": 37
+    },
+    {
+      "Name": "Shock 5",
+      "Description": "PURE shock 5.",
+      "Price": 2200,
+      "Value": 1,
+      "SourceModType": 37
+    },
+    {
+      "Name": "Shock 7",
+      "Description": "PURE shock 7.",
+      "Price": 2200,
+      "Value": 2,
+      "SourceModType": 37
+    },
+    {
+      "Name": "Shock 9",
+      "Description": "PURE shock 9.",
+      "Price": 2200,
+      "Value": 3,
+      "SourceModType": 37
+    }
+  ]
+}

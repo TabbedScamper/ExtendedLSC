@@ -40,6 +40,56 @@ namespace ExtendedLSC
 
         public static Action<string> Log { get; set; }
 
+        /// <summary>
+        /// Pick the per-vehicle config folder for the active vehicle. Modders ship a folder named by the
+        /// MODEL (e.g. "blazer4") — stable + language-independent — OR by the in-game display name. We resolve
+        /// CurrentVehicle to whichever folder actually exists so a dropped-in config "just works".
+        /// Priority: exact display-name folder, then a folder whose joaat() matches the model hash, else display name.
+        /// </summary>
+        public static void SetCurrentVehicle(string displayName, uint modelHash)
+        {
+            CurrentVehicle = ResolveVehicleFolder(displayName, modelHash);
+        }
+
+        private static string ResolveVehicleFolder(string displayName, uint modelHash)
+        {
+            try
+            {
+                if (Directory.Exists(BasePath))
+                {
+                    // 1) exact display-name folder wins (back-compat with existing configs)
+                    if (!string.IsNullOrEmpty(displayName) && Directory.Exists(Path.Combine(BasePath, displayName)))
+                        return displayName;
+                    // 2) otherwise match a folder by model-name hash (e.g. folder "blazer4" -> joaat == model hash)
+                    foreach (string dir in Directory.GetDirectories(BasePath))
+                    {
+                        string name = Path.GetFileName(dir);
+                        if (name.Equals("Default", StringComparison.OrdinalIgnoreCase) ||
+                            name.Equals("Universal", StringComparison.OrdinalIgnoreCase)) continue;
+                        if (Joaat(name) == modelHash) return name;
+                    }
+                }
+            }
+            catch (Exception ex) { Log?.Invoke($"[MenuConfig] ResolveVehicleFolder error: {ex.Message}"); }
+            return displayName;
+        }
+
+        // Jenkins one-at-a-time hash (GTA model-name hash), computed on the lowercased name.
+        private static uint Joaat(string text)
+        {
+            uint hash = 0;
+            foreach (char c in text.ToLowerInvariant())
+            {
+                hash += c;
+                hash += hash << 10;
+                hash ^= hash >> 6;
+            }
+            hash += hash << 3;
+            hash ^= hash >> 11;
+            hash += hash << 15;
+            return hash;
+        }
+
         #region Data Classes
 
         /// <summary>
@@ -52,6 +102,17 @@ namespace ExtendedLSC
             public int Price { get; set; }
             public int Value { get; set; }
             public string Type { get; set; }  // Optional: "toggle", "color", etc.
+
+            // Source slot for re-shelved parts (the ELSC edit-mode feature): the game VehicleModType this part
+            // actually lives in. -1 = use the category's native slot (default behaviour). When set, this item
+            // applies (SourceModType, Value) regardless of which custom category it's displayed under — that's
+            // what lets a custom category mix parts pulled from different game slots (e.g. a fender flare that
+            // the game filed under Side Skirts).
+            public int SourceModType { get; set; } = -1;
+
+            // Wheel items (universal wheel categories): the GTA wheel TYPE this rim belongs to (-1 = not a wheel).
+            // When set, the item is a rim applied via SET_VEHICLE_WHEEL_TYPE(WheelType) + SET_VEHICLE_MOD(23/24, Value).
+            public int WheelType { get; set; } = -1;
 
             // For color items
             public int? R { get; set; }
@@ -87,6 +148,16 @@ namespace ExtendedLSC
             /// Gets the display name for the submenu (MenuTitle if set, otherwise Name)
             /// </summary>
             public string DisplayName => !string.IsNullOrEmpty(MenuTitle) ? MenuTitle : Name;
+        }
+
+        /// <summary>Per-vehicle edit-mode config (_config.json): which whole default categories are hidden.
+        /// (Hidden PARTS are not stored here — they're derived from what the custom categories contain, so
+        /// the two can never get out of sync.)</summary>
+        public class VehicleConfig
+        {
+            public List<string> HiddenCategories { get; set; } = new List<string>();
+            // Per-vehicle display-name overrides for BUILT-IN categories (key = original title, e.g. "Skirts").
+            public Dictionary<string, string> CategoryRenames { get; set; } = new Dictionary<string, string>();
         }
 
         #endregion
@@ -183,10 +254,288 @@ namespace ExtendedLSC
                 }
             }
 
+            // Also include THIS vehicle's own custom categories (created in edit mode) that aren't in Default.
+            if (!string.IsNullOrEmpty(CurrentVehicle))
+            {
+                string vehRoot = Path.Combine(BasePath, CurrentVehicle);
+                if (Directory.Exists(vehRoot))
+                {
+                    foreach (string dir in Directory.GetDirectories(vehRoot))
+                    {
+                        string folderName = Path.GetFileName(dir);
+                        if (categories.Exists(c => string.Equals(c.Name, folderName, StringComparison.OrdinalIgnoreCase))) continue;
+                        var vc = LoadCategoryFromPath(dir, folderName);
+                        if (vc != null) categories.Add(vc);
+                    }
+                }
+            }
+
             // Sort alphabetically by display name
             categories.Sort((a, b) => string.Compare(a.DisplayName, b.DisplayName, StringComparison.OrdinalIgnoreCase));
 
             return categories;
+        }
+
+        /// <summary>Create a new per-vehicle custom category folder under <paramref name="parentPath"/> (""=root,
+        /// or e.g. "Wheels/Wheel Type"). False if the name is invalid or the category already exists.</summary>
+        public static bool CreateVehicleCategory(string parentPath, string name)
+        {
+            if (string.IsNullOrWhiteSpace(name) || string.IsNullOrEmpty(CurrentVehicle)) return false;
+            name = name.Trim();
+            string rel = string.IsNullOrEmpty(parentPath) ? name : Path.Combine(parentPath, name);
+            string path = Path.Combine(BasePath, CurrentVehicle, rel);
+            try
+            {
+                if (Directory.Exists(path)) return false;
+                Directory.CreateDirectory(path);
+                var f = new ItemsFile { MenuTitle = name, Description = null, Items = new List<MenuItem>() };
+                File.WriteAllText(Path.Combine(path, "items.json"), JsonConvert.SerializeObject(f, Formatting.Indented));
+                Log?.Invoke($"[MenuConfig] Created vehicle category: {CurrentVehicle}/{rel}");
+                return true;
+            }
+            catch (Exception ex) { Log?.Invoke($"[MenuConfig] CreateVehicleCategory error: {ex.Message}"); return false; }
+        }
+
+        /// <summary>This vehicle's custom sub-categories (folders) directly under <paramref name="parentPath"/>
+        /// (""=root). Used to render modder categories inside any menu, including built-in submenus.</summary>
+        public static List<Category> GetVehicleSubCategories(string parentPath)
+        {
+            var list = new List<Category>();
+            if (string.IsNullOrEmpty(CurrentVehicle)) return list;
+            string dir = Path.Combine(BasePath, CurrentVehicle, parentPath ?? "");
+            if (!Directory.Exists(dir)) return list;
+            foreach (string sub in Directory.GetDirectories(dir))
+            {
+                string name = Path.GetFileName(sub);
+                string rel = string.IsNullOrEmpty(parentPath) ? name : Path.Combine(parentPath, name);
+                var cat = LoadCategoryFromPath(sub, rel);
+                if (cat != null) list.Add(cat);
+            }
+            return list;
+        }
+
+        /// <summary>Rename a per-vehicle custom category (its display title; keeps the folder). Returns false if the
+        /// category isn't a per-vehicle custom one.</summary>
+        public static bool RenameVehicleCategory(string categoryPath, string newName)
+        {
+            if (string.IsNullOrEmpty(CurrentVehicle) || string.IsNullOrWhiteSpace(categoryPath) || string.IsNullOrWhiteSpace(newName)) return false;
+            string dir = Path.Combine(BasePath, CurrentVehicle, categoryPath);
+            if (!Directory.Exists(dir)) return false;
+            try
+            {
+                string itemsPath = Path.Combine(dir, "items.json");
+                ItemsFile f = File.Exists(itemsPath) ? JsonConvert.DeserializeObject<ItemsFile>(File.ReadAllText(itemsPath)) : null;
+                if (f == null) f = new ItemsFile();
+                f.MenuTitle = newName.Trim();
+                File.WriteAllText(itemsPath, JsonConvert.SerializeObject(f, Formatting.Indented));
+                Log?.Invoke($"[MenuConfig] Renamed category {categoryPath} -> {newName}");
+                return true;
+            }
+            catch (Exception ex) { Log?.Invoke($"[MenuConfig] RenameVehicleCategory error: {ex.Message}"); return false; }
+        }
+
+        /// <summary>Set the per-vehicle description for a category path (preserves the category's title + items).</summary>
+        public static void SetVehicleDescription(string categoryPath, string description)
+        {
+            if (string.IsNullOrEmpty(CurrentVehicle) || string.IsNullOrWhiteSpace(categoryPath)) return;
+            string dir = Path.Combine(BasePath, CurrentVehicle, categoryPath);
+            try
+            {
+                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                string itemsPath = Path.Combine(dir, "items.json");
+                ItemsFile f = File.Exists(itemsPath) ? JsonConvert.DeserializeObject<ItemsFile>(File.ReadAllText(itemsPath)) : null;
+                if (f == null) f = new ItemsFile { MenuTitle = Path.GetFileName(categoryPath) };
+                f.Description = description;
+                File.WriteAllText(itemsPath, JsonConvert.SerializeObject(f, Formatting.Indented));
+            }
+            catch (Exception ex) { Log?.Invoke($"[MenuConfig] SetVehicleDescription error: {ex.Message}"); }
+        }
+
+        /// <summary>Append a part (MenuItem, typically with a SourceModType set) to a per-vehicle custom
+        /// category's items.json, creating the file/folder if needed.</summary>
+        public static bool AddItemToVehicleCategory(string categoryName, MenuItem item)
+        {
+            if (string.IsNullOrEmpty(CurrentVehicle) || string.IsNullOrWhiteSpace(categoryName) || item == null) return false;
+            string dir = Path.Combine(BasePath, CurrentVehicle, categoryName);
+            try
+            {
+                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                string itemsPath = Path.Combine(dir, "items.json");
+                ItemsFile f = null;
+                if (File.Exists(itemsPath)) f = JsonConvert.DeserializeObject<ItemsFile>(File.ReadAllText(itemsPath));
+                if (f == null) f = new ItemsFile { MenuTitle = categoryName };
+                if (f.Items == null) f.Items = new List<MenuItem>();
+                f.Items.Add(item);
+                File.WriteAllText(itemsPath, JsonConvert.SerializeObject(f, Formatting.Indented));
+                InvalidateReshelvedCache();   // this part is now re-shelved -> hide it from its default category
+                Log?.Invoke($"[MenuConfig] Added part to {CurrentVehicle}/{categoryName}: {item.Name}");
+                return true;
+            }
+            catch (Exception ex) { Log?.Invoke($"[MenuConfig] AddItemToVehicleCategory error: {ex.Message}"); return false; }
+        }
+
+        private static bool UpdateItem(string itemsPath, int index, string name, int price)
+        {
+            try
+            {
+                if (!File.Exists(itemsPath)) return false;
+                var f = JsonConvert.DeserializeObject<ItemsFile>(File.ReadAllText(itemsPath));
+                if (f?.Items == null || index < 0 || index >= f.Items.Count) return false;
+                if (!string.IsNullOrWhiteSpace(name)) f.Items[index].Name = name;
+                f.Items[index].Price = price;
+                File.WriteAllText(itemsPath, JsonConvert.SerializeObject(f, Formatting.Indented));
+                return true;
+            }
+            catch (Exception ex) { Log?.Invoke($"[MenuConfig] UpdateItem error: {ex.Message}"); return false; }
+        }
+
+        /// <summary>Edit a part's name/price in a per-vehicle custom category (edit mode).</summary>
+        public static bool UpdateVehicleCategoryItem(string categoryPath, int index, string name, int price)
+        {
+            if (string.IsNullOrEmpty(CurrentVehicle) || string.IsNullOrWhiteSpace(categoryPath)) return false;
+            return UpdateItem(Path.Combine(BasePath, CurrentVehicle, categoryPath, "items.json"), index, name, price);
+        }
+
+        /// <summary>Edit a rim's name/price in a universal wheel category (edit mode).</summary>
+        public static bool UpdateUniversalWheelItem(string categoryName, int index, string name, int price)
+        {
+            if (string.IsNullOrWhiteSpace(categoryName)) return false;
+            bool ok = UpdateItem(Path.Combine(UniversalWheelsBase, categoryName, "items.json"), index, name, price);
+            if (ok) InvalidateUniversalWheelCache();
+            return ok;
+        }
+
+        // ---- Per-vehicle edit-mode config (hidden parts / categories) ----
+        private static VehicleConfig _cfgCache;
+        private static string _cfgCacheVehicle;
+
+        public static VehicleConfig GetVehicleConfig()
+        {
+            if (string.IsNullOrEmpty(CurrentVehicle)) return new VehicleConfig();
+            if (_cfgCache != null && _cfgCacheVehicle == CurrentVehicle) return _cfgCache;
+            var cfg = new VehicleConfig();
+            try
+            {
+                string p = Path.Combine(BasePath, CurrentVehicle, "_config.json");
+                if (File.Exists(p)) cfg = JsonConvert.DeserializeObject<VehicleConfig>(File.ReadAllText(p)) ?? new VehicleConfig();
+            }
+            catch { }
+            _cfgCache = cfg; _cfgCacheVehicle = CurrentVehicle;
+            return cfg;
+        }
+
+        private static void SaveVehicleConfig(VehicleConfig cfg)
+        {
+            if (string.IsNullOrEmpty(CurrentVehicle)) return;
+            try
+            {
+                string dir = Path.Combine(BasePath, CurrentVehicle);
+                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                File.WriteAllText(Path.Combine(dir, "_config.json"), JsonConvert.SerializeObject(cfg, Formatting.Indented));
+                _cfgCache = cfg; _cfgCacheVehicle = CurrentVehicle;
+            }
+            catch (Exception ex) { Log?.Invoke($"[MenuConfig] SaveVehicleConfig error: {ex.Message}"); }
+        }
+
+        // The set of (slot,value) parts that live in THIS vehicle's custom categories — derived (and cached) so a
+        // part shown in a custom category is automatically hidden from its default category. Key = slot<<20 | value.
+        private static HashSet<long> _reshelvedCache;
+        private static string _reshelvedVehicle;
+        private static long PartKey(int slot, int value) => ((long)slot << 20) | (uint)value;
+
+        public static HashSet<long> GetReshelvedParts()
+        {
+            if (string.IsNullOrEmpty(CurrentVehicle)) return new HashSet<long>();
+            if (_reshelvedCache != null && _reshelvedVehicle == CurrentVehicle) return _reshelvedCache;
+            var set = new HashSet<long>();
+            try
+            {
+                string vroot = Path.Combine(BasePath, CurrentVehicle);
+                if (Directory.Exists(vroot))
+                {
+                    // Recurse to ANY depth — nested categories (e.g. Bodies/Body 03/Front Fenders) re-shelve
+                    // their parts too, so their default slots must hide just like top-level categories.
+                    foreach (string itemsPath in Directory.GetFiles(vroot, "items.json", SearchOption.AllDirectories))
+                    {
+                        var f = JsonConvert.DeserializeObject<ItemsFile>(File.ReadAllText(itemsPath));
+                        if (f?.Items == null) continue;
+                        foreach (var it in f.Items)
+                            if (it.SourceModType >= 0 && it.Value >= 0) set.Add(PartKey(it.SourceModType, it.Value));
+                    }
+                }
+            }
+            catch { }
+            _reshelvedCache = set; _reshelvedVehicle = CurrentVehicle;
+            return set;
+        }
+
+        public static void InvalidateReshelvedCache() { _reshelvedCache = null; _reshelvedVehicle = null; }
+
+        /// <summary>Is this (slot, value) part re-shelved into a custom category (so hide it from its default)?</summary>
+        public static bool IsPartHidden(int slot, int value) => GetReshelvedParts().Contains(PartKey(slot, value));
+
+        /// <summary>Per-vehicle display-name override for a BUILT-IN category, or null if none.</summary>
+        public static string GetCategoryRename(string original)
+        {
+            if (string.IsNullOrEmpty(original)) return null;
+            var cfg = GetVehicleConfig();
+            return (cfg.CategoryRenames != null && cfg.CategoryRenames.TryGetValue(original, out var n) && !string.IsNullOrWhiteSpace(n)) ? n : null;
+        }
+
+        public static void SetCategoryRename(string original, string newName)
+        {
+            if (string.IsNullOrWhiteSpace(original)) return;
+            var cfg = GetVehicleConfig();
+            if (cfg.CategoryRenames == null) cfg.CategoryRenames = new Dictionary<string, string>();
+            if (string.IsNullOrWhiteSpace(newName)) cfg.CategoryRenames.Remove(original);
+            else cfg.CategoryRenames[original] = newName.Trim();
+            SaveVehicleConfig(cfg);
+        }
+
+        /// <summary>Is a built-in default category hidden for the current vehicle (via _config.json)?</summary>
+        public static bool IsCategoryHidden(string title)
+        {
+            if (string.IsNullOrWhiteSpace(title)) return false;
+            var cfg = GetVehicleConfig();
+            return cfg.HiddenCategories != null && cfg.HiddenCategories.Contains(title);
+        }
+
+        /// <summary>Hide or show a built-in default category for the current vehicle (persists to _config.json).</summary>
+        public static void SetCategoryHidden(string title, bool hidden)
+        {
+            if (string.IsNullOrWhiteSpace(title) || string.IsNullOrEmpty(CurrentVehicle)) return;
+            var cfg = GetVehicleConfig();
+            if (cfg.HiddenCategories == null) cfg.HiddenCategories = new List<string>();
+            bool has = cfg.HiddenCategories.Contains(title);
+            if (hidden && !has) cfg.HiddenCategories.Add(title);
+            else if (!hidden && has) cfg.HiddenCategories.Remove(title);
+            else return;
+            SaveVehicleConfig(cfg);
+        }
+
+        /// <summary>Is <paramref name="name"/> a custom per-vehicle category (a folder under Vehicles/{model}/)?</summary>
+        public static bool IsVehicleCategory(string name)
+        {
+            if (string.IsNullOrEmpty(CurrentVehicle) || string.IsNullOrWhiteSpace(name)) return false;
+            return Directory.Exists(Path.Combine(BasePath, CurrentVehicle, name));
+        }
+
+        /// <summary>Delete a custom category and RESTORE its parts to their default slots (un-hides every part
+        /// that was re-shelved into it, then removes the folder).</summary>
+        public static bool DeleteVehicleCategory(string name)
+        {
+            if (!IsVehicleCategory(name)) return false;
+            string dir = Path.Combine(BasePath, CurrentVehicle, name);
+            try
+            {
+                // Removing the folder removes its items -> those parts are no longer re-shelved, so they
+                // automatically reappear in their default categories (just invalidate the derived cache).
+                Directory.Delete(dir, true);
+                InvalidateReshelvedCache();
+                Log?.Invoke($"[MenuConfig] Deleted vehicle category + restored parts: {CurrentVehicle}/{name}");
+                return true;
+            }
+            catch (Exception ex) { Log?.Invoke($"[MenuConfig] DeleteVehicleCategory error: {ex.Message}"); return false; }
         }
 
         /// <summary>
@@ -232,6 +581,114 @@ namespace ExtendedLSC
             var category = LoadCategory(categoryPath);
             SaveCategory(categoryPath, description, category?.Items ?? new List<MenuItem>(), vehicleSpecific);
         }
+
+        // ---- Universal wheel categories (NOT per-vehicle — wheels are global). Live at ExtendedLSC/Universal/Wheels/
+        // so a wheel pack can ship that one folder and it applies to every car. ----
+        private static string UniversalWheelsBase => Path.Combine(
+            AppDomain.CurrentDomain.BaseDirectory, "ExtendedLSC", "Universal", "Wheels");
+
+        public static List<Category> GetUniversalWheelCategories()
+        {
+            var list = new List<Category>();
+            if (!Directory.Exists(UniversalWheelsBase)) return list;
+            foreach (string dir in Directory.GetDirectories(UniversalWheelsBase))
+            {
+                var cat = LoadCategoryFromPath(dir, Path.GetFileName(dir));
+                if (cat != null) list.Add(cat);
+            }
+            list.Sort((a, b) => string.Compare(a.DisplayName, b.DisplayName, StringComparison.OrdinalIgnoreCase));
+            return list;
+        }
+
+        public static bool IsUniversalWheelCategory(string name) =>
+            !string.IsNullOrWhiteSpace(name) && Directory.Exists(Path.Combine(UniversalWheelsBase, name));
+
+        public static bool CreateUniversalWheelCategory(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return false;
+            name = name.Trim();
+            string path = Path.Combine(UniversalWheelsBase, name);
+            try
+            {
+                if (Directory.Exists(path)) return false;
+                Directory.CreateDirectory(path);
+                File.WriteAllText(Path.Combine(path, "items.json"),
+                    JsonConvert.SerializeObject(new ItemsFile { MenuTitle = name, Items = new List<MenuItem>() }, Formatting.Indented));
+                return true;
+            }
+            catch (Exception ex) { Log?.Invoke($"[MenuConfig] CreateUniversalWheelCategory error: {ex.Message}"); return false; }
+        }
+
+        public static bool AddWheelToUniversalCategory(string categoryName, MenuItem item)
+        {
+            if (string.IsNullOrWhiteSpace(categoryName) || item == null) return false;
+            string dir = Path.Combine(UniversalWheelsBase, categoryName);
+            try
+            {
+                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                string ip = Path.Combine(dir, "items.json");
+                ItemsFile f = File.Exists(ip) ? JsonConvert.DeserializeObject<ItemsFile>(File.ReadAllText(ip)) : null;
+                if (f == null) f = new ItemsFile { MenuTitle = categoryName };
+                if (f.Items == null) f.Items = new List<MenuItem>();
+                f.Items.Add(item);
+                File.WriteAllText(ip, JsonConvert.SerializeObject(f, Formatting.Indented));
+                InvalidateUniversalWheelCache();   // this rim is now re-shelved -> hide it from the default list
+                return true;
+            }
+            catch (Exception ex) { Log?.Invoke($"[MenuConfig] AddWheelToUniversalCategory error: {ex.Message}"); return false; }
+        }
+
+        public static bool RenameUniversalWheelCategory(string name, string newName)
+        {
+            if (!IsUniversalWheelCategory(name) || string.IsNullOrWhiteSpace(newName)) return false;
+            try
+            {
+                string ip = Path.Combine(UniversalWheelsBase, name, "items.json");
+                ItemsFile f = File.Exists(ip) ? JsonConvert.DeserializeObject<ItemsFile>(File.ReadAllText(ip)) : new ItemsFile();
+                if (f == null) f = new ItemsFile();
+                f.MenuTitle = newName.Trim();
+                File.WriteAllText(ip, JsonConvert.SerializeObject(f, Formatting.Indented));
+                return true;
+            }
+            catch (Exception ex) { Log?.Invoke($"[MenuConfig] RenameUniversalWheelCategory error: {ex.Message}"); return false; }
+        }
+
+        public static bool DeleteUniversalWheelCategory(string name)
+        {
+            if (!IsUniversalWheelCategory(name)) return false;
+            try { Directory.Delete(Path.Combine(UniversalWheelsBase, name), true); InvalidateUniversalWheelCache(); return true; }
+            catch (Exception ex) { Log?.Invoke($"[MenuConfig] DeleteUniversalWheelCategory error: {ex.Message}"); return false; }
+        }
+
+        // Derived set of (wheelType, index) rims that live in some universal wheel category, so they're hidden
+        // from the default per-type rim list (mirrors the body-part GetReshelvedParts, but global, not per-vehicle).
+        private static HashSet<long> _wheelReshelvedCache;
+        public static HashSet<long> GetUniversalWheelRimSet()
+        {
+            if (_wheelReshelvedCache != null) return _wheelReshelvedCache;
+            var set = new HashSet<long>();
+            try
+            {
+                if (Directory.Exists(UniversalWheelsBase))
+                    foreach (string dir in Directory.GetDirectories(UniversalWheelsBase))
+                    {
+                        string ip = Path.Combine(dir, "items.json");
+                        if (!File.Exists(ip)) continue;
+                        var f = JsonConvert.DeserializeObject<ItemsFile>(File.ReadAllText(ip));
+                        if (f?.Items == null) continue;
+                        foreach (var it in f.Items) if (it.WheelType >= 0) set.Add(PartKey(it.WheelType, it.Value));
+                    }
+            }
+            catch { }
+            _wheelReshelvedCache = set;
+            return set;
+        }
+
+        public static void InvalidateUniversalWheelCache() { _wheelReshelvedCache = null; }
+
+        /// <summary>Is this rim (wheelType, index) re-shelved into a universal category (so hide it from the default
+        /// per-type list)?</summary>
+        public static bool IsRimHidden(int wheelType, int index) => GetUniversalWheelRimSet().Contains(PartKey(wheelType, index));
 
         #endregion
 

@@ -1,0 +1,13 @@
+{
+  "MenuTitle": "Body 1",
+  "Description": "Body 1 shell + its fitment.",
+  "Items": [
+    {
+      "Name": "Body 1 (Stock)",
+      "Description": "Factory PURE body shell.",
+      "Price": 0,
+      "Value": -1,
+      "SourceModType": 10
+    }
+  ]
+}

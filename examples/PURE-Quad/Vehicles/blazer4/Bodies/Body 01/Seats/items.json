@@ -1,0 +1,13 @@
+{
+  "MenuTitle": "Seats",
+  "Description": "Seats for Body 1.",
+  "Items": [
+    {
+      "Name": "Seat 2",
+      "Description": "Seats for Body 1.",
+      "Price": 800,
+      "Value": 0,
+      "SourceModType": 7
+    }
+  ]
+}

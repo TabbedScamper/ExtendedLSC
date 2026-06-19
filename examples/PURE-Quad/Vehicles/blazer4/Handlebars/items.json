@@ -1,0 +1,41 @@
+{
+  "MenuTitle": "Handlebars",
+  "Description": "PURE handlebars.",
+  "Items": [
+    {
+      "Name": "Handlebar 2",
+      "Description": "PURE handlebar 2.",
+      "Price": 900,
+      "Value": 0,
+      "SourceModType": 35
+    },
+    {
+      "Name": "Handlebar 3",
+      "Description": "PURE handlebar 3.",
+      "Price": 900,
+      "Value": 1,
+      "SourceModType": 35
+    },
+    {
+      "Name": "Handlebar 4",
+      "Description": "PURE handlebar 4.",
+      "Price": 900,
+      "Value": 2,
+      "SourceModType": 35
+    },
+    {
+      "Name": "Handlebar 5",
+      "Description": "PURE handlebar 5.",
+      "Price": 900,
+      "Value": 3,
+      "SourceModType": 35
+    },
+    {
+      "Name": "Handlebar 6",
+      "Description": "PURE handlebar 6.",
+      "Price": 900,
+      "Value": 4,
+      "SourceModType": 35
+    }
+  ]
+}

@@ -132,6 +132,11 @@ namespace ExtendedLSC.WheelFitment
         }
         private static int ReadU8(long addr)
             => IsValid(addr, 1, READABLE) ? *(byte*)addr : -1;
+        private static bool WriteU8(long addr, byte val)
+        {
+            if (!IsValid(addr, 1, WRITABLE)) return false;
+            *(byte*)addr = val; return true;
+        }
 
         private static long Addr(Vehicle v)
             => (v != null && v.Exists() && v.MemoryAddress != IntPtr.Zero) ? v.MemoryAddress.ToInt64() : 0;
@@ -164,10 +169,79 @@ namespace ExtendedLSC.WheelFitment
         public static bool HasHandling(Vehicle v) => HandlingPtr(v) != 0;
 
         // CHandlingData float offsets (ikt HandlingInfo.h, b3788) used by the LSC stat bars + live tuning.
-        public const int HOFF_DRIVE_FORCE = 0x60;    // fInitialDriveForce   -> Acceleration
-        public const int HOFF_MAX_FLAT_VEL = 0x64;   // fInitialDriveMaxFlatVel -> Top Speed
-        public const int HOFF_BRAKE_FORCE = 0x6C;    // fBrakeForce          -> Braking
-        public const int HOFF_TRACTION_MAX = 0x88;   // fTractionCurveMax    -> Traction
+        // Verified empirically 2026-06-16 by cross-referencing a live car vs its extracted handling.meta.
+        public const int HOFF_DRIVE_BIAS_FRONT = 0x48; // fDriveBiasFront      0=RWD .. 1=FWD (direct)
+        public const int HOFF_DRIVE_FORCE = 0x60;    // fInitialDriveForce   -> Acceleration (direct)
+        public const int HOFF_MAX_FLAT_VEL = 0x64;   // fInitialDriveMaxFlatVel -> Top Speed (stored = meta/3)
+        public const int HOFF_BRAKE_FORCE = 0x6C;    // fBrakeForce          -> Braking (direct)
+        public const int HOFF_BRAKE_BIAS_FRONT = 0x74; // = 2*biasFront ; HOFF_BRAKE_BIAS_REAR(0x78) = 2*(1-biasFront)
+        public const int HOFF_BRAKE_BIAS_REAR = 0x78;
+        public const int HOFF_STEER_LOCK = 0x80;     // fSteeringLock in RADIANS ; HOFF_STEER_LOCK_INV(0x84) = 1/radians
+        public const int HOFF_STEER_LOCK_INV = 0x84;
+        public const int HOFF_TRACTION_MAX = 0x88;   // fTractionCurveMax    -> Traction (direct)
+        public const int HOFF_TRACTION_MAX_INV = 0x8C; // = 1/fTractionCurveMax (game-cached reciprocal)
+
+        // ---- Full CHandlingData field map (canonical b1604+ layout; bracketed/confirmed by the verified
+        // anchors above: fDriveBiasFront=0x48, fInitialDriveForce=0x60, fInitialDriveMaxFlatVel=0x64,
+        // fBrakeForce=0x6C, fBrakeBiasFront=0x74, fSteeringLock=0x80, fTractionCurveMax=0x88, and the
+        // suspension block is locked at the far end by the empirically-verified fSuspensionRaise=0xD0).
+        // The traction+suspension run (0x88..0xF0) is fully bracketed by 0x88 and 0xD0 → trustworthy.
+        // Each new field is still READ-verified against the car's extracted handling.meta before any write
+        // is exposed to players (ELSC no-blind-write rule). Fields marked (verify) are not yet confirmed live.
+        public const int HOFF_MASS              = 0x0C; // fMass (kg) — collision mass, not handling
+        public const int HOFF_DRAG_COEFF        = 0x10; // fInitialDragCoeff
+        public const int HOFF_DOWNFORCE         = 0x14; // fDownforceModifier (verify per build)
+        public const int HOFF_COM_X             = 0x20; // vecCentreOfMassOffset.x (lateral)
+        public const int HOFF_COM_Y             = 0x24; // .y (longitudinal weight balance)
+        public const int HOFF_COM_Z             = 0x28; // .z (CoM height)
+        public const int HOFF_INERTIA_X         = 0x30; // vecInertiaMultiplier.x
+        public const int HOFF_INERTIA_Y         = 0x34; // .y
+        public const int HOFF_INERTIA_Z         = 0x38; // .z (rotational inertia — spin-out feel)
+        // fDriveBiasFront = 0x48 (HOFF_DRIVE_BIAS_FRONT above)
+        public const int HOFF_DRIVE_GEARS       = 0x50; // nInitialDriveGears (UINT8) (verify)
+        public const int HOFF_DRIVE_INERTIA     = 0x54; // fDriveInertia (rev/throttle response)
+        public const int HOFF_CLUTCH_UP         = 0x58; // fClutchChangeRateScaleUpShift  (MT shift feel)
+        public const int HOFF_CLUTCH_DOWN       = 0x5C; // fClutchChangeRateScaleDownShift (MT shift feel)
+        // fInitialDriveForce=0x60, fInitialDriveMaxFlatVel=0x64, fBrakeForce=0x6C above
+        public const int HOFF_HANDBRAKE_FORCE   = 0x7C; // fHandBrakeForce (verify)
+        // fSteeringLock=0x80, fTractionCurveMax=0x88 above
+        public const int HOFF_TRACTION_MIN      = 0x90; // fTractionCurveMin
+        public const int HOFF_TRACTION_LATERAL  = 0x98; // fTractionCurveLateral (radians)
+        public const int HOFF_TRACTION_SPRING   = 0xA0; // fTractionSpringDeltaMax
+        public const int HOFF_LOWSPEED_LOSS     = 0xA8; // fLowSpeedTractionLossMult
+        public const int HOFF_CAMBER_STIFF      = 0xAC; // fCamberStiffness
+        public const int HOFF_TRACTION_BIAS_F   = 0xB0; // fTractionBiasFront (0..1)
+        public const int HOFF_TRACTION_BIAS_R   = 0xB4; // fTractionBiasRear  (= 1-front)
+        public const int HOFF_TRACTION_LOSS     = 0xB8; // fTractionLossMult (wet/road grip)
+        public const int HOFF_SUSP_FORCE        = 0xBC; // fSuspensionForce
+        public const int HOFF_SUSP_COMP_DAMP    = 0xC0; // fSuspensionCompDamp
+        public const int HOFF_SUSP_REBOUND_DAMP = 0xC4; // fSuspensionReboundDamp
+        public const int HOFF_SUSP_UPPER_LIMIT  = 0xC8; // fSuspensionUpperLimit
+        public const int HOFF_SUSP_LOWER_LIMIT  = 0xCC; // fSuspensionLowerLimit
+        // fSuspensionRaise = 0xD0 (OFF_SUSP_RAISE) — VERIFIED anchor
+        public const int HOFF_SUSP_BIAS_F       = 0xD4; // fSuspensionBiasFront (= 2*biasFront convention)
+        public const int HOFF_SUSP_BIAS_R       = 0xD8; // fSuspensionBiasRear
+        public const int HOFF_ANTIROLL_FORCE    = 0xDC; // fAntiRollBarForce
+        public const int HOFF_ANTIROLL_BIAS_F   = 0xE0; // fAntiRollBarBiasFront
+        public const int HOFF_ANTIROLL_BIAS_R   = 0xE4; // fAntiRollBarBiasRear
+        public const int HOFF_ROLL_CENTRE_F     = 0xE8; // fRollCentreHeightFront
+        public const int HOFF_ROLL_CENTRE_R     = 0xEC; // fRollCentreHeightRear
+        public const int HOFF_COLLISION_DMG     = 0xF0; // fCollisionDamageMult (verify)
+
+        /// <summary>Read nInitialDriveGears (UINT8). -1 if unavailable. NOT yet write-verified.</summary>
+        public static int GetHandlingGears(Vehicle v)
+        {
+            long h = HandlingPtr(v);
+            return h == 0 ? -1 : ReadU8(h + HOFF_DRIVE_GEARS);
+        }
+        /// <summary>Write nInitialDriveGears (UINT8, clamped 1..10). Takes effect on vehicle reload.</summary>
+        public static bool SetHandlingGears(Vehicle v, int gears)
+        {
+            long h = HandlingPtr(v);
+            if (h == 0) return false;
+            if (gears < 1) gears = 1; if (gears > 10) gears = 10;
+            return WriteU8(h + HOFF_DRIVE_GEARS, (byte)gears);
+        }
         /// <summary>Read a CHandlingData float (model-shared). Returns 0 if the handling ptr is unavailable.</summary>
         public static float GetHandlingFloat(Vehicle v, int offset)
         {
