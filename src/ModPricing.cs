@@ -50,13 +50,18 @@ namespace ExtendedLSC
             { VehicleModType.Struts, new[] { 400, 200 } },
         };
 
+        // No single mod/part may cost more than this — every price path is capped to it (rebalance ceiling).
+        public const int MaxModPrice = 12000;
+
         // Toggle mod prices (turbo, etc.)
         public static readonly int TurboPrice = 2500;
         public static readonly int NosPrice = 10000;   // legacy single-NOS price (kept for compatibility)
-        // Nitrous tiers — each a separate purchase, rising in cost (NOS 1..4 => index 0..3).
-        public static readonly int[] NosTierPrices = { 5000, 12000, 25000, 45000 };
+        // Nitrous tiers — each a separate purchase, rising in cost (NOS 1..4 => index 0..3). Capped at MaxModPrice.
+        public static readonly int[] NosTierPrices = { 5000, 8000, 10000, 12000 };
         public static readonly int XenonLightsPrice = 1500;
         public static readonly int CustomTiresPrice = 600;   // Aftermarket (low-profile) tire design
+        public static readonly int CustomSuspensionPrice = 2000; // Custom Suspension & Camber (ride height/camber/rake/poke)
+        public static readonly int ManualTransmissionPrice = 7500; // Manual Transmission (manual shifting + unlocks transmission tuning)
 
         // Speedometer skins (bought once, global)
         public static readonly int SpeedoLeFixPrice = 4500;
@@ -108,9 +113,12 @@ namespace ExtendedLSC
         }
 
         /// <summary>
-        /// Get the price for a specific mod index and value
+        /// Get the price for a specific mod index and value (capped at MaxModPrice).
         /// </summary>
         public static int GetModPriceByIndex(int modIndex, int valueIndex)
+            => Math.Min(RawModPriceByIndex(modIndex, valueIndex), MaxModPrice);
+
+        private static int RawModPriceByIndex(int modIndex, int valueIndex)
         {
             // Try to convert to VehicleModType to use existing pricing
             if (Enum.IsDefined(typeof(VehicleModType), modIndex))
@@ -149,7 +157,7 @@ namespace ExtendedLSC
         public static int GetWheelPrice(int wheelType, int wheelIndex)
         {
             int basePrice = WheelCategoryPrices.ContainsKey(wheelType) ? WheelCategoryPrices[wheelType] : 1500;
-            return basePrice + (wheelIndex * 200); // Higher index = more expensive
+            return Math.Min(basePrice + (wheelIndex * 200), MaxModPrice); // Higher index = more expensive, capped
         }
 
         /// <summary>

@@ -464,6 +464,20 @@ namespace ExtendedLSC.ManualTransmission
             WriteProcessMemory(GetCurrentProcess(), addr + _nextGearOffset, buffer, 2, out bytesWritten);
         }
 
+        /// <summary>Write the LIVE gearbox top-gear (drive gear) count (UINT8) on THIS vehicle instance — the
+        /// field the game + MT actually read. (CHandlingData.nInitialDriveGears only applies on vehicle reload.)
+        /// Caller must also set a ratio for any newly-added gear (e.g. ELSCTransmission.ApplyNfsGearing).</summary>
+        public static void SetTopGear(Vehicle vehicle, int gears)
+        {
+            if (!_available || _topGearOffset == 0) return;
+            IntPtr addr = GetVehicleAddress(vehicle);
+            if (addr == IntPtr.Zero) return;
+            if (gears < 1) gears = 1; if (gears > 8) gears = 8;
+            byte[] buffer = { (byte)gears };
+            int bytesWritten;
+            WriteProcessMemory(GetCurrentProcess(), addr + _topGearOffset, buffer, 1, out bytesWritten);
+        }
+
         public static void SetClutch(Vehicle vehicle, float value)
         {
             if (!_available || _clutchOffset == 0) return;

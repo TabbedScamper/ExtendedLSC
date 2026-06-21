@@ -32,19 +32,19 @@ namespace ExtendedLSC
         // Ordered weakest -> strongest. Audio names + power values are easy to retune after in-game feel tests.
         public static readonly List<EngineSwap> All = new List<EngineSwap>
         {
-            new EngineSwap("street_i4", "Tuned Turbo Inline-4", "sultan",   18f,  35000, 0.10f, 0.03f,
+            new EngineSwap("street_i4", "Tuned Turbo Inline-4", "sultan",   18f,   4000, 0.10f, 0.03f,
                 "A high-revving turbo four. Crisp, eager street power."),
-            new EngineSwap("muscle_v8", "American Muscle V8",    "dominator",32f,  60000, 0.16f, 0.05f,
+            new EngineSwap("muscle_v8", "American Muscle V8",    "dominator",32f,   6000, 0.16f, 0.05f,
                 "Big-displacement pushrod V8. Deep idle, lazy torque."),
-            new EngineSwap("twin_v6",   "Twin-Turbo V6",         "banshee",  48f,  95000, 0.20f, 0.07f,
+            new EngineSwap("twin_v6",   "Twin-Turbo V6",         "banshee",  48f,   8500, 0.20f, 0.07f,
                 "Compact twin-turbo six. Smooth, relentless boost."),
-            new EngineSwap("super_v8",  "Supercharged V8",       "gauntlet", 64f, 135000, 0.25f, 0.09f,
+            new EngineSwap("super_v8",  "Supercharged V8",       "gauntlet", 64f,  11000, 0.25f, 0.09f,
                 "Belt-driven blower V8. Aggressive whine, savage pull."),
-            new EngineSwap("electric",  "Electric Drive Unit",   "cyclone",  72f, 170000, 0.34f, 0.06f,
+            new EngineSwap("electric",  "Electric Drive Unit",   "cyclone",  72f,  14000, 0.34f, 0.06f,
                 "Dual electric motors. Silent launch, instant torque."),
-            new EngineSwap("race_v12",  "Motorsport V12",        "zentorno", 90f, 210000, 0.30f, 0.13f,
+            new EngineSwap("race_v12",  "Motorsport V12",        "zentorno", 90f,  16500, 0.30f, 0.13f,
                 "Naturally-aspirated race V12. A screaming top end."),
-            new EngineSwap("hyper_w16", "Quad-Turbo W16",        "adder",   130f, 320000, 0.40f, 0.18f,
+            new EngineSwap("hyper_w16", "Quad-Turbo W16",        "adder",   130f,  20000, 0.40f, 0.18f,
                 "The pinnacle. Obscene, endless power everywhere."),
         };
 

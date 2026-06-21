@@ -29,6 +29,9 @@
 
     <!-- JSON serialization for config files -->
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+
+    <!-- Audio playback for the optional "Customize Radio" (plays the player's OWN mp3/wav files; none bundled) -->
+    <PackageReference Include="NAudio" Version="1.10.0" />
   </ItemGroup>
 
   <ItemGroup>

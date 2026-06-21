@@ -37,6 +37,30 @@ namespace ExtendedLSC
         /// <summary>Live handling.meta editing with sliders (not yet implemented)</summary>
         public static bool VehicleTuning { get; set; } = true;
 
+        /// <summary>Optional "Customize Radio": loop the player's OWN mp3/wav files (from scripts/ExtendedLSC/radio)
+        /// while the LSC menu is open. No music is bundled — drop your own tracks in the folder.</summary>
+        public static bool CustomizeRadio { get; set; } = true;
+        public static float CustomizeRadioVolume { get; set; } = 0.19f;  // 0..1 ceiling (~-10 dB; quieter than in-game radio)
+
+        /// <summary>Let the menu key open ELSC ANYWHERE (not just at a Los Santos Customs shop). Off by default.</summary>
+        public static bool OpenAnywhere { get; set; } = false;
+
+        /// <summary>Make every purchase free (skips all charges + zeroes package cost offsets). Off by default.</summary>
+        public static bool AllItemsFree { get; set; } = false;
+
+        /// <summary>Show ELSC's small contextual hint bubbles / action popups ANYWHERE they'd appear (door
+        /// open/close, the free-roam help bubble, etc.). On by default; turn off to fully declutter the screen.</summary>
+        public static bool ShowHints { get; set; } = true;
+
+        /// <summary>Idle showcase cinematic: after ~10s of no input in the menu, fade to black, hide the HUD/menu and
+        /// slowly orbit the car (fading on each side switch). Any input snaps back. On by default.</summary>
+        public static bool IdleCinematic { get; set; } = true;
+
+        /// <summary>Keep the front wheels turned where you left them instead of snapping back to center when you exit
+        /// a parked vehicle (global steering auto-center fix). Also lets you turn the wheels in the walk-around camera
+        /// (D-pad Left/Right) to inspect them. On by default.</summary>
+        public static bool KeepSteeringAngle { get; set; } = true;
+
         /// <summary>While moving with Manual Transmission, restrict the player to melee (no drive-by shooting),
         /// which also frees the weapon controls so they can't interfere with shifting.</summary>
         public static bool MeleeOnlyInMotion { get; set; } = true;
@@ -210,6 +234,37 @@ namespace ExtendedLSC
                                 case "vehicletuning":
                                 case "vehicle_tuning":
                                     VehicleTuning = ParseBool(value);
+                                    break;
+                                case "customizeradio":
+                                case "customize_radio":
+                                    CustomizeRadio = ParseBool(value);
+                                    break;
+                                case "customizeradiovolume":
+                                case "customize_radio_volume":
+                                    if (float.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float crv))
+                                        CustomizeRadioVolume = crv < 0f ? 0f : (crv > 1f ? 1f : crv);
+                                    break;
+                                case "openanywhere":
+                                case "open_anywhere":
+                                    OpenAnywhere = ParseBool(value);
+                                    break;
+                                case "allitemsfree":
+                                case "all_items_free":
+                                    AllItemsFree = ParseBool(value);
+                                    break;
+                                case "showhints":
+                                case "show_hints":
+                                case "walkaroundhints":        // backward-compat alias (old name)
+                                case "walk_around_hints":
+                                    ShowHints = ParseBool(value);
+                                    break;
+                                case "idlecinematic":
+                                case "idle_cinematic":
+                                    IdleCinematic = ParseBool(value);
+                                    break;
+                                case "keepsteeringangle":
+                                case "keep_steering_angle":
+                                    KeepSteeringAngle = ParseBool(value);
                                     break;
                                 case "meleeonlyinmotion":
                                 case "melee_only_in_motion":
@@ -460,6 +515,33 @@ namespace ExtendedLSC
 
                     writer.WriteLine("; Live handling.meta editing with sliders");
                     writer.WriteLine($"VehicleTuning = {BoolToString(VehicleTuning)}");
+                    writer.WriteLine();
+
+                    writer.WriteLine("; Customize Radio: loop YOUR OWN mp3/wav files (put them in scripts\\ExtendedLSC\\radio)");
+                    writer.WriteLine("; while the menu is open. Toggle also shown at the top of the menu (only if you have tracks).");
+                    writer.WriteLine($"CustomizeRadio = {BoolToString(CustomizeRadio)}");
+                    writer.WriteLine($"CustomizeRadioVolume = {CustomizeRadioVolume.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
+                    writer.WriteLine();
+
+                    writer.WriteLine("; Let the menu key (MenuKey) open ELSC ANYWHERE, not just at a Los Santos Customs shop");
+                    writer.WriteLine($"OpenAnywhere = {BoolToString(OpenAnywhere)}");
+                    writer.WriteLine();
+
+                    writer.WriteLine("; Make every purchase free (no charges, package costs show $0)");
+                    writer.WriteLine($"AllItemsFree = {BoolToString(AllItemsFree)}");
+                    writer.WriteLine();
+
+                    writer.WriteLine("; Show ELSC's little hint bubbles / action popups anywhere (door open/close, free-roam help, etc.)");
+                    writer.WriteLine($"ShowHints = {BoolToString(ShowHints)}");
+                    writer.WriteLine();
+
+                    writer.WriteLine("; Idle showcase cinematic: after ~10s of no menu input, fade out, hide HUD/menu and slowly orbit the car");
+                    writer.WriteLine($"IdleCinematic = {BoolToString(IdleCinematic)}");
+                    writer.WriteLine();
+
+                    writer.WriteLine("; Keep the front wheels turned where you left them instead of snapping back to center on exit");
+                    writer.WriteLine("; (also lets you turn the wheels in the walk-around camera with D-pad Left/Right to inspect them)");
+                    writer.WriteLine($"KeepSteeringAngle = {BoolToString(KeepSteeringAngle)}");
                     writer.WriteLine();
 
                     writer.WriteLine("; Restrict to melee (no drive-by shooting) while moving with Manual Transmission");

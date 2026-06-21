@@ -43,8 +43,16 @@ namespace ExtendedLSC
             public bool HasTurbo { get; set; } = false;
             public bool HasXenon { get; set; } = false;
             public bool HasBulletproofTires { get; set; } = false;
-            public bool HasManualTransmission { get; set; } = false;
+            public bool HasManualTransmission { get; set; } = false;   // owned (bought)
+            // True when Manual Transmission is the ACTIVE transmission (vs a vanilla level / Stock automatic).
+            public bool ManualTransmissionEquipped { get; set; } = false;
+            // Nitrous, per-vehicle: bitmask of owned tiers, and the equipped tier (-1 = none / Off).
+            public int NosOwnedTiers { get; set; } = 0;
+            public int NosEquippedTier { get; set; } = -1;
             public bool HasWheelFitment { get; set; } = false;
+            // True when Custom Suspension & Camber is the ACTIVE suspension (vs a vanilla level / Stock). Lets us
+            // distinguish "custom equipped" from plain Stock when no vanilla suspension mod is installed.
+            public bool CustomSuspensionEquipped { get; set; } = false;
 
             // Wheel fitment data
             public FitmentData Fitment { get; set; } = new FitmentData();
@@ -56,7 +64,8 @@ namespace ExtendedLSC
             public Dictionary<string, List<int>> PurchasedCustomItems { get; set; } = new Dictionary<string, List<int>>();
 
             // Custom window-glass color (AARRGGBB int). 0 = none/not set (use a normal preset instead).
-            public int CustomWindowColor { get; set; } = 0;
+            public int CustomWindowColor { get; set; } = 0;        // 0 when not equipped (un-equipped clears it)
+            public int LastCustomWindowColor { get; set; } = 0;    // last chosen color; survives un-equip for re-equip
 
             // Persistent tint-array slot assigned to this car's custom color (-1 = unassigned). Persisted so a
             // car keeps the SAME slot forever — adding/removing other cars never reshuffles it.
@@ -64,6 +73,13 @@ namespace ExtendedLSC
 
             // Installed engine swap id (see EngineSwaps.All). null/empty = stock engine.
             public string EngineSwapId { get; set; } = null;
+
+            // Display name of the package last applied to this car (null = none) — drives the "equipped" marker.
+            public string EquippedPackage { get; set; } = null;
+
+            // Speedometer is PER-CAR: which style is equipped on THIS vehicle (0 = Off, 1 = Simple, 2 = Nfsu).
+            // The look/colours/units are global (Speedo config); only the on/off + style is per-car.
+            public int SpeedoStyle { get; set; } = 0;
         }
 
         public class FitmentData
@@ -108,6 +124,62 @@ namespace ExtendedLSC
         public static void Initialize()
         {
             Load();
+        }
+
+        /// <summary>Remove every saved vehicle whose license-plate component equals <paramref name="plate"/>
+        /// (case-insensitive). VehicleKey = "DisplayName|PLATE", so we compare the part after the last '|'.
+        /// Returns the number of entries removed; persists immediately if any were.</summary>
+        public static int PurgeVehiclesByPlate(string plate)
+        {
+            if (_saveData == null) Load();
+            if (_saveData?.Vehicles == null || string.IsNullOrEmpty(plate)) return 0;
+            string want = plate.Trim();
+            var toRemove = new List<string>();
+            foreach (var key in _saveData.Vehicles.Keys)
+            {
+                int bar = key.LastIndexOf('|');
+                string p = bar >= 0 ? key.Substring(bar + 1) : "";
+                if (string.Equals(p.Trim(), want, StringComparison.OrdinalIgnoreCase)) toRemove.Add(key);
+            }
+            foreach (var k in toRemove) _saveData.Vehicles.Remove(k);
+            if (toRemove.Count > 0)
+            {
+                _isDirty = true;
+                Save();
+                Log?.Invoke($"[SaveData] Purged {toRemove.Count} vehicle save(s) with plate '{plate}'");
+            }
+            return toRemove.Count;
+        }
+
+        /// <summary>True if there is a saved VehicleData entry for this key (case-insensitive).</summary>
+        public static bool HasVehicleData(string key)
+        {
+            if (_saveData == null) Load();
+            if (string.IsNullOrEmpty(key)) return false;
+            return _saveData.Vehicles.ContainsKey(key.ToLowerInvariant());
+        }
+
+        /// <summary>
+        /// Move the saved build from oldKey to newKey (used when a car's plate is renamed so its entire
+        /// build follows). No-op if oldKey has no data or newKey already has data.
+        /// </summary>
+        public static void MigrateVehicle(string oldKey, string newKey)
+        {
+            if (_saveData == null) Load();
+            if (string.IsNullOrEmpty(oldKey) || string.IsNullOrEmpty(newKey)) return;
+
+            oldKey = oldKey.ToLowerInvariant();
+            newKey = newKey.ToLowerInvariant();
+            if (oldKey == newKey) return;
+
+            if (_saveData.Vehicles.TryGetValue(oldKey, out var data) &&
+                !_saveData.Vehicles.ContainsKey(newKey))
+            {
+                _saveData.Vehicles[newKey] = data;
+                _saveData.Vehicles.Remove(oldKey);
+                _isDirty = true;
+                Log?.Invoke($"[SaveData] Migrated vehicle data: '{oldKey}' -> '{newKey}'");
+            }
         }
 
         /// <summary>
@@ -192,6 +264,41 @@ namespace ExtendedLSC
             _isDirty = true;
         }
 
+        /// <summary>Get the package last applied to this vehicle (null = none) — for the equipped marker.</summary>
+        public static string GetEquippedPackage(string vehicleName)
+        {
+            if (_saveData == null) Load();
+            vehicleName = vehicleName.ToLowerInvariant();
+            return _saveData.Vehicles.TryGetValue(vehicleName, out var data) ? data.EquippedPackage : null;
+        }
+
+        /// <summary>Record the package last applied to this vehicle (null = none / cleared).</summary>
+        public static void SetEquippedPackage(string vehicleName, string packageName)
+        {
+            if (_saveData == null) Load();
+            vehicleName = vehicleName.ToLowerInvariant();
+            EnsureVehicle(vehicleName).EquippedPackage = string.IsNullOrEmpty(packageName) ? null : packageName;
+            _isDirty = true;
+        }
+
+        /// <summary>Speedometer style equipped on THIS vehicle (0 = Off, 1 = Simple, 2 = Nfsu).</summary>
+        public static int GetSpeedoStyle(string vehicleName)
+        {
+            if (_saveData == null) Load();
+            if (string.IsNullOrEmpty(vehicleName)) return 0;
+            vehicleName = vehicleName.ToLowerInvariant();
+            return _saveData.Vehicles.TryGetValue(vehicleName, out var data) ? data.SpeedoStyle : 0;
+        }
+
+        public static void SetSpeedoStyle(string vehicleName, int style)
+        {
+            if (_saveData == null) Load();
+            if (string.IsNullOrEmpty(vehicleName)) return;
+            vehicleName = vehicleName.ToLowerInvariant();
+            EnsureVehicle(vehicleName).SpeedoStyle = style;
+            _isDirty = true;
+        }
+
         /// <summary>
         /// Check if xenon lights have been purchased
         /// </summary>
@@ -246,6 +353,52 @@ namespace ExtendedLSC
             _isDirty = true;
         }
 
+        // ---- Nitrous (per-vehicle) ----
+        public static int GetNosOwnedTiers(string vehicleName)
+        {
+            if (_saveData == null) Load();
+            vehicleName = vehicleName.ToLowerInvariant();
+            return _saveData.Vehicles.TryGetValue(vehicleName, out var data) ? data.NosOwnedTiers : 0;
+        }
+
+        public static void SetNosOwnedTiers(string vehicleName, int mask)
+        {
+            if (_saveData == null) Load();
+            vehicleName = vehicleName.ToLowerInvariant();
+            EnsureVehicle(vehicleName).NosOwnedTiers = mask;
+            _isDirty = true;
+        }
+
+        public static int GetNosEquippedTier(string vehicleName)
+        {
+            if (_saveData == null) Load();
+            vehicleName = vehicleName.ToLowerInvariant();
+            return _saveData.Vehicles.TryGetValue(vehicleName, out var data) ? data.NosEquippedTier : -1;
+        }
+
+        public static void SetNosEquippedTier(string vehicleName, int tier)
+        {
+            if (_saveData == null) Load();
+            vehicleName = vehicleName.ToLowerInvariant();
+            EnsureVehicle(vehicleName).NosEquippedTier = tier;
+            _isDirty = true;
+        }
+
+        public static bool IsManualTransmissionEquipped(string vehicleName)
+        {
+            if (_saveData == null) Load();
+            vehicleName = vehicleName.ToLowerInvariant();
+            return _saveData.Vehicles.TryGetValue(vehicleName, out var data) && data.ManualTransmissionEquipped;
+        }
+
+        public static void SetManualTransmissionEquipped(string vehicleName, bool equipped)
+        {
+            if (_saveData == null) Load();
+            vehicleName = vehicleName.ToLowerInvariant();
+            EnsureVehicle(vehicleName).ManualTransmissionEquipped = equipped;
+            _isDirty = true;
+        }
+
         /// <summary>
         /// Check if wheel fitment has been purchased
         /// </summary>
@@ -261,6 +414,21 @@ namespace ExtendedLSC
             if (_saveData == null) Load();
             vehicleName = vehicleName.ToLowerInvariant();
             EnsureVehicle(vehicleName).HasWheelFitment = owned;
+            _isDirty = true;
+        }
+
+        public static bool IsCustomSuspensionEquipped(string vehicleName)
+        {
+            if (_saveData == null) Load();
+            vehicleName = vehicleName.ToLowerInvariant();
+            return _saveData.Vehicles.TryGetValue(vehicleName, out var data) && data.CustomSuspensionEquipped;
+        }
+
+        public static void SetCustomSuspensionEquipped(string vehicleName, bool equipped)
+        {
+            if (_saveData == null) Load();
+            vehicleName = vehicleName.ToLowerInvariant();
+            EnsureVehicle(vehicleName).CustomSuspensionEquipped = equipped;
             _isDirty = true;
         }
 
@@ -449,6 +617,14 @@ namespace ExtendedLSC
             return _saveData.Vehicles.TryGetValue(vehicleName, out var data) ? data.CustomWindowColor : 0;
         }
 
+        /// <summary>The last custom window color the player chose for this car (survives un-equip).</summary>
+        public static int GetLastCustomWindowColor(string vehicleName)
+        {
+            if (_saveData == null) Load();
+            vehicleName = vehicleName.ToLowerInvariant();
+            return _saveData.Vehicles.TryGetValue(vehicleName, out var data) ? data.LastCustomWindowColor : 0;
+        }
+
         /// <summary>All vehicles that have a custom window color, name -> AARRGGBB. For populating slots so
         /// multiple parked custom cars can all show their colors at once.</summary>
         public static System.Collections.Generic.Dictionary<string, int> GetAllCustomWindowColors()
@@ -466,6 +642,7 @@ namespace ExtendedLSC
             if (_saveData == null) Load();
             vehicleName = vehicleName.ToLowerInvariant();
             var data = EnsureVehicle(vehicleName);
+            if (argb != 0) data.LastCustomWindowColor = argb;   // remember the chosen color so un-equip can restore it
             if (data.CustomWindowColor != argb)
             {
                 data.CustomWindowColor = argb;

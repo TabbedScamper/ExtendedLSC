@@ -11,6 +11,7 @@ using GTA.UI;
 using LemonUI;
 using LemonUI.Menus;
 using LemonUI.Elements;
+using Newtonsoft.Json;
 using ExtendedLSC.ManualTransmission;
 using ExtendedLSC.WheelFitment;
 using ExtendedLSC.WindowTint;
@@ -446,10 +447,26 @@ namespace ExtendedLSC
 
         // Special menus that need refresh capability
         private NativeMenu hornMenu;
+        private NativeMenu nosMenu;   // the Nitrous tier menu (for the context "Preview" hint)
         private NativeMenu repairMenu;   // damage-repair gate shown at menu open before customizing
         private readonly List<int> _hornItemModIndex = new List<int>();  // horn menu position -> mod index
         private NativeMenu windowTintMenu;
         private NativeMenu plateMenu;
+        private NativeMenu packagesMenu;
+        private bool isNamingPackage = false;
+        // Package preview-on-hover: snapshot the car's mods when the Packages menu opens, apply a package on hover
+        // (reverting to the snapshot first so each preview is clean), commit on select, revert on close.
+        private readonly Dictionary<NativeItem, string> _packageItemPaths = new Dictionary<NativeItem, string>();
+        // Full visual snapshot of the car when the Packages menu opened (so a hover preview can be reverted exactly).
+        private VehiclePackageData _packageSnapshot;
+        private bool _packageCommitted;
+        // True whenever the player is entering TEXT (any on-screen keyboard prompt). While set, ALL other ELSC input
+        // must stand down so the letters being typed (e.g. "Drifty") can't ALSO trigger gameplay actions like the
+        // walk-around toggle. (Key/button BINDING prompts are separate states with their own guards.)
+        private bool IsTypingText =>
+            isNamingPackage || isEditingDescription || isEditingPlate || isAddingCategory || isNamingPart
+            || isPricingPart || isRenamingCategory || isNamingWheel || isAddingWheelCategory
+            || isEditingItemName || isEditingItemPrice;
         private NativeMenu turboMenu;
         private NativeMenu headlightsMenu;
 
@@ -481,6 +498,8 @@ namespace ExtendedLSC
         private readonly Dictionary<NativeItem, string> customDescriptions = new Dictionary<NativeItem, string>();
         private const int STATUS_INSTALLED = 1;
         private const int STATUS_OWNED = 2;
+        // Sentinel "item value" for the buyable Custom Window Color (kept clear of the preset tint values 0/2/3/5).
+        private const int WINDOW_CUSTOM_COLOR_KEY = 9999;
 
         // Track scroll position per menu (to match LemonUI's internal firstItem)
         private Dictionary<NativeMenu, int> menuFirstItem = new Dictionary<NativeMenu, int>();
@@ -497,10 +516,25 @@ namespace ExtendedLSC
         private ELSCTransmission elscTransmission = new ELSCTransmission();
         private TransmissionHUD transmissionHUD;
         private Vehicle lastTransmissionVehicle = null;
+        private bool _driveByDisabled = false;   // we disabled drive-by (to stop aim-breaking windows) while MT is on
+
+        // Optional "Customize Radio" — loops the player's own music while the menu is open.
+        private CustomizeRadio customizeRadio;
+        // Smoothed garage-radio level (0..1) so it crossfades between states instead of cutting out:
+        // 1 = normal (menu open in LSC), QUIET = menu closed but still in LSC, 0 = left LSC (fade out then stop).
+        private float _radioFade = 0f;
+        private const float RADIO_QUIET_LEVEL = 0.30f;
 
         // ELSC Wheel Fitment (VStancer-style wheel adjustments)
         private WheelFitment.WheelFitment wheelFitment = new WheelFitment.WheelFitment();
         private Vehicle lastFitmentVehicle = null;
+
+        // Per-instance plate identity (model + plate). _plateClaims maps an uppercased plate -> the vehicle Handle
+        // that owns it this session, so a freshly-spawned duplicate (same model + same plate as a built car) gets
+        // auto-renamed to a unique plate before ELSC reads/applies saved data — keeping it stock per-instance.
+        private readonly Dictionary<string, int> _plateClaims = new Dictionary<string, int>();
+        private int _lastPlateBoundHandle = 0;   // guard so EnsureUniquePlate runs once per new-car bind, not per frame
+        private readonly Random _plateRng = new Random();
 
         // Custom window-glass color (requires the dlc_elsc clear-glass texture)
         private WindowTint.WindowTintManager windowTint = new WindowTint.WindowTintManager();
@@ -594,7 +628,7 @@ namespace ExtendedLSC
 
         // Vehicle Tuning (live handling fine-tune; one-time dyno unlock per vehicle). Handling is model-shared,
         // so factory values are cached per model hash and tunes are applied relative to that captured stock.
-        private const int TUNING_FEE = 50000;
+        private const int TUNING_FEE = 12000;
         private NativeMenu tuningMenu = null;
         private VehicleSaveData.TuningData currentTuning = new VehicleSaveData.TuningData();
         private float[] currentStock = null;  // [driveForce, maxVel, brakeForce, tractionMax, driveBiasFront, brakeBiasFront, steerLockRad]
@@ -667,29 +701,47 @@ namespace ExtendedLSC
         // 39938 Burton, 37890 La Mesa, 9474 Route 68/Harmony, 115714 Paleto Bay, 93442 Grand Senora.
         private static readonly int[] LSC_INTERIORS = { 39938, 37890, 9474, 115714, 93442 };
         private bool isInLSC = false;
-        private bool waitingForVehicleStop = false;
         private Vector3 lastVehiclePos = Vector3.Zero;
-        private Vector3 lscWorldPos = Vector3.Zero;   // remembered LSC location, to suppress the "closed" help nearby too
-        private Vector3 customizeSpot = Vector3.Zero; // the exact spot the native teleport dropped the car (marker + 5m activation)
-        private int lscSettleSince = 0;               // when the first-entry cinematic finished parking the car
-        private bool lscSwapped = false;              // have we swapped the native mechanic this visit (suppress once)
-        private int lscSuppressUntil = 0;             // keep deleting the bay mechanic each frame until here (kills the vanilla menu flash)
-        private bool lscWentFar = false;              // player left the shop area since the last visit (=> carmod_shop reset => arm fresh)
+        private Vector3 lscWorldPos = Vector3.Zero;   // remembered LSC location (leave-cleanup / nearby checks)
+        private Vector3 customizeSpot = Vector3.Zero; // the spot the car was parked at when ELSC opened
         // Default follow-camera framing applied on menu open (relative to the vehicle). Captured live to match
         // the LSC-style "see what you're working on" angle. Default cam stays active; player can still move it.
         private const float MENU_CAM_HEADING = -149.08f;
         private const float MENU_CAM_PITCH = 13.44f;
         private int menuCamUntil = 0;                 // re-assert the menu framing each frame until here (survives the LSC cinematic-end / follow-cam re-center)
         private bool _recordVanillaLSC = false;       // TEMP (timing capture): stand down LSC hijack so the vanilla animation + menu run
+        // Universal eject takeover: when the vanilla customs menu opens, popping the player out of the driver
+        // seat and instantly re-seating makes carmod_shop ABORT its menu (control returns) WITHOUT swapping the
+        // mechanic. Phase 0 idle, 1 just-ejected (re-seat next frame), 2 waiting for control to open ELSC.
+        private int _lscEjectPhase = 0;
+        private int _lscEjectSince = 0;
+        private Vehicle _lscEjectVeh = null;
+        private int _lscMenuMaybeSince = 0;           // when "control off + stopped in vehicle" first appeared
+        private Vector3 _lscCarPos = Vector3.Zero;    // car's nice spot from the FIRST drive-in, restored on re-open
+        private float _lscCarHeading = 0f;
+        private bool _lscCarCaptured = false;         // captured this visit? (reset on leaving the shop)
+        private Camera _lscHoldCam = null;            // freezes the drive-in view over the eject (interp source)
+        private Camera _lscMenuCam = null;            // interp target = ELSC's menu framing (read off the settled gameplay cam)
+        private int _lscHoldCamReleaseAt = 0;         // GameTime to delete the eject cams after the hand-back
 
-        // Mechanic management
-        private const bool ENABLE_MECHANIC_REPLACEMENT = true; // Seamless swap halts carmod_shop's menu (no script termination)
-        private Ped customMechanic = null;
-        private Vector3 customMechanicPos = Vector3.Zero;
+        // Inspect-steering hold: turn the front wheels in walk-around (D-pad Left/Right) and keep them from snapping
+        // back to center. The global SteeringFix EXE patch handles every vehicle on exit; this per-frame re-assert
+        // additionally pins the ELSC-configured car (and is the fallback if the patch can't match the build). Cleared
+        // once the car is actually driven so normal steering resumes. See SteeringFix.cs.
+        private float _heldSteerDeg = 0f;     // desired steering angle in degrees (0 = centered)
+        private int _steerHoldHandle = 0;     // handle of the vehicle whose wheels we're holding (0 = none)
+        private const float STEER_HOLD_MAX_DEG = 45f;
 
         // Walk-around camera
         private bool isWalkAroundActive = false;
         private Vehicle walkAroundVehicle = null;
+
+        // First-person camera (3rd cycle state). Y cycles: Basic -> Walk-Around -> First-Person -> Basic.
+        private bool isFirstPersonActive = false;
+        private Camera firstPersonCam = null;
+        private float _fpYaw = 0f;     // look yaw offset from vehicle forward (deg)
+        private float _fpPitch = 0f;   // look pitch (deg)
+        private const float FP_LOOK_SENS = 4.0f;
         private bool radarHiddenByMenu = false;   // minimap/GPS hidden while the ELSC menu is open
         private bool editModeActive = false;       // ELSC modder edit mode (gated by ModSettings.EditorMode)
         private Vector3 cameraOrbitPos = Vector3.Zero;  // Target camera orbit position
@@ -700,6 +752,43 @@ namespace ExtendedLSC
         private float smoothCamHeight = 1.5f;           // Smoothed camera height
         private Camera walkAroundCam = null;
         private float cameraHeight = 1.5f;
+
+        // ---- Idle showcase cinematic (attract mode): after ~10s of no menu input, fade out, hide HUD/menu, and
+        // slowly orbit the car (8s per side, fading on each switch). Any input snaps back + unhides. ----
+        // Phase: 0 inactive | 1 fading out to enter | 2 playing (orbit) | 3 fading out to switch sides.
+        private int _idlePhase = 0;
+        private Camera _idleCam = null;
+        private Camera _idlePrevRenderingCam = null;   // what was rendering before (null = gameplay cam)
+        private int _lastInteractionTime = 0;
+        private int _idleSideStart = 0;
+        private float _idleSideBaseDeg = 0f;
+        private Vector3 _idleCenter; private float _idleDist = 6f; private float _idleHeight = 2f;
+        // Per-side shot variety (randomized each switch) so it doesn't repeat the same few views.
+        private float _idleShotHeight = 1.5f;   // world-Z above the ground (low hero .. high overhead)
+        private float _idleShotDistF = 1.12f;   // bounding-box ellipse factor (closer .. pulled back)
+        private float _idleShotFov = 45f;
+        private int _idleSlideSign = 1;          // slow drift direction (left/right) for this side
+        private int _idlePrevSelIndex = -999;
+        private float _idlePrevCursorX = -1f, _idlePrevCursorY = -1f;
+        private readonly Random _idleRng = new Random();
+        private const int IDLE_DELAY_MS = 10000;     // idle time before the cinematic kicks in
+        private const int IDLE_PER_SIDE_MS = 8000;   // how long each side is shown before switching
+        private const float IDLE_SLIDE_DEG = 22f;    // slow orbit amount across a single side
+        // FAKE fade: a script-drawn black overlay whose alpha we animate ourselves, INSTEAD of DO_SCREEN_FADE_OUT/IN.
+        // The native fade (a) leaves the screen stuck black if the script reloads mid-fade and (b) ducks game audio
+        // on every camera switch. A drawn rect does neither — on reload it simply stops drawing.
+        private float _idleFadeAlpha = 0f;    // 0..255 current overlay opacity
+        private float _idleFadeTarget = 0f;   // where it's heading (0 = clear, 255 = full black)
+        private float _idleFadeRate = 0.51f;  // alpha units per millisecond
+        private bool _idleScreenBlack => _idleFadeAlpha >= 254f;
+        private bool _idleHideUI => _idlePhase >= 2; // hide HUD/menu only once we've faded to black + switched cams
+        private static readonly GTA.Control[] _idleInputCtrls =
+        {
+            GTA.Control.FrontendUp, GTA.Control.FrontendDown, GTA.Control.FrontendLeft, GTA.Control.FrontendRight,
+            GTA.Control.FrontendAccept, GTA.Control.FrontendCancel, GTA.Control.FrontendLb, GTA.Control.FrontendRb,
+            GTA.Control.FrontendLt, GTA.Control.FrontendRt, GTA.Control.FrontendX, GTA.Control.FrontendY,
+            GTA.Control.FrontendLs, GTA.Control.FrontendRs
+        };
         private float lookOffsetH = 0f;  // Horizontal look offset (left/right from car center)
         private int cameraModeCooldown = 0;  // Prevent immediate re-entry
         private float vehicleCamMinDist = 1f;  // Dynamic based on vehicle size
@@ -892,6 +981,10 @@ namespace ExtendedLSC
             VehicleSaveData.Log = Log;
             VehicleSaveData.Initialize();
 
+            // One-shot housekeeping: clear ELSC saves + packages stamped with Menyoo's placeholder plate "menyoo"
+            // (those collide in the per-car plate-identity system). No-op once they're gone.
+            PurgeMenyooData();
+
             // Let the window-tint manager surface player-facing messages (e.g. auto-plate on a collision).
             windowTint.Notify = ShowNotification;
 
@@ -913,9 +1006,20 @@ namespace ExtendedLSC
             WheelFitment.WheelFitment.Log = Log;
             Log($"[ELSC Fitment] Wheel fitment system ready");
 
-            // Speedometer skins (Simple / NFSU2) — drawn by ELSC, bought in the LSC menu.
+            // Speedometer skins (Simple / FASTandSPEEDY) — drawn by ELSC, bought in the LSC menu.
             Speedo.Log = Log;
             Speedo.Initialize(System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ExtendedLSC", "speedo"));
+
+            // Customize Radio — loops the player's OWN mp3/wav files (scripts/ExtendedLSC/radio) while the menu is
+            // open. Nothing is bundled; the folder is created empty for the player to fill. Guarded so a missing
+            // NAudio.dll (or audio device) can't crash the mod.
+            try
+            {
+                CustomizeRadio.Log = Log;
+                customizeRadio = new CustomizeRadio();
+                customizeRadio.Initialize(System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ExtendedLSC", "radio"), ModSettings.CustomizeRadioVolume);
+            }
+            catch (Exception ex) { Log($"[Radio] init failed: {ex.Message}"); customizeRadio = null; }
 
             // Restore the saved nitrous flame colour + chosen exhaust effect.
             if (elscTransmission != null)
@@ -934,6 +1038,15 @@ namespace ExtendedLSC
                 return (pp != null && pp.Exists() && pp.IsInVehicle()) ? pp.CurrentVehicle : null;
             };
             try { stanceManager.Initialize(); _stanceMgrInit = true; } catch (Exception ex) { Log($"[Stance] init failed: {ex.Message}"); }
+
+            // Steering auto-center fix: NOP the game's "snap wheels back to center on exit" stores so a parked car
+            // keeps its wheels turned (also lets the walk-around camera turn them for inspection). Global, Legacy-only,
+            // graceful on a signature miss. Gated by the INI toggle.
+            SteeringFix.Log = Log;
+            if (ModSettings.KeepSteeringAngle)
+            {
+                try { SteeringFix.Apply(); } catch (Exception ex) { Log($"[SteeringFix] init failed: {ex.Message}"); }
+            }
 
             // Build static menus
             BuildMainMenu();
@@ -957,12 +1070,19 @@ namespace ExtendedLSC
                 {
                     try { ExitWalkAround(); } catch { }
                 }
+                if (isFirstPersonActive)
+                {
+                    try { ExitFirstPerson(); } catch { }
+                }
                 World.RenderingCamera = null;
                 if (walkAroundCam != null && walkAroundCam.Exists()) walkAroundCam.Delete();
+                if (firstPersonCam != null && firstPersonCam.Exists()) firstPersonCam.Delete();
                 Function.Call(Hash.DISPLAY_RADAR, true);
                 Function.Call(Hash.SET_PLAYER_CAN_DO_DRIVE_BY, Game.Player, true);
             }
             catch { }
+            // Un-patch the steering auto-center stores so a reload/unload leaves the EXE in its original state.
+            try { SteeringFix.Restore(); } catch { }
         }
 
         #region Menu Building
@@ -982,6 +1102,10 @@ namespace ExtendedLSC
             menu.HeldTime = 999999; // Disable LemonUI's repeat - we handle it ourselves
             menu.MaxItems = 10; // Show 10 items, then scroll (shows scroll indicator)
             menu.ItemCount = CountVisibility.Always; // Always show "X/Y" counter
+            // LemonUI mouse OFF: its click activates the highlighted item, but hover-to-highlight doesn't track the
+            // cursor over ELSC's custom-drawn menu, so a click anywhere fired the wrong item. Keyboard/controller only.
+            menu.UseMouse = false;
+            menu.CloseOnInvalidClick = false;  // (moot with mouse off) never let a stray click close the menu
             menuPool.Add(menu);
             allSubMenus.Add(menu);   // tracked so rebuild can hide+remove every submenu (no stale/overlapping menus)
 
@@ -1075,6 +1199,8 @@ namespace ExtendedLSC
             mainMenu.HeldTime = 999999; // Disable LemonUI's repeat - we handle it ourselves
             mainMenu.MaxItems = 10; // Show 10 items, then scroll (shows scroll indicator)
             mainMenu.ItemCount = CountVisibility.Always; // Always show "X/Y" counter
+            mainMenu.UseMouse = false;
+            mainMenu.CloseOnInvalidClick = false;
             menuPool.Add(mainMenu);
 
             // Load custom banner PNG
@@ -1168,39 +1294,26 @@ namespace ExtendedLSC
         /// <summary>Build + draw the context-sensitive hint bar. menu = the visible menu (null in walk-around).</summary>
         private void DrawHintBar(NativeMenu visibleMenu, bool walkAround)
         {
-            if (hintBar == null) return;
+            // Build the menu hint-button set, then draw it on our OWN instanced scaleform at GFX order 7
+            // (same technique as the walk-around bar) so carmod_shop's shared bar can't overwrite it.
+            bool editing = editModeActive;
+            bool onHorn = hornMenu != null && visibleMenu == hornMenu;
+            bool onNos = nosMenu != null && visibleMenu == nosMenu;
+            // On a package row (Packages menu, highlighted item is a saved package): offer X = Delete.
+            bool onPackage = packagesMenu != null && visibleMenu == packagesMenu
+                && visibleMenu.SelectedItem is NativeItem pkgSel && _packageItemPaths.ContainsKey(pkgSel);
 
-            var list = new System.Collections.Generic.List<LemonUI.Scaleform.InstructionalButton>();
-            string sig;
+            var glyphs = new System.Collections.Generic.List<string>();
+            var labels = new System.Collections.Generic.List<string>();
 
-            if (walkAround)
-            {
-                sig = "walk";
-                list.Add(HintBtn("Cycle View", ModSettings.CamPrevButton));
-                list.Add(new LemonUI.Scaleform.InstructionalButton("Move", GTA.Control.VehicleMoveLeftRight));
-                list.Add(new LemonUI.Scaleform.InstructionalButton("Look / Height", GTA.Control.LookLeftRight));
-                list.Add(HintBtn("Open Door", ModSettings.DoorButton));
-                list.Add(HintBtn("Exit", ModSettings.WalkAroundButton));
-            }
-            else
-            {
-                bool editing = editModeActive;
-                bool onHorn = hornMenu != null && visibleMenu == hornMenu;
-                sig = (editing ? "E" : "N") + (onHorn ? "H" : "") + (ModSettings.CustomCamera ? "C" : "");
-                list.Add(new LemonUI.Scaleform.InstructionalButton(editing ? "Edit Name / Price" : "Select", GTA.Control.FrontendAccept));
-                list.Add(new LemonUI.Scaleform.InstructionalButton("Back", GTA.Control.FrontendCancel));
-                if (onHorn) list.Add(HintBtn("Preview", ModSettings.HornPreviewButton));
-                if (ModSettings.CustomCamera) list.Add(HintBtn("Walk-Around", ModSettings.WalkAroundButton));
-            }
+            glyphs.Add(Glyph((int)GTA.Control.FrontendAccept)); labels.Add(editing ? "Edit Name / Price" : "Select");
+            glyphs.Add(Glyph((int)GTA.Control.FrontendCancel)); labels.Add("Back");
+            if (onHorn) { glyphs.Add(Glyph(ModSettings.HornPreviewButton)); labels.Add("Preview"); }
+            if (onNos) { glyphs.Add(Glyph(ModSettings.NosButton)); labels.Add("Preview"); }
+            if (onPackage) { glyphs.Add(Glyph((int)GTA.Control.FrontendX)); labels.Add("Delete"); }
+            if (ModSettings.CustomCamera) { glyphs.Add(Glyph(ModSettings.WalkAroundButton)); labels.Add(isFirstPersonActive ? "Camera: First-Person" : "Camera"); }
 
-            if (sig != hintBarSig)
-            {
-                hintBar.Clear();
-                foreach (var b in list) hintBar.Add(b);
-                hintBar.Update();
-                hintBarSig = sig;
-            }
-            hintBar.Draw();
+            DrawHintsOwn(glyphs.ToArray(), labels.ToArray());
 
             // Edit mode keyboard hotkeys (keyboard-only, no controller glyph) — a tidy yellow strip above the bar.
             if (editModeActive && !walkAround)
@@ -1217,6 +1330,98 @@ namespace ExtendedLSC
             }
         }
 
+        // ── Walk-around hint bar on our OWN instanced scaleform ──────────────────────────────
+        // Inside the vanilla LSC, carmod_shop owns the SHARED "instructional_buttons" movie and
+        // overwrites LemonUI's hint bar (same handle → last SET_DATA_SLOT wins → flicker). We
+        // request a SEPARATE instance so our content can't be clobbered, then draw it at GFX
+        // order 7 so it renders on top of the game's bar. Fully self-managed, no LemonUI.
+        private int _hintSf = -1;   // one instance, reused by the menu + walk-around hint bars (mutually exclusive)
+
+        // Glyph token(s) for a control as shown in instructional-button boxes (current input device).
+        private string Glyph(int control)
+            => Function.Call<string>(Hash.GET_CONTROL_INSTRUCTIONAL_BUTTONS_STRING, 2, control, true);
+
+        // Draw a button list (pre-built glyph strings; a slot may concatenate two glyphs, e.g. LB+RB) on OUR
+        // instanced scaleform at GFX order 7 (on top of carmod_shop's bar).
+        private void DrawHintsOwn(string[] glyphs, string[] labels)
+        {
+            if (_hintSf <= 0)
+            {
+                _hintSf = Function.Call<int>(Hash.REQUEST_SCALEFORM_MOVIE_INSTANCE, "instructional_buttons");
+                return;   // give it a frame to load
+            }
+            if (!Function.Call<bool>(Hash.HAS_SCALEFORM_MOVIE_LOADED, _hintSf)) return;
+
+            int sf = _hintSf;
+
+            Function.Call(Hash.BEGIN_SCALEFORM_MOVIE_METHOD, sf, "CLEAR_ALL");
+            Function.Call(Hash.END_SCALEFORM_MOVIE_METHOD);
+
+            Function.Call(Hash.BEGIN_SCALEFORM_MOVIE_METHOD, sf, "TOGGLE_MOUSE_BUTTONS");
+            Function.Call(Hash.SCALEFORM_MOVIE_METHOD_ADD_PARAM_BOOL, false);
+            Function.Call(Hash.END_SCALEFORM_MOVIE_METHOD);
+
+            for (int i = 0; i < glyphs.Length; i++)
+                SfButton(sf, i, glyphs[i], labels[i]);
+
+            Function.Call(Hash.BEGIN_SCALEFORM_MOVIE_METHOD, sf, "DRAW_INSTRUCTIONAL_BUTTONS");
+            Function.Call(Hash.SCALEFORM_MOVIE_METHOD_ADD_PARAM_INT, 0);
+            Function.Call(Hash.END_SCALEFORM_MOVIE_METHOD);
+
+            // Render on top of carmod_shop's bar (layer 7), then restore the default layer.
+            Function.Call(Hash.SET_SCRIPT_GFX_DRAW_ORDER, 7);
+            Function.Call(Hash.DRAW_SCALEFORM_MOVIE_FULLSCREEN, sf, 255, 255, 255, 255, 0);
+            Function.Call(Hash.SET_SCRIPT_GFX_DRAW_ORDER, 0);
+        }
+
+        private void DrawWalkAroundHints()
+        {
+            // Rev is RT on controller (VehicleAccelerate) but the keyboard 'R' key (W moves now), so the glyph is
+            // device-specific — the VehicleAccelerate glyph would wrongly show "W" on keyboard.
+            bool kbm = Game.LastInputMethod == InputMethod.MouseAndKeyboard;
+            string revGlyph = kbm ? "R" : Glyph((int)GTA.Control.VehicleAccelerate);
+
+            // "Cycle View" shows BOTH bumpers (LB prev / RB next) as two adjacent slots — concatenating the
+            // two control-glyph blobs into one slot renders blank, so each gets its own slot, label on RB.
+            // Steering hint (D-pad Left/Right) only when the inspect-steering feature is enabled.
+            if (ModSettings.KeepSteeringAngle)
+            {
+                DrawHintsOwn(
+                    new[] { Glyph(ModSettings.CamPrevButton),
+                            Glyph(ModSettings.CamNextButton),
+                            revGlyph,
+                            Glyph((int)GTA.Control.VehicleMoveLeftRight),
+                            Glyph((int)GTA.Control.LookLeftRight),
+                            Glyph((int)GTA.Control.FrontendLeft),
+                            Glyph((int)GTA.Control.FrontendRight),
+                            Glyph(ModSettings.DoorButton),
+                            Glyph(ModSettings.WalkAroundButton) },
+                    new[] { "", "Cycle View", "Rev", "Move", "Look / Height", "", "Turn Wheels", "Open Door", "Next Cam" });
+                return;
+            }
+
+            DrawHintsOwn(
+                new[] { Glyph(ModSettings.CamPrevButton),
+                        Glyph(ModSettings.CamNextButton),
+                        revGlyph,
+                        Glyph((int)GTA.Control.VehicleMoveLeftRight),
+                        Glyph((int)GTA.Control.LookLeftRight),
+                        Glyph(ModSettings.DoorButton),
+                        Glyph(ModSettings.WalkAroundButton) },
+                new[] { "", "Cycle View", "Rev", "Move", "Look / Height", "Open Door", "Next Cam" });
+        }
+
+        private void SfButton(int sf, int index, string glyph, string label)
+        {
+            Function.Call(Hash.BEGIN_SCALEFORM_MOVIE_METHOD, sf, "SET_DATA_SLOT");
+            Function.Call(Hash.SCALEFORM_MOVIE_METHOD_ADD_PARAM_INT, index);
+            Function.Call(Hash.SCALEFORM_MOVIE_METHOD_ADD_PARAM_PLAYER_NAME_STRING, glyph);
+            Function.Call(Hash.BEGIN_TEXT_COMMAND_SCALEFORM_STRING, "STRING");
+            Function.Call(Hash.ADD_TEXT_COMPONENT_SUBSTRING_PLAYER_NAME, label);
+            Function.Call(Hash.END_TEXT_COMMAND_SCALEFORM_STRING);
+            Function.Call(Hash.END_SCALEFORM_MOVIE_METHOD);
+        }
+
         private void DrawCustomBanner()
         {
             // Find any visible menu in the pool to get banner position
@@ -1231,9 +1436,6 @@ namespace ExtendedLSC
             }
 
             if (visibleMenu == null) return;
-
-            // Context-sensitive button-hint bar at the bottom of the screen.
-            DrawHintBar(visibleMenu, false);
 
             // Draw custom banner on all menus
             if (customBanner != null)
@@ -1263,6 +1465,15 @@ namespace ExtendedLSC
 
             // Draw vehicle stats bars below description (LSC style)
             DrawVehicleStats(visibleMenu);
+
+            // Context-sensitive button-hint bar at the bottom of the screen — drawn LAST because DrawHintsOwn
+            // sets the script GFX draw order to 7 (to sit on top of carmod_shop's bar) and resets it to 0.
+            // Doing it before the icons/stats would draw THEM at order 0 too, dimming them (the greyed-icon bug).
+            // In walk-around, UpdateWalkAround draws its own hint bar; drawing one here too would flip-flop the
+            // scaleform signature every frame.
+            // Skip the hint bar while the idle cinematic is active — its instructional-button scaleform draws above a
+            // plain DRAW_RECT, so it would poke through the fake-fade overlay.
+            if (!isWalkAroundActive && _idlePhase == 0) DrawHintBar(visibleMenu, false);
 
             // Note: Menu position adjustment is handled in OnTick for MenuPosition debug mode
             // with element-specific controls (see switch on selectedUIElement)
@@ -2260,7 +2471,7 @@ namespace ExtendedLSC
 
             // Load + re-assert this vehicle's saved engine swap (EnginePowerMultiplier/forced audio reset when
             // the entity restreams, so re-apply whenever we rebuild the menu for this car).
-            activeEngineSwap = EngineSwaps.Lookup(VehicleSaveData.GetEngineSwapId(currentVehicle.DisplayName));
+            activeEngineSwap = EngineSwaps.Lookup(VehicleSaveData.GetEngineSwapId(VehicleKey(currentVehicle)));
             if (activeEngineSwap != null) ApplyEngineSwap(activeEngineSwap);
 
             // Capture factory handling (once per model) + load/apply this vehicle's saved handling tune.
@@ -2403,6 +2614,11 @@ namespace ExtendedLSC
                 for (int i = 0; i < total; i++) if (!MenuConfig.IsPartHidden(modIndex, i)) vis++;
                 return vis;
             }
+
+            // Customize Radio: no in-menu toggle — it follows the game's Music volume (turn music down in GTA
+            // settings to quiet/mute it). Just rescan here (when not already playing) so files added before
+            // opening the menu are picked up.
+            try { if (customizeRadio != null && !customizeRadio.IsActive) customizeRadio.Rescan(); } catch { }
 
             // Armor (16)
             if (GetModCount(16) > 0)
@@ -2601,12 +2817,12 @@ namespace ExtendedLSC
                 headlightsMenu.Add(stockLightsItem);
 
                 var xenonLightsItem = new NativeItem("Xenon Lights");
-                bool xenonOwned = VehicleSaveData.IsXenonOwned(currentVehicle.DisplayName);
+                bool xenonOwned = VehicleSaveData.IsXenonOwned(VehicleKey(currentVehicle));
                 if (hasXenon)
                 {
                     xenonLightsItem.AltTitle = "";
                     itemOwnershipStatus[xenonLightsItem] = STATUS_INSTALLED;
-                    if (!xenonOwned) VehicleSaveData.SetXenonOwned(currentVehicle.DisplayName);
+                    if (!xenonOwned) VehicleSaveData.SetXenonOwned(VehicleKey(currentVehicle));
                 }
                 else if (xenonOwned)
                 {
@@ -2619,13 +2835,13 @@ namespace ExtendedLSC
                 }
                 xenonLightsItem.Activated += (s, e) =>
                 {
-                    bool owned = VehicleSaveData.IsXenonOwned(currentVehicle.DisplayName);
+                    bool owned = VehicleSaveData.IsXenonOwned(VehicleKey(currentVehicle));
                     if (!TryPurchase(ModPricing.XenonLightsPrice, owned)) return;
 
                     SetXenon(true);
                     if (!owned)
                     {
-                        VehicleSaveData.SetXenonOwned(currentVehicle.DisplayName);
+                        VehicleSaveData.SetXenonOwned(VehicleKey(currentVehicle));
                         VehicleSaveData.Save();
                     }
                 };
@@ -2787,7 +3003,7 @@ namespace ExtendedLSC
             // Packages (Side Course feature - save/load mod presets)
             if (ModSettings.VehiclePackages)
             {
-                var packagesMenu = CreatePackagesMenu();
+                packagesMenu = CreatePackagesMenu();
                 AddSubmenuItem("Packages", packagesMenu);
             }
 
@@ -2834,9 +3050,36 @@ namespace ExtendedLSC
                 {
                     alignmentParent = menu;   // BuildAlignmentMenu restores to this on close
                     var alignNav = new NativeItem("Custom Suspension and Camber", FitmentSummary());
-                    alignNav.AltTitle = ">>";
-                    // Refresh the saved-value summary each time the Suspension menu opens.
-                    menu.Shown += (s, e) => { alignNav.Description = FitmentSummary(); _hoveringCustomSuspension = false; };
+                    // Three states: NOT owned -> price; owned but NOT the active suspension -> owned tick +
+                    // "Select to equip"; owned AND equipped -> equipped garage icon + "Select to edit". This makes
+                    // the equip mutually exclusive with the vanilla levels (only one shows the garage icon).
+                    void RefreshSuspNav()
+                    {
+                        string vn = VehicleKey(currentVehicle);
+                        bool owned = VehicleSaveData.IsWheelFitmentOwned(vn);
+                        bool equipped = owned && VehicleSaveData.IsCustomSuspensionEquipped(vn);
+                        if (!owned)
+                        {
+                            itemOwnershipStatus.Remove(alignNav);
+                            alignNav.AltTitle = $"${ModPricing.CustomSuspensionPrice}";
+                            alignNav.Description = FitmentSummary();
+                        }
+                        else if (equipped)
+                        {
+                            alignNav.AltTitle = "";
+                            itemOwnershipStatus[alignNav] = STATUS_INSTALLED;
+                            alignNav.Description = FitmentSummary() + "  ·  Select to edit";
+                        }
+                        else
+                        {
+                            alignNav.AltTitle = "";
+                            itemOwnershipStatus[alignNav] = STATUS_OWNED;
+                            alignNav.Description = "Select to equip your custom suspension setup.";
+                        }
+                    }
+                    RefreshSuspNav();
+                    // Refresh the saved-value summary + owned/equipped state each time the Suspension menu opens.
+                    menu.Shown += (s, e) => { RefreshSuspNav(); _hoveringCustomSuspension = false; };
                     // Hovering our custom item should show OUR stance, not a game-level preview: undo the
                     // generic preview (back to the original installed level) and let our ride-height re-apply.
                     menu.SelectedIndexChanged += (s, e) =>
@@ -2852,9 +3095,30 @@ namespace ExtendedLSC
                             wheelFitment.ApplyRideHeightNow();
                         }
                     };
-                    // Rebuild fresh on open so it reflects current wheels / owned / pro-mode state.
+                    // Buy once per car to unlock the camber/ride-height sliders (also unlocks the Tire Grip /
+                    // Steering Lock tuning sliders). Rebuild fresh on open so it reflects wheels / pro-mode state.
+                    // Double-select: first select buys-and-equips (or, if already owned, equips); only once it's
+                    // the equipped suspension does a select open the editor. Equipping rebuilds the menu so the
+                    // garage icon moves to Custom and off whatever vanilla level was equipped.
                     alignNav.Activated += (s, e) =>
                     {
+                        if (currentVehicle == null) return;
+                        string vn = VehicleKey(currentVehicle);
+                        bool owned = VehicleSaveData.IsWheelFitmentOwned(vn);
+                        bool equipped = owned && VehicleSaveData.IsCustomSuspensionEquipped(vn);
+
+                        if (!owned)
+                        {
+                            if (!TryPurchase(ModPricing.CustomSuspensionPrice, false)) return;
+                            VehicleSaveData.SetWheelFitmentOwned(vn, true);
+                            EquipCustomSuspension();   // buys + equips; select again to edit
+                            return;
+                        }
+                        if (!equipped)
+                        {
+                            EquipCustomSuspension();   // equip; select again to edit
+                            return;
+                        }
                         var sub = BuildAlignmentMenu();
                         if (sub == null) return;
                         isNavigatingMenu = true; menu.Visible = false; sub.Visible = true; isNavigatingMenu = false;
@@ -2880,7 +3144,7 @@ namespace ExtendedLSC
                 turboMenu = CreateMenu("Turbo");
 
                 bool hasTurbo = Function.Call<bool>(Hash.IS_TOGGLE_MOD_ON, currentVehicle, 18);
-                bool turboOwned = VehicleSaveData.IsTurboOwned(currentVehicle.DisplayName);
+                bool turboOwned = VehicleSaveData.IsTurboOwned(VehicleKey(currentVehicle));
 
                 var noneItem = new NativeItem("None");
                 if (!hasTurbo)
@@ -2900,7 +3164,7 @@ namespace ExtendedLSC
                 {
                     turboTuningItem.AltTitle = "";
                     itemOwnershipStatus[turboTuningItem] = STATUS_INSTALLED;
-                    if (!turboOwned) VehicleSaveData.SetTurboOwned(currentVehicle.DisplayName);
+                    if (!turboOwned) VehicleSaveData.SetTurboOwned(VehicleKey(currentVehicle));
                 }
                 else if (turboOwned)
                 {
@@ -2913,13 +3177,13 @@ namespace ExtendedLSC
                 }
                 turboTuningItem.Activated += (s, e) =>
                 {
-                    bool owned = VehicleSaveData.IsTurboOwned(currentVehicle.DisplayName);
+                    bool owned = VehicleSaveData.IsTurboOwned(VehicleKey(currentVehicle));
                     if (!TryPurchase(ModPricing.TurboPrice, owned)) return;
 
                     SetTurbo(true);
                     if (!owned)
                     {
-                        VehicleSaveData.SetTurboOwned(currentVehicle.DisplayName);
+                        VehicleSaveData.SetTurboOwned(VehicleKey(currentVehicle));
                         VehicleSaveData.Save();
                     }
                 };
@@ -2929,9 +3193,21 @@ namespace ExtendedLSC
                 // and (first time) prompts for the spray button. Hold the NOS button while open to preview.
                 {
                     var nosFxMenu = CreateNosColorMenu();
-                    nosFxMenu.Closed += (s, e) => { if (!isNavigatingMenu) { turboMenu.Visible = true; nosColorMenuOpen = false; elscTransmission?.StopExhaustFlames(); } };
-                    var nosFxNav = new NativeItem("Nitrous (NOS)") { AltTitle = ">>" };
-                    nosFxNav.Description = $"Buy & equip a nitrous tier (NOS 1-4). Hold {ModSettings.NosKey} to preview on the car.";
+                    nosMenu = nosFxMenu;   // for the context "Preview" hint in the hint bar
+                    var nosFxNav = new NativeItem("Nitrous (NOS)");
+                    nosFxNav.Description = "Buy & equip a nitrous tier (NOS 1-4), then hold Preview to see it on the car.";
+                    // Equipped (a tier active) -> garage icon; owned but Off -> owned tick; nothing owned -> ">>".
+                    void RefreshNosNav()
+                    {
+                        string vn = VehicleKey(currentVehicle);
+                        int eq = VehicleSaveData.GetNosEquippedTier(vn);
+                        int ownedMask = VehicleSaveData.GetNosOwnedTiers(vn);
+                        if (eq >= 0) { nosFxNav.AltTitle = ""; itemOwnershipStatus[nosFxNav] = STATUS_INSTALLED; }
+                        else if (ownedMask != 0) { nosFxNav.AltTitle = ""; itemOwnershipStatus[nosFxNav] = STATUS_OWNED; }
+                        else { nosFxNav.AltTitle = ">>"; itemOwnershipStatus.Remove(nosFxNav); }
+                    }
+                    RefreshNosNav();
+                    nosFxMenu.Closed += (s, e) => { if (!isNavigatingMenu) { turboMenu.Visible = true; nosColorMenuOpen = false; elscTransmission?.StopExhaustFlames(); RefreshNosNav(); } };
                     nosFxNav.Activated += (s, e) => { isNavigatingMenu = true; turboMenu.Visible = false; nosColorMenuOpen = true; nosFxMenu.Visible = true; isNavigatingMenu = false; };
                     turboMenu.Add(nosFxNav);
                 }
@@ -3428,7 +3704,7 @@ namespace ExtendedLSC
                     try { wheelFitment.RestoreSuspension(); } catch { }
                 wheelFitment.Initialize(currentVehicle);
                 lastFitmentVehicle = currentVehicle;
-                string vehName = currentVehicle.DisplayName;
+                string vehName = VehicleKey(currentVehicle);
                 if (VehicleSaveData.IsWheelFitmentOwned(vehName))
                 {
                     var saved = VehicleSaveData.GetFitmentData(vehName);
@@ -3540,6 +3816,17 @@ namespace ExtendedLSC
         {
             try
             {
+                // A vanilla suspension (Stock or a level) is now the active suspension, so Custom is no longer
+                // equipped (it stays OWNED). Rebuild so the equipped icon moves off Custom onto the vanilla pick.
+                if (currentVehicle != null && currentVehicle.Exists() &&
+                    VehicleSaveData.IsCustomSuspensionEquipped(VehicleKey(currentVehicle)))
+                {
+                    VehicleSaveData.SetCustomSuspensionEquipped(VehicleKey(currentVehicle), false);
+                    VehicleSaveData.Save();
+                    CaptureMenuPosition();
+                    RebuildMenusForVehicle();
+                }
+
                 if (!wheelFitment.IsInitialized) return;
                 wheelFitment.SuspendRideHeight = false;
                 wheelFitment.RefreshStockFake();   // the game just set the new level's ride height
@@ -3549,6 +3836,68 @@ namespace ExtendedLSC
                 RebuildOpenFitmentMenu();           // reflect the zeroed ride-height slider if it's open
             }
             catch { }
+        }
+
+        // A vanilla transmission (Stock or a level) was chosen, so Manual Transmission is no longer the active
+        // transmission (it stays OWNED). Disable it + rebuild so the equipped icon moves off MT onto the pick.
+        private void OnGameTransmissionChosen()
+        {
+            try
+            {
+                if (currentVehicle == null || !currentVehicle.Exists()) return;
+                if (!VehicleSaveData.IsManualTransmissionEquipped(VehicleKey(currentVehicle))) return;
+                elscTransmission.Disable();
+                VehicleSaveData.SetManualTransmissionEquipped(VehicleKey(currentVehicle), false);
+                VehicleSaveData.Save();
+                CaptureMenuPosition();
+                RebuildMenusForVehicle();
+            }
+            catch { }
+        }
+
+        // Equip Manual Transmission as the ACTIVE transmission: drop any vanilla level, flag it equipped, enable
+        // manual shifting, then rebuild so the equipped icon lands on MT (vanilla levels drop to owned-tick).
+        private void EquipManualTransmission()
+        {
+            if (currentVehicle == null || !currentVehicle.Exists()) return;
+            string vn = VehicleKey(currentVehicle);
+            isPreviewingMod = false; previewModIndex = -1;
+            Function.Call(Hash.SET_VEHICLE_MOD_KIT, currentVehicle, 0);
+            Function.Call(Hash.REMOVE_VEHICLE_MOD, currentVehicle, 13);   // drop vanilla transmission (mutually exclusive)
+            previewOriginalValue = -1;
+            VehicleSaveData.SetManualTransmissionOwned(vn, true);
+            VehicleSaveData.SetManualTransmissionEquipped(vn, true);
+            VehicleSaveData.Save();
+            elscTransmission.SetVehicle(currentVehicle);
+            elscTransmission.Enable();
+            // Manual Transmission needs a gauge (gear/RPM readout) — turn one on for THIS car if it has none.
+            if (VehicleSaveData.GetSpeedoStyle(vn) == 0)
+            {
+                VehicleSaveData.SetSpeedoStyle(vn, (int)SpeedoStyle.Simple);
+                Speedo.Active = SpeedoStyle.Simple;
+                ShowNotification("~g~Speedometer enabled for Manual Transmission");
+            }
+            ShowNotification("~g~Manual Transmission equipped~w~ — select again to edit keys");
+            CaptureMenuPosition();
+            RebuildMenusForVehicle();
+        }
+
+        // Equip Custom Suspension & Camber as the ACTIVE suspension: drop any vanilla level, flag it equipped,
+        // re-apply the saved custom ride-height/camber, then rebuild so the equipped icon lands on Custom.
+        private void EquipCustomSuspension()
+        {
+            if (currentVehicle == null || !currentVehicle.Exists()) return;
+            string vn = VehicleKey(currentVehicle);
+            isPreviewingMod = false; previewModIndex = -1;   // don't let a menu-close revert undo the removal
+            Function.Call(Hash.SET_VEHICLE_MOD_KIT, currentVehicle, 0);
+            Function.Call(Hash.REMOVE_VEHICLE_MOD, currentVehicle, 15);   // strip vanilla Suspension lowering
+            previewOriginalValue = -1;
+            VehicleSaveData.SetCustomSuspensionEquipped(vn, true);
+            VehicleSaveData.Save();
+            if (wheelFitment.IsInitialized) { wheelFitment.SuspendRideHeight = false; wheelFitment.ApplyRideHeightNow(); }
+            ShowNotification("~g~Custom Suspension equipped~w~ — select again to edit");
+            CaptureMenuPosition();
+            RebuildMenusForVehicle();
         }
 
         private void SaveCurrentFitment()
@@ -3567,10 +3916,10 @@ namespace ExtendedLSC
                 VisualSize = wheelFitment.VisualSize,
                 VisualWidth = wheelFitment.VisualWidth
             };
-            VehicleSaveData.SetFitmentData(currentVehicle.DisplayName, fitmentData);
+            VehicleSaveData.SetFitmentData(VehicleKey(currentVehicle), fitmentData);
             // Mark "owned" so InitFitmentForVehicle re-loads this on re-entry (the purchase gate that used
             // to set this was removed — fitment is now free, and saving is what flags a car as customised).
-            VehicleSaveData.SetWheelFitmentOwned(currentVehicle.DisplayName, true);
+            VehicleSaveData.SetWheelFitmentOwned(VehicleKey(currentVehicle), true);
             VehicleSaveData.Save();
 
             // Also record this SPECIFIC car (model + plate + fingerprint + decorator tag) so the stance
@@ -3642,7 +3991,7 @@ namespace ExtendedLSC
             // Items can span multiple game slots, so snapshot each slot's value on open and revert on close;
             // a purchase updates that baseline so the chosen part sticks.
             var previewOriginals = new Dictionary<int, int>();
-            string vehicleName = currentVehicle != null ? currentVehicle.DisplayName : "";
+            string vehicleName = VehicleKey(currentVehicle);
 
             menu.Shown += (s, e) =>
             {
@@ -3705,14 +4054,14 @@ namespace ExtendedLSC
                     }
                     if (capturedItem.SourceModType < 0 || currentVehicle == null || !currentVehicle.Exists()) return;
                     bool own = Function.Call<int>(Hash.GET_VEHICLE_MOD, currentVehicle, capturedItem.SourceModType) == capturedItem.Value
-                               || VehicleSaveData.IsModOwned(currentVehicle.DisplayName, capturedItem.SourceModType, capturedItem.Value);
+                               || VehicleSaveData.IsModOwned(VehicleKey(currentVehicle), capturedItem.SourceModType, capturedItem.Value);
                     if (!TryPurchase(capturedItem.Price, own)) return;
                     Function.Call(Hash.SET_VEHICLE_MOD_KIT, currentVehicle, 0);
                     Function.Call(Hash.SET_VEHICLE_MOD, currentVehicle, capturedItem.SourceModType, capturedItem.Value, false);
                     previewOriginals[capturedItem.SourceModType] = capturedItem.Value;   // keep it on close
                     if (!own)
                     {
-                        VehicleSaveData.SetModOwned(currentVehicle.DisplayName, capturedItem.SourceModType, capturedItem.Value);
+                        VehicleSaveData.SetModOwned(VehicleKey(currentVehicle), capturedItem.SourceModType, capturedItem.Value);
                         VehicleSaveData.Save();
                     }
                     itemOwnershipStatus[menuItem] = STATUS_INSTALLED;
@@ -4658,7 +5007,7 @@ namespace ExtendedLSC
 
             var menu = CreateMenu(category.DisplayName);
             int currentValue = getCurrentValue?.Invoke() ?? -1;
-            string vehicleName = currentVehicle?.DisplayName ?? "";
+            string vehicleName = VehicleKey(currentVehicle);
 
             foreach (var item in category.Items)
             {
@@ -4701,14 +5050,14 @@ namespace ExtendedLSC
                 {
                     if (currentVehicle == null) return;
 
-                    bool owned = capturedItem.Value >= 0 && VehicleSaveData.IsCustomItemOwned(currentVehicle.DisplayName, capturedCategoryPath, capturedItem.Value);
+                    bool owned = capturedItem.Value >= 0 && VehicleSaveData.IsCustomItemOwned(VehicleKey(currentVehicle), capturedCategoryPath, capturedItem.Value);
                     if (!TryPurchase(capturedPrice, owned)) return;
 
                     onActivate(capturedItem);
                     // Mark as owned when purchased
                     if (capturedItem.Value >= 0 && !owned)
                     {
-                        VehicleSaveData.SetCustomItemOwned(currentVehicle.DisplayName, capturedCategoryPath, capturedItem.Value);
+                        VehicleSaveData.SetCustomItemOwned(VehicleKey(currentVehicle), capturedCategoryPath, capturedItem.Value);
                         VehicleSaveData.Save();
                     }
                     // Refresh the menu to show updated icons
@@ -4729,7 +5078,7 @@ namespace ExtendedLSC
         private void RefreshConfigMenuStatus(string categoryPath, int newInstalledValue)
         {
             if (!configMenusByPath.TryGetValue(categoryPath, out var menu)) return;
-            string vehicleName = currentVehicle?.DisplayName ?? "";
+            string vehicleName = VehicleKey(currentVehicle);
 
             foreach (var menuItemBase in menu.Items)
             {
@@ -4766,22 +5115,136 @@ namespace ExtendedLSC
         /// </summary>
         private NativeMenu CreateWindowTintMenuFromConfig()
         {
+            // Custom Color follows the ELSC equip model (same as Custom Suspension / Manual Transmission):
+            // NOT owned -> price; owned but NOT active -> owned tick + "Select to equip"; owned AND active ->
+            // equipped garage icon + "Select to edit". Equipping applies the custom glass color (mutually
+            // exclusive with the presets); selecting a preset un-equips it (the chosen color is preserved).
+            NativeItem customColorItem = null;
+            const int customColorPrice = 500;
+
+            // Custom is "equipped" when a custom color is actively saved (CurrentColor != 0).
+            bool CustomColorEquipped() =>
+                currentVehicle != null && VehicleSaveData.IsCustomItemOwned(VehicleKey(currentVehicle), "Windows", WINDOW_CUSTOM_COLOR_KEY)
+                && windowTint.CurrentColor(currentVehicle) != 0;
+
+            void RefreshCustomColorItem()
+            {
+                if (customColorItem == null || currentVehicle == null) return;
+                bool owned = VehicleSaveData.IsCustomItemOwned(VehicleKey(currentVehicle), "Windows", WINDOW_CUSTOM_COLOR_KEY);
+                if (!owned)
+                {
+                    itemOwnershipStatus.Remove(customColorItem);
+                    customColorItem.AltTitle = $"${customColorPrice}";
+                    customColorItem.Description = "Buy a custom glass color you can fine-tune.";
+                }
+                else if (CustomColorEquipped())
+                {
+                    customColorItem.AltTitle = "";
+                    itemOwnershipStatus[customColorItem] = STATUS_INSTALLED;
+                    customColorItem.Description = "Select to edit your custom glass color.";
+                }
+                else
+                {
+                    customColorItem.AltTitle = "";
+                    itemOwnershipStatus[customColorItem] = STATUS_OWNED;
+                    customColorItem.Description = "Select to equip your custom glass color.";
+                }
+            }
+
+            // Equip the custom glass color as the active tint (restores the last chosen color, or a default).
+            void EquipCustomColor()
+            {
+                if (currentVehicle == null || !currentVehicle.Exists()) return;
+                if (!windowTint.Ready) { ShowNotification("~y~Window-color table initializing… try again in a moment."); return; }
+                int last = windowTint.LastColor(currentVehicle);
+                int argb = last != 0 ? last : WindowTintManager.PackArgb(64, 0, 0, 0);
+                windowTint.ApplyCustomColor(currentVehicle, argb);
+                windowTintPurchased = true;                 // don't revert on close
+                RefreshConfigMenuStatus("Windows", -999);   // no preset shows the equipped icon now
+                RefreshCustomColorItem();                   // Custom shows the equipped garage icon
+                ShowNotification("~g~Custom glass color equipped~w~ — select again to edit");
+            }
+
             var menu = CreateMenuFromConfig(
                 "Windows",
                 () => (int)currentVehicle.Mods.WindowTint,
-                (item) => { windowTint.ClearCustomColor(currentVehicle); ApplyWindowTint(item.Value); }
+                (item) =>
+                {
+                    // Selecting a preset un-equips Custom (its chosen color is preserved for re-equip).
+                    windowTint.ClearCustomColor(currentVehicle);
+                    ApplyWindowTint(item.Value);
+                    windowTintPurchased = true;
+                    RefreshCustomColorItem();   // Custom drops back to the owned tick
+                }
             );
             if (menu == null) return null;
 
-            // Custom Color picker (requires the dlc_elsc clear-glass texture). Choosing a preset above clears it.
             var colorMenu = CreateCustomWindowColorMenu();
-            var openItem = new NativeItem("Custom Color") { AltTitle = ">>" };
-            openItem.Activated += (s, e) =>
+
+            // Hover preview of the custom glass color (uses the active or last-chosen color, never wipes it).
+            void PreviewCustomColor()
             {
+                if (currentVehicle == null || !currentVehicle.Exists() || !windowTint.CanPreview) return;
+                int saved = windowTint.CurrentColor(currentVehicle);
+                int last = windowTint.LastColor(currentVehicle);
+                int argb = saved != 0 ? saved : (last != 0 ? last : WindowTintManager.PackArgb(64, 0, 0, 0));
+                windowTint.PreviewColor(currentVehicle, argb);
+            }
+
+            menu.Shown += (s, e) =>
+            {
+                if (currentVehicle == null || !currentVehicle.Exists()) return;
+                origWindowTint = (int)currentVehicle.Mods.WindowTint;
+                windowTintPurchased = false;
+                RefreshCustomColorItem();
+                // Park the car off per-tick assertion for the session so preset previews don't fight the
+                // custom color; restore the real look immediately (BeginPreview moves it to the preview slot).
+                windowTint.BeginPreview(currentVehicle);
+                currentVehicle.Mods.WindowTint = (VehicleWindowTint)origWindowTint;
+            };
+            menu.SelectedIndexChanged += (s, e) =>
+            {
+                if (currentVehicle == null || !currentVehicle.Exists()) return;
+                if (e.Index < 0 || e.Index >= menu.Items.Count) return;
+                var hovered = menu.Items[e.Index] as NativeItem;
+                if (hovered != null && hovered == customColorItem) { PreviewCustomColor(); return; }
+                if (hovered != null && configItemMetadata.TryGetValue(hovered, out var meta) && meta.Item2 >= 0)
+                    currentVehicle.Mods.WindowTint = (VehicleWindowTint)meta.Item2;
+            };
+            menu.Closed += (s, e) =>
+            {
+                if (isNavigatingMenu) return;   // opening the color picker — don't revert / release the preview
+                windowTint.EndPreview();
+                if (!windowTintPurchased && origWindowTint >= 0 && currentVehicle != null && currentVehicle.Exists())
+                    currentVehicle.Mods.WindowTint = (VehicleWindowTint)origWindowTint;
+            };
+
+            customColorItem = new NativeItem("Custom Color");
+            RefreshCustomColorItem();
+            customColorItem.Activated += (s, e) =>
+            {
+                if (currentVehicle == null) return;
+                string vn = VehicleKey(currentVehicle);
+                bool owned = VehicleSaveData.IsCustomItemOwned(vn, "Windows", WINDOW_CUSTOM_COLOR_KEY);
+
+                if (!owned)
+                {
+                    if (!TryPurchase(customColorPrice, false)) return;
+                    VehicleSaveData.SetCustomItemOwned(vn, "Windows", WINDOW_CUSTOM_COLOR_KEY);
+                    VehicleSaveData.Save();
+                    EquipCustomColor();   // buy + equip; select again to edit
+                    return;
+                }
+                if (!CustomColorEquipped())
+                {
+                    EquipCustomColor();   // equip; select again to edit
+                    return;
+                }
+                // Equipped -> open the RGB adjuster (edit).
                 isNavigatingMenu = true; menu.Visible = false; colorMenu.Visible = true; isNavigatingMenu = false;
             };
-            colorMenu.Closed += (s, e) => { if (!isNavigatingMenu) menu.Visible = true; };
-            menu.Add(openItem);
+            colorMenu.Closed += (s, e) => { if (!isNavigatingMenu) { menu.Visible = true; RefreshCustomColorItem(); } };
+            menu.Add(customColorItem);
             return menu;
         }
 
@@ -5081,7 +5544,7 @@ namespace ExtendedLSC
             modMenusByIndex[modIndex] = menu;
 
             int currentMod = Function.Call<int>(Hash.GET_VEHICLE_MOD, currentVehicle, modIndex);
-            string vehicleName = currentVehicle.DisplayName;
+            string vehicleName = VehicleKey(currentVehicle);
             int idx = modIndex; // Capture for closure
             bool hasStock = !noStockOption; // Capture for closure
 
@@ -5145,7 +5608,12 @@ namespace ExtendedLSC
                     default: stockLabel = "Stock"; break;
                 }
                 var stockItem = new NativeItem(stockLabel);
-                if (currentMod == -1)
+                // When an ELSC custom part is the active equip (Custom Suspension for slot 15, Manual Transmission
+                // for slot 13), Stock must NOT show the equipped icon — the custom item owns it — even though no
+                // vanilla mod is installed (slot == -1).
+                bool customActive = (idx == 15 && VehicleSaveData.IsCustomSuspensionEquipped(vehicleName))
+                                 || (idx == 13 && VehicleSaveData.IsManualTransmissionEquipped(vehicleName));
+                if (currentMod == -1 && !customActive)
                 {
                     stockItem.AltTitle = "";
                     itemOwnershipStatus[stockItem] = STATUS_INSTALLED;
@@ -5162,6 +5630,7 @@ namespace ExtendedLSC
                     previewModIndex = -1;
                     ApplyModByIndex(idx, -1);
                     if (idx == 15) OnGameSuspensionChosen();
+                    if (idx == 13) OnGameTransmissionChosen();
                 };
                 menu.Add(stockItem);
             }
@@ -5205,7 +5674,7 @@ namespace ExtendedLSC
                 item.Activated += (s, e) =>
                 {
                     if (editModeActive) { ShowNotification("~y~Edit mode: preview only"); return; }
-                    bool owned = VehicleSaveData.IsModOwned(currentVehicle.DisplayName, idx, modValue);
+                    bool owned = VehicleSaveData.IsModOwned(VehicleKey(currentVehicle), idx, modValue);
                     if (!TryPurchase(capturedPrice, owned)) return;
 
                     // Purchasing - clear preview state first
@@ -5215,6 +5684,7 @@ namespace ExtendedLSC
                     int prevEngine = Function.Call<int>(Hash.GET_VEHICLE_MOD, currentVehicle, idx);
                     ApplyModByIndex(idx, modValue);
                     if (idx == 15) OnGameSuspensionChosen();
+                    if (idx == 13) OnGameTransmissionChosen();
                     // New engine hardware -> the dyno tune no longer matches; reset it (keeps the unlock).
                     if (idx == 11 && ModSettings.VehicleTuning && currentTuning.Unlocked && prevEngine != modValue)
                     {
@@ -5224,7 +5694,7 @@ namespace ExtendedLSC
                     // Mark as owned when purchased
                     if (!owned)
                     {
-                        VehicleSaveData.SetModOwned(currentVehicle.DisplayName, idx, modValue);
+                        VehicleSaveData.SetModOwned(VehicleKey(currentVehicle), idx, modValue);
                         VehicleSaveData.Save();
                     }
                 };
@@ -5339,7 +5809,7 @@ namespace ExtendedLSC
                 if (EditBlockApply()) return;
                 isPreviewingSwap = false;
                 ApplyEngineSwap(null);
-                VehicleSaveData.SetEngineSwapId(currentVehicle.DisplayName, null);
+                VehicleSaveData.SetEngineSwapId(VehicleKey(currentVehicle), null);
                 VehicleSaveData.Save();
                 RefreshIcons();
             };
@@ -5358,7 +5828,7 @@ namespace ExtendedLSC
                     bool changedSwap = !owned;
                     isPreviewingSwap = false;
                     ApplyEngineSwap(captured);
-                    VehicleSaveData.SetEngineSwapId(currentVehicle.DisplayName, captured.Id);
+                    VehicleSaveData.SetEngineSwapId(VehicleKey(currentVehicle), captured.Id);
                     VehicleSaveData.Save();
                     RefreshIcons();
                     // Swapped to a different engine -> reset the dyno tune (keeps the unlock).
@@ -5392,7 +5862,7 @@ namespace ExtendedLSC
                 tuningStockCache[mh] = stock;
             }
             currentStock = stock;
-            currentTuning = VehicleSaveData.GetTuningData(currentVehicle.DisplayName);
+            currentTuning = VehicleSaveData.GetTuningData(VehicleKey(currentVehicle));
             ApplyTuning();
         }
 
@@ -5431,15 +5901,29 @@ namespace ExtendedLSC
             SetH(currentVehicle, H_STEER, lk);
             SetH(currentVehicle, H_STEER_INV, lk > 0.0001f ? 1f / lk : 0f);
 
-            // Extra gears (staged behind GEARS_VERIFIED). Stock count cached in s[7]; applies on vehicle reload.
+            // Extra gears: write the LIVE gearbox top-gear count (the model handling field 0x50 only applies on a
+            // vehicle reload — the running car never sees it). Then re-cache MT and re-space the ratios so the NEW
+            // gear gets a real ratio (not garbage). Idempotent: always targets stock + N, so N=0 restores stock.
             if (GEARS_VERIFIED && s.Length > 7 && s[7] > 0)
-                WheelFitment.WheelMemory.SetHandlingGears(currentVehicle, (int)s[7] + Math.Max(0, t.GearCount));
+            {
+                int target = (int)s[7] + Math.Max(0, t.GearCount);
+                ManualTransmission.VehicleMemory.SetTopGear(currentVehicle, target);   // live count (game + MT read this)
+                // NOTE: do NOT write SetHandlingGears here. That field (nInitialDriveGears 0x50) is model-shared and
+                // persists across a script reload, and CaptureTuningStock READS it as "stock" — so writing stock+N
+                // back to it made every reload re-capture the tuned value and add the tune again (5->6->7->8...).
+                // The live SetTopGear above is the real mechanism; it's re-applied by InitTuningForVehicle on entry.
+                if (elscTransmission != null)
+                {
+                    if (elscTransmission.IsEnabled) elscTransmission.RefreshGears((int)s[7]);    // re-cache + extend range from stock
+                    else elscTransmission.ApplyNfsGearing(currentVehicle, (int)s[7]);            // automatic: extend range from stock
+                }
+            }
         }
 
         private void PersistTuning()
         {
             if (currentVehicle != null && currentVehicle.Exists())
-                VehicleSaveData.SetTuningData(currentVehicle.DisplayName, currentTuning);
+                VehicleSaveData.SetTuningData(VehicleKey(currentVehicle), currentTuning);
         }
 
         /// <summary>Reset the tune values to factory (keeps the dyno unlock), re-apply, persist, resync sliders.
@@ -5496,6 +5980,10 @@ namespace ExtendedLSC
             var menu = CreateMenu("VEHICLE TUNING");
             tuningMenu = menu;
             PopulateTuningMenu(menu);
+            // Rebuild every time the menu opens so a gating part bought elsewhere (Suspension / Brakes /
+            // Transmission / Manual Transmission) unlocks its slider the moment you re-enter Vehicle Tuning,
+            // instead of staying locked until a full menu rebuild.
+            menu.Shown += (s, e) => PopulateTuningMenu(menu);
             menu.Closed += (s, e) => VehicleSaveData.Save();
             return menu;
         }
@@ -5559,14 +6047,14 @@ namespace ExtendedLSC
                 for (int g = 1; g <= extraGears; g++) opts[g] = $"+{g}";
                 var gi = new NativeListItem<string>("Gears", opts)
                 { SelectedIndex = Math.Min(Math.Max(0, currentTuning.GearCount), extraGears) };
-                gi.Description = "Add gears for a broader powerband. Unlocked by stronger engines."
+                gi.Description = "Add gears for more top end. Unlocked by Manual Transmission (or a stronger engine)."
                     + (GEARS_VERIFIED ? "" : " (Coming with the next update.)");
                 gi.ItemChanged += (s, e) => { currentTuning.GearCount = gi.SelectedIndex; ApplyTuning(); PersistTuning(); };
                 _tuningResync.Add(() => { gi.SelectedIndex = Math.Min(Math.Max(0, currentTuning.GearCount), extraGears); });
                 NoWrap(gi);
                 menu.Add(gi);
             }
-            else menu.Add(LockedItem("Gears", "Install an Engine upgrade (EMS 2+) or an engine swap to add gears."));
+            else menu.Add(LockedItem("Gears", "Equip Manual Transmission (or install an Engine upgrade / swap) to add gears."));
 
             // ---- Tire Grip : gated by Suspension ----
             if (u.Susp >= 0)
@@ -5577,14 +6065,14 @@ namespace ExtendedLSC
                     () => currentTuning.GripMult * 100f, v => currentTuning.GripMult = v / 100f,
                     "Cornering grip. Right = more traction. Better suspension widens the range."));
             }
-            else menu.Add(LockedItem("Tire Grip", "Install a Suspension upgrade to tune grip."));
+            else menu.Add(LockedItem("Tire Grip", "Set up Custom Suspension & Camber (or install a Suspension upgrade) to tune grip."));
 
             // ---- Steering Lock : gated by Suspension ----
             if (u.Susp >= 0)
                 menu.Add(MakeBarSlider("Steering Lock", 95, u.Susp >= 2 ? 115 : 108, 9,
                     () => currentTuning.SteerLockMult * 100f, v => currentTuning.SteerLockMult = v / 100f,
                     "Maximum steering angle. Right = sharper turn-in."));
-            else menu.Add(LockedItem("Steering Lock", "Install a Suspension upgrade to sharpen steering."));
+            else menu.Add(LockedItem("Steering Lock", "Set up Custom Suspension & Camber (or install a Suspension upgrade) to sharpen steering."));
 
             // ---- Power Split : AWD cars only, gated by Race Transmission ----
             bool awd = currentStock != null && currentStock.Length > 4 && currentStock[4] > 0.05f && currentStock[4] < 0.95f;
@@ -5613,7 +6101,7 @@ namespace ExtendedLSC
         }
 
         // What the installed performance parts unlock for tuning (-1 = stock/not installed; 0..N = part level).
-        private struct TuneUnlocks { public int Trans, Engine, Susp, Brakes; public bool HasSwap; }
+        private struct TuneUnlocks { public int Trans, Engine, Susp, Brakes; public bool HasSwap, HasManual; }
         private TuneUnlocks GetUnlocks(Vehicle v)
         {
             var u = new TuneUnlocks { Trans = -1, Engine = -1, Susp = -1, Brakes = -1 };
@@ -5622,7 +6110,20 @@ namespace ExtendedLSC
             u.Engine = Function.Call<int>(Hash.GET_VEHICLE_MOD, v, 11);
             u.Susp = Function.Call<int>(Hash.GET_VEHICLE_MOD, v, 15);
             u.Brakes = Function.Call<int>(Hash.GET_VEHICLE_MOD, v, 12);
-            u.HasSwap = !string.IsNullOrEmpty(VehicleSaveData.GetEngineSwapId(v.DisplayName));
+            u.HasSwap = !string.IsNullOrEmpty(VehicleSaveData.GetEngineSwapId(VehicleKey(v)));
+            // ELSC's Manual Transmission is a transmission upgrade in its own right (NOT a vanilla mod slot 13),
+            // so count it as a high transmission tier — this unlocks Final Drive (and widens its range) even
+            // when no vanilla Transmission mod is installed.
+            if (VehicleSaveData.IsManualTransmissionOwned(VehicleKey(v)))
+            {
+                u.Trans = Math.Max(u.Trans, 2);
+                u.HasManual = true;   // gates the Gears tuning (the +gears feature is driven by MT)
+            }
+            // Custom Suspension & Camber (fitment) is ELSC's FREE suspension feature — once the player has set
+            // up a custom stance for this car, count it as suspension installed (unlocks Tire Grip / Steering
+            // Lock), since there's no vanilla suspension mod to read in that case.
+            if (VehicleSaveData.IsWheelFitmentOwned(VehicleKey(v)))
+                u.Susp = Math.Max(u.Susp, 1);
             return u;
         }
 
@@ -5640,6 +6141,9 @@ namespace ExtendedLSC
         {
             int n = u.Engine >= 2 ? 2 : u.Engine >= 1 ? 1 : 0;
             if (u.HasSwap) n += 1;
+            // Manual Transmission is the gateway to gear tuning — owning it unlocks the extra-gear range even on a
+            // stock engine. Engine/swap still stack toward the cap.
+            if (u.HasManual) n = Math.Max(n, 2);
             return Math.Min(n, 3);
         }
 
@@ -5760,7 +6264,7 @@ namespace ExtendedLSC
                 bool currentTypeMatches = previewOrigWheelType == wType;
                 // Highlight the rim installed on the axle currently being edited (rear when "Rear Only").
                 int installedMod = wheelApplyAxle == 2 ? previewOrigBackMod : previewOrigWheelMod;
-                string vName = currentVehicle != null && currentVehicle.Exists() ? currentVehicle.DisplayName : null;
+                string vName = VehicleKey(currentVehicle);
                 foreach (var (item, wi) in wheelItems)
                 {
                     itemOwnershipStatus.Remove(item);
@@ -5839,7 +6343,7 @@ namespace ExtendedLSC
                 // Show the owned icon (and make it free) if this wheel was bought before — matches every
                 // other mod category, which the wheel menu previously didn't do (wheels weren't saved).
                 bool ownedAtBuild = currentVehicle != null && currentVehicle.Exists()
-                    && VehicleSaveData.IsModOwned(currentVehicle.DisplayName, 23, WheelOwnKey(wType, i));
+                    && VehicleSaveData.IsModOwned(VehicleKey(currentVehicle), 23, WheelOwnKey(wType, i));
                 if (ownedAtBuild)
                 {
                     item.AltTitle = ""; // icon drawn instead of price
@@ -5854,14 +6358,14 @@ namespace ExtendedLSC
                 int wheelPrice = price;
                 item.Activated += (s, e) =>
                 {
-                    bool owned = VehicleSaveData.IsModOwned(currentVehicle.DisplayName, 23, WheelOwnKey(wType, wheelIndex));
+                    bool owned = VehicleSaveData.IsModOwned(VehicleKey(currentVehicle), 23, WheelOwnKey(wType, wheelIndex));
                     if (!TryPurchase(wheelPrice, owned)) return;
                     wheelPurchased = true; // keep the preview, don't revert on close
                     ApplyWheelAxle(wType, wheelIndex, wheelApplyAxle);
                     // Save wheel ownership so it's free to re-install later and shows the owned icon.
                     if (!owned)
                     {
-                        VehicleSaveData.SetModOwned(currentVehicle.DisplayName, 23, WheelOwnKey(wType, wheelIndex));
+                        VehicleSaveData.SetModOwned(VehicleKey(currentVehicle), 23, WheelOwnKey(wType, wheelIndex));
                         VehicleSaveData.Save();
                     }
                     // This wheel is now installed on the chosen axle(s) — update the revert baseline + icon.
@@ -5944,26 +6448,31 @@ namespace ExtendedLSC
         {
             var menu = CreateMenu("HEADLIGHT COLOR");
 
-            // Xenon headlight color names (indices 0-12)
+            // Xenon headlight color names — these MUST match GTA's xenon color enum exactly (the index is what
+            // SET_VEHICLE_XENON_LIGHT_COLOR_INDEX takes). A spurious "Default White" used to sit at 0, shifting every
+            // label one slot off its real color (e.g. "Red" applied index 9 = Pony Pink). Index 0 = White (default).
             var colors = new[]
             {
-                (0, "Default White"),
-                (1, "White"),
-                (2, "Blue"),
-                (3, "Electric Blue"),
-                (4, "Mint Green"),
-                (5, "Lime Green"),
-                (6, "Yellow"),
-                (7, "Golden Shower"),
-                (8, "Orange"),
-                (9, "Red"),
-                (10, "Pony Pink"),
-                (11, "Hot Pink"),
-                (12, "Purple")
+                (0, "White"),
+                (1, "Blue"),
+                (2, "Electric Blue"),
+                (3, "Mint Green"),
+                (4, "Lime Green"),
+                (5, "Yellow"),
+                (6, "Golden Shower"),
+                (7, "Orange"),
+                (8, "Red"),
+                (9, "Pony Pink"),
+                (10, "Hot Pink"),
+                (11, "Purple"),
+                (12, "Blacklight")
             };
 
             // Get current color
             int currentColor = Function.Call<int>(Hash.GET_VEHICLE_XENON_LIGHT_COLOR_INDEX, currentVehicle);
+            // The color the player has actually committed to (bought/applied). Hover only PREVIEWS; if they back out
+            // without applying, we revert to this on close so the preview doesn't stick.
+            int committedColor = currentColor;
 
             foreach (var (colorIndex, colorName) in colors)
             {
@@ -5996,8 +6505,9 @@ namespace ExtendedLSC
                         if (!TryPurchase(250, false)) return;
                     }
 
-                    // Apply color
+                    // Apply color — now it's committed, so the close-revert keeps it.
                     Function.Call(Hash.SET_VEHICLE_XENON_LIGHT_COLOR_INDEX, currentVehicle, idx);
+                    committedColor = idx;
                     if (activeDebugMode != DebugMode.None)
                         ShowNotification($"~g~{colorName} headlights installed!");
 
@@ -6028,13 +6538,13 @@ namespace ExtendedLSC
                 }
             };
 
-            // Store original color for revert on close
-            int originalColor = currentColor;
             menu.Closed += (s, e) =>
             {
-                // Turn headlights back to normal mode (0 = auto)
                 if (currentVehicle != null && currentVehicle.Exists())
                 {
+                    // Revert any un-bought preview back to the committed color, then restore auto light mode.
+                    if (Function.Call<bool>(Hash.IS_TOGGLE_MOD_ON, currentVehicle, 22))
+                        Function.Call(Hash.SET_VEHICLE_XENON_LIGHT_COLOR_INDEX, currentVehicle, committedColor);
                     Function.Call(Hash.SET_VEHICLE_LIGHTS, currentVehicle, 0);
                 }
             };
@@ -6070,6 +6580,39 @@ namespace ExtendedLSC
 
         private string PackagesDirectory => Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ExtendedLSC", "Packages");
 
+        /// <summary>Clear ELSC saves + package files tied to Menyoo's default placeholder plate ("menyoo").
+        /// Save entries are keyed by plate; package files store the captured plateText. Safe to run every load.</summary>
+        private void PurgeMenyooData()
+        {
+            try
+            {
+                int vehicles = VehicleSaveData.PurgeVehiclesByPlate("menyoo");
+
+                int pkgs = 0;
+                if (Directory.Exists(PackagesDirectory))
+                {
+                    foreach (var file in Directory.GetFiles(PackagesDirectory, "*.json"))
+                    {
+                        try
+                        {
+                            var p = LoadPackageData(file);
+                            if (p != null && !string.IsNullOrEmpty(p.plateText)
+                                && string.Equals(p.plateText.Trim(), "menyoo", StringComparison.OrdinalIgnoreCase))
+                            {
+                                File.Delete(file);
+                                pkgs++;
+                            }
+                        }
+                        catch { }
+                    }
+                }
+
+                if (vehicles > 0 || pkgs > 0)
+                    Log($"[Cleanup] Removed {vehicles} menyoo save(s) + {pkgs} menyoo package(s)");
+            }
+            catch (Exception ex) { Log($"[Cleanup] menyoo purge error: {ex.Message}"); }
+        }
+
         /// <summary>
         /// Create menu for saving/loading vehicle mod packages (Side Course feature)
         /// </summary>
@@ -6079,10 +6622,10 @@ namespace ExtendedLSC
 
             // Save current mods option
             var saveItem = new NativeItem("Save Current Mods");
-            saveItem.Description = "Save all current modifications to a package file";
+            saveItem.Description = "Save all current modifications to a package file (you'll be asked to name it)";
             saveItem.Activated += (s, e) =>
             {
-                SaveVehiclePackage();
+                BeginNamePackage();
             };
             menu.Add(saveItem);
 
@@ -6090,6 +6633,12 @@ namespace ExtendedLSC
 
             // Load saved packages
             LoadPackageItems(menu);
+
+            // Preview-on-hover: snapshot the car's mods when the menu opens, live-preview the highlighted package,
+            // commit on select, and revert to the snapshot on close (unless a package was committed).
+            menu.Shown += (s, e) => { CaptureVehicleModSnapshot(); _packageCommitted = false; PreviewSelectedPackage(); };
+            menu.SelectedIndexChanged += (s, e) => PreviewSelectedPackage();
+            menu.Closed += (s, e) => { if (!_packageCommitted) RestoreVehicleModSnapshot(); };
 
             return menu;
         }
@@ -6099,6 +6648,7 @@ namespace ExtendedLSC
         /// </summary>
         private void LoadPackageItems(NativeMenu menu)
         {
+            _packageItemPaths.Clear();   // rebuilding the list -> drop stale item->path mappings
             try
             {
                 if (!Directory.Exists(PackagesDirectory))
@@ -6127,8 +6677,36 @@ namespace ExtendedLSC
                     string filePath = file; // Capture for closure
 
                     var packageItem = new NativeItem(displayName);
-                    packageItem.Description = $"Load {displayName} package";
-                    packageItem.AltTitle = ">>";
+                    // Status, mirroring other ELSC items: this car's last-applied package -> equipped (garage) icon;
+                    // else if you own every part in it (offset $0) -> owned tick; else show the cost you'd pay.
+                    string equippedPkg = currentVehicle != null ? VehicleSaveData.GetEquippedPackage(VehicleKey(currentVehicle)) : null;
+                    bool isEquipped = string.Equals(equippedPkg, displayName, StringComparison.OrdinalIgnoreCase);
+                    try
+                    {
+                        var pkg = LoadPackageData(filePath);
+                        if (pkg == null) { packageItem.AltTitle = ">>"; packageItem.Description = $"Couldn't read {displayName}."; }
+                        else
+                        {
+                            int offset = ComputePackageOffset(pkg);
+                            if (isEquipped)
+                            {
+                                packageItem.AltTitle = ""; itemOwnershipStatus[packageItem] = STATUS_INSTALLED;
+                                packageItem.Description = $"Equipped. Hover to preview; select to re-apply. Press {Glyph((int)GTA.Control.FrontendX)} to delete.";
+                            }
+                            else if (offset > 0)
+                            {
+                                packageItem.AltTitle = $"${offset:N0}";
+                                packageItem.Description = $"Hover to preview; select to buy & apply (${offset:N0} for parts you don't own). Press {Glyph((int)GTA.Control.FrontendX)} to delete.";
+                            }
+                            else
+                            {
+                                packageItem.AltTitle = ""; itemOwnershipStatus[packageItem] = STATUS_OWNED;
+                                packageItem.Description = $"Owned. Hover to preview; select to apply (free). Press {Glyph((int)GTA.Control.FrontendX)} to delete.";
+                            }
+                        }
+                    }
+                    catch { packageItem.AltTitle = ">>"; }
+                    _packageItemPaths[packageItem] = filePath;   // for hover preview + X-to-delete
                     packageItem.Activated += (s, e) =>
                     {
                         LoadVehiclePackage(filePath);
@@ -6155,7 +6733,47 @@ namespace ExtendedLSC
         /// <summary>
         /// Save current vehicle mods to a package file
         /// </summary>
-        private void SaveVehiclePackage()
+        // Prompt the user to name the package (on-screen keyboard), then SaveVehiclePackage(name).
+        private void BeginNamePackage()
+        {
+            if (isNamingPackage) return;
+            if (currentVehicle == null || !currentVehicle.Exists())
+            {
+                ShowNotification("~r~No vehicle to save!");
+                return;
+            }
+            isNamingPackage = true; keyboardCheckCooldown = 5;
+            Function.Call(Hash.DISPLAY_ONSCREEN_KEYBOARD, 0, "FMMC_KEY_TIP8", "", "", "", "", "", 32);
+            ShowNotification("~y~Name this package (same name overwrites)");
+        }
+
+        private void UpdateNamePackage()
+        {
+            if (!isNamingPackage) return;
+            if (keyboardCheckCooldown > 0) { keyboardCheckCooldown--; return; }
+            keyboardCheckCooldown = 5;
+            int status = Function.Call<int>(Hash.UPDATE_ONSCREEN_KEYBOARD);
+            if (status == 1)
+            {
+                string result = (Function.Call<string>(Hash.GET_ONSCREEN_KEYBOARD_RESULT) ?? "").Trim();
+                isNamingPackage = false;
+                if (string.IsNullOrEmpty(result)) { ShowNotification("~r~Package not saved (empty name)."); return; }
+                SaveVehiclePackage(result);
+            }
+            else if (status == 2) { isNamingPackage = false; }   // cancelled
+        }
+
+        // Turn a user-typed package name into a safe filename token (so the same name maps to the same file).
+        private string SanitizePackageName(string name)
+        {
+            var sb = new System.Text.StringBuilder();
+            foreach (char c in name)
+                sb.Append((char.IsLetterOrDigit(c) || c == ' ' || c == '-') ? c : '_');
+            string clean = sb.ToString().Trim();
+            return string.IsNullOrEmpty(clean) ? "Package" : clean;
+        }
+
+        private void SaveVehiclePackage(string packageName)
         {
             if (currentVehicle == null || !currentVehicle.Exists())
             {
@@ -6170,58 +6788,28 @@ namespace ExtendedLSC
                     Directory.CreateDirectory(PackagesDirectory);
 
                 string vehicleModel = currentVehicle.Model.ToString();
-                string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-                string fileName = $"{vehicleModel}_{timestamp}.json";
+                string safeName = SanitizePackageName(packageName);
+                // Same vehicle + same name => identical path => File.WriteAllText overwrites the old package.
+                string fileName = $"{vehicleModel}_{safeName}.json";
                 string filePath = Path.Combine(PackagesDirectory, fileName);
+                bool overwrite = File.Exists(filePath);
 
-                // Collect current mods
-                var package = new System.Text.StringBuilder();
-                package.AppendLine("{");
-                package.AppendLine($"  \"vehicle\": \"{vehicleModel}\",");
-                package.AppendLine($"  \"created\": \"{DateTime.Now:yyyy-MM-dd HH:mm:ss}\",");
-                package.AppendLine("  \"mods\": {");
+                // Capture a complete, shareable snapshot of EVERYTHING ELSC can track, then serialize with Json.NET.
+                var pkg = CaptureCurrentPackage();
+                File.WriteAllText(filePath, JsonConvert.SerializeObject(pkg, Formatting.Indented));
 
-                // Save all mod slots (0-48)
-                bool first = true;
-                for (int modIndex = 0; modIndex <= 48; modIndex++)
-                {
-                    int modValue = Function.Call<int>(Hash.GET_VEHICLE_MOD, currentVehicle, modIndex);
-                    if (modValue >= 0) // Only save if mod is installed
-                    {
-                        if (!first) package.AppendLine(",");
-                        package.Append($"    \"{modIndex}\": {modValue}");
-                        first = false;
-                    }
-                }
-                package.AppendLine();
-                package.AppendLine("  },");
+                // You built this car, so you OWN everything in the package you just saved — mark it owned for THIS
+                // car (so re-applying it is free, $0 offset) and flag it as the car's equipped build (the car
+                // currently IS this snapshot). Without this, parts not bought through ELSC's buy flow (e.g. a
+                // Menyoo-modded or spawned car) would read as un-owned and wrongly charge on re-apply.
+                MarkPackageOwned(pkg);
+                VehicleSaveData.SetEquippedPackage(VehicleKey(currentVehicle), safeName);
 
-                // Save colors
-                int primary, secondary;
-                unsafe
-                {
-                    Function.Call(Hash.GET_VEHICLE_COLOURS, currentVehicle, &primary, &secondary);
-                }
-                package.AppendLine($"  \"primaryColor\": {primary},");
-                package.AppendLine($"  \"secondaryColor\": {secondary},");
-
-                // Save wheel type
-                int wheelType = Function.Call<int>(Hash.GET_VEHICLE_WHEEL_TYPE, currentVehicle);
-                package.AppendLine($"  \"wheelType\": {wheelType},");
-
-                // Save turbo
-                bool hasTurbo = Function.Call<bool>(Hash.IS_TOGGLE_MOD_ON, currentVehicle, 18);
-                package.AppendLine($"  \"turbo\": {hasTurbo.ToString().ToLower()},");
-
-                // Save xenon
-                bool hasXenon = Function.Call<bool>(Hash.IS_TOGGLE_MOD_ON, currentVehicle, 22);
-                package.AppendLine($"  \"xenon\": {hasXenon.ToString().ToLower()}");
-
-                package.AppendLine("}");
-
-                File.WriteAllText(filePath, package.ToString());
-                ShowNotification($"~g~Package saved: {timestamp}");
+                ShowNotification(overwrite ? $"~g~Package overwritten: {safeName}" : $"~g~Package saved: {safeName}");
                 Log($"Package saved to: {filePath}");
+
+                // Refresh the Packages submenu in place so the new/updated package shows in the load list.
+                RefreshPackagesMenu();
             }
             catch (Exception ex)
             {
@@ -6230,75 +6818,729 @@ namespace ExtendedLSC
             }
         }
 
-        /// <summary>
-        /// Load and apply a vehicle package
-        /// </summary>
-        private void LoadVehiclePackage(string filePath)
+        // Rebuild the Packages submenu's items (Save + separator + saved packages) without re-creating the menu.
+        private void RefreshPackagesMenu()
         {
-            if (currentVehicle == null || !currentVehicle.Exists())
-            {
-                ShowNotification("~r~No vehicle!");
-                return;
-            }
+            if (packagesMenu == null) return;
+            packagesMenu.Clear();
 
+            var saveItem = new NativeItem("Save Current Mods");
+            saveItem.Description = "Save all current modifications to a package file (you'll be asked to name it)";
+            saveItem.Activated += (s, e) => { BeginNamePackage(); };
+            packagesMenu.Add(saveItem);
+
+            packagesMenu.Add(new NativeSeparatorItem());
+            LoadPackageItems(packagesMenu);
+        }
+
+        // Toggle-type mod slots are driven by TOGGLE_VEHICLE_MOD, not SET_VEHICLE_MOD.
+        private static bool IsToggleModSlot(int slot) => slot >= 17 && slot <= 22;
+
+        // Neon natives (raw hashes, mirroring the ones used in CreateNeonColorMenuFromConfig).
+        private const ulong NEON_IS_ENABLED   = 0x8C4B92553E4766A5;  // _IS_VEHICLE_NEON_LIGHT_ENABLED(veh, index)
+        private const ulong NEON_GET_COLOUR   = 0x7619EEE8C886757F;  // _GET_VEHICLE_NEON_LIGHTS_COLOUR(veh, &r,&g,&b)
+        private const ulong NEON_SET_ENABLED  = 0x2AA720E4287BF269;  // _SET_VEHICLE_NEON_LIGHT_ENABLED(veh, index, on)
+        private const ulong NEON_SET_COLOUR   = 0x8E0A582209A62695;  // _SET_VEHICLE_NEON_LIGHTS_COLOUR(veh, r,g,b)
+
+        #region Vehicle Package — data model
+
+        /// <summary>
+        /// A complete, shareable build snapshot of everything ELSC can track for one vehicle.
+        /// VISUAL fields are applied for hover-preview AND restore; ELSC fields are applied only on commit.
+        /// </summary>
+        private class VehiclePackageData
+        {
+            public string vehicle;          // model token
+            public string created;          // timestamp
+
+            // ---- VISUAL (native, applied on preview + restore) ----
+            public Dictionary<int, int> mods = new Dictionary<int, int>();  // non-toggle slots 0-48, value>=0
+            public int wheelType;
+            public bool turbo, xenon, tireSmoke;
+            public int primaryColor, secondaryColor, pearlColor, rimColor;
+            public int primaryCustomArgb, secondaryCustomArgb;  // 0 = not a custom colour
+            public int tireSmokeArgb;
+            public bool neonLeft, neonRight, neonFront, neonBack;
+            public int neonArgb;
+            public int windowTint;
+            public int livery = -1;
+            public string plateText;
+            public int plateStyle;
+            public List<int> extras = new List<int>();   // extra ids that are ON (1-14)
+
+            // ---- ELSC (applied only on commit) ----
+            public VehicleSaveData.FitmentData fitment;
+            public bool wheelFitmentOwned, customSuspensionEquipped;
+            public VehicleSaveData.TuningData tuning;
+            public bool mtOwned, mtEquipped;
+            public int nosOwnedTiers, nosEquippedTier = -1;
+            public string engineSwapId;
+            public int customWindowColor;   // AARRGGBB (0 = none)
+            public string speedoConfig;     // global speedo look (style/units/per-style colours) JSON, from Speedo.ExportConfig
+        }
+
+        #endregion
+
+        #region Vehicle Package — capture
+
+        /// <summary>Build a complete package snapshot from the live currentVehicle. Each native/getter group is
+        /// wrapped so one failure can't abort the rest.</summary>
+        private VehiclePackageData CaptureCurrentPackage()
+        {
+            var p = new VehiclePackageData
+            {
+                vehicle = currentVehicle != null ? currentVehicle.Model.ToString() : "",
+                created = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+            };
+            if (currentVehicle == null || !currentVehicle.Exists()) return p;
+            var v = currentVehicle;
+            string vn = VehicleKey(v);
+
+            try { Function.Call(Hash.SET_VEHICLE_MOD_KIT, v, 0); } catch (Exception ex) { Log($"[Pkg] mod kit: {ex.Message}"); }
+
+            // Mods (non-toggle slots only)
+            try
+            {
+                for (int i = 0; i <= 48; i++)
+                {
+                    if (IsToggleModSlot(i)) continue;
+                    int val = Function.Call<int>(Hash.GET_VEHICLE_MOD, v, i);
+                    if (val >= 0) p.mods[i] = val;
+                }
+            }
+            catch (Exception ex) { Log($"[Pkg] mods: {ex.Message}"); }
+
+            try { p.wheelType = Function.Call<int>(Hash.GET_VEHICLE_WHEEL_TYPE, v); } catch (Exception ex) { Log($"[Pkg] wheelType: {ex.Message}"); }
+
+            // Toggle mods
+            try { p.turbo = Function.Call<bool>(Hash.IS_TOGGLE_MOD_ON, v, 18); } catch (Exception ex) { Log($"[Pkg] turbo: {ex.Message}"); }
+            try { p.xenon = Function.Call<bool>(Hash.IS_TOGGLE_MOD_ON, v, 22); } catch (Exception ex) { Log($"[Pkg] xenon: {ex.Message}"); }
+            try { p.tireSmoke = Function.Call<bool>(Hash.IS_TOGGLE_MOD_ON, v, 20); } catch (Exception ex) { Log($"[Pkg] tireSmoke: {ex.Message}"); }
+
+            // Colours
+            try { unsafe { int a, b; Function.Call(Hash.GET_VEHICLE_COLOURS, v, &a, &b); p.primaryColor = a; p.secondaryColor = b; } }
+            catch (Exception ex) { Log($"[Pkg] colours: {ex.Message}"); }
+            try { unsafe { int pe, rm; Function.Call(Hash.GET_VEHICLE_EXTRA_COLOURS, v, &pe, &rm); p.pearlColor = pe; p.rimColor = rm; } }
+            catch (Exception ex) { Log($"[Pkg] extraColours: {ex.Message}"); }
+
+            // Custom RGB colours
+            try
+            {
+                if (Function.Call<bool>(Hash.GET_IS_VEHICLE_PRIMARY_COLOUR_CUSTOM, v))
+                    unsafe { int r, g, b; Function.Call(Hash.GET_VEHICLE_CUSTOM_PRIMARY_COLOUR, v, &r, &g, &b); p.primaryCustomArgb = PackRgb(r, g, b); }
+            }
+            catch (Exception ex) { Log($"[Pkg] customPrimary: {ex.Message}"); }
+            try
+            {
+                if (Function.Call<bool>(Hash.GET_IS_VEHICLE_SECONDARY_COLOUR_CUSTOM, v))
+                    unsafe { int r, g, b; Function.Call(Hash.GET_VEHICLE_CUSTOM_SECONDARY_COLOUR, v, &r, &g, &b); p.secondaryCustomArgb = PackRgb(r, g, b); }
+            }
+            catch (Exception ex) { Log($"[Pkg] customSecondary: {ex.Message}"); }
+
+            // Tyre smoke colour
+            try { unsafe { int r, g, b; Function.Call(Hash.GET_VEHICLE_TYRE_SMOKE_COLOR, v, &r, &g, &b); p.tireSmokeArgb = PackRgb(r, g, b); } }
+            catch (Exception ex) { Log($"[Pkg] tyreSmokeColor: {ex.Message}"); }
+
+            // Neon
+            try
+            {
+                p.neonLeft  = Function.Call<bool>((Hash)NEON_IS_ENABLED, v, 0);
+                p.neonRight = Function.Call<bool>((Hash)NEON_IS_ENABLED, v, 1);
+                p.neonFront = Function.Call<bool>((Hash)NEON_IS_ENABLED, v, 2);
+                p.neonBack  = Function.Call<bool>((Hash)NEON_IS_ENABLED, v, 3);
+                unsafe { int r, g, b; Function.Call((Hash)NEON_GET_COLOUR, v, &r, &g, &b); p.neonArgb = PackRgb(r, g, b); }
+            }
+            catch (Exception ex) { Log($"[Pkg] neon: {ex.Message}"); }
+
+            try { p.windowTint = Function.Call<int>(Hash.GET_VEHICLE_WINDOW_TINT, v); } catch (Exception ex) { Log($"[Pkg] windowTint: {ex.Message}"); }
+            try { p.livery = Function.Call<int>(Hash.GET_VEHICLE_LIVERY, v); } catch (Exception ex) { Log($"[Pkg] livery: {ex.Message}"); }
+            try { p.plateText = Function.Call<string>(Hash.GET_VEHICLE_NUMBER_PLATE_TEXT, v); } catch (Exception ex) { Log($"[Pkg] plateText: {ex.Message}"); }
+            try { p.plateStyle = Function.Call<int>(Hash.GET_VEHICLE_NUMBER_PLATE_TEXT_INDEX, v); } catch (Exception ex) { Log($"[Pkg] plateStyle: {ex.Message}"); }
+
+            // Extras (1-14)
+            try
+            {
+                for (int i = 1; i <= 14; i++)
+                    if (Function.Call<bool>(Hash.DOES_EXTRA_EXIST, v, i) && Function.Call<bool>(Hash.IS_VEHICLE_EXTRA_TURNED_ON, v, i))
+                        p.extras.Add(i);
+            }
+            catch (Exception ex) { Log($"[Pkg] extras: {ex.Message}"); }
+
+            // ---- ELSC state (from save data) ----
+            try
+            {
+                // Prefer the LIVE stance — so the snapshot restores the actual current stance and a save captures
+                // exactly what's on the car — falling back to saved fitment data when the controller isn't bound.
+                if (wheelFitment != null && wheelFitment.IsInitialized && lastFitmentVehicle == currentVehicle)
+                    p.fitment = new VehicleSaveData.FitmentData
+                    {
+                        FrontCamber = wheelFitment.FrontCamber, RearCamber = wheelFitment.RearCamber,
+                        FrontTrackWidth = wheelFitment.FrontTrackWidth, RearTrackWidth = wheelFitment.RearTrackWidth,
+                        FrontHeight = wheelFitment.FrontHeight, RearHeight = wheelFitment.RearHeight,
+                        Rake = wheelFitment.Rake, StockFake = wheelFitment.StockFake,
+                        VisualSize = wheelFitment.VisualSize, VisualWidth = wheelFitment.VisualWidth
+                    };
+                else p.fitment = VehicleSaveData.GetFitmentData(vn);
+            }
+            catch (Exception ex) { Log($"[Pkg] fitment: {ex.Message}"); }
+            try { p.wheelFitmentOwned = VehicleSaveData.IsWheelFitmentOwned(vn); } catch (Exception ex) { Log($"[Pkg] fitmentOwned: {ex.Message}"); }
+            try { p.customSuspensionEquipped = VehicleSaveData.IsCustomSuspensionEquipped(vn); } catch (Exception ex) { Log($"[Pkg] customSusp: {ex.Message}"); }
+            try { p.tuning = VehicleSaveData.GetTuningData(vn); } catch (Exception ex) { Log($"[Pkg] tuning: {ex.Message}"); }
+            try { p.mtOwned = VehicleSaveData.IsManualTransmissionOwned(vn); } catch (Exception ex) { Log($"[Pkg] mtOwned: {ex.Message}"); }
+            try { p.mtEquipped = VehicleSaveData.IsManualTransmissionEquipped(vn); } catch (Exception ex) { Log($"[Pkg] mtEquipped: {ex.Message}"); }
+            try { p.nosOwnedTiers = VehicleSaveData.GetNosOwnedTiers(vn); } catch (Exception ex) { Log($"[Pkg] nosOwned: {ex.Message}"); }
+            try { p.nosEquippedTier = VehicleSaveData.GetNosEquippedTier(vn); } catch (Exception ex) { Log($"[Pkg] nosEquipped: {ex.Message}"); }
+            try { p.engineSwapId = VehicleSaveData.GetEngineSwapId(vn); } catch (Exception ex) { Log($"[Pkg] engineSwap: {ex.Message}"); }
+            try { p.customWindowColor = VehicleSaveData.GetCustomWindowColor(vn); } catch (Exception ex) { Log($"[Pkg] customWindow: {ex.Message}"); }
+            try { p.speedoConfig = Speedo.ExportConfig(); } catch (Exception ex) { Log($"[Pkg] speedo: {ex.Message}"); }   // global speedo look (style/units/colours)
+
+            return p;
+        }
+
+        // ARGB pack with full alpha; RGB unpackers.
+        private static int PackRgb(int r, int g, int b) => unchecked((int)(0xFF000000u | ((uint)(r & 0xFF) << 16) | ((uint)(g & 0xFF) << 8) | (uint)(b & 0xFF)));
+        private static void UnpackRgb(int argb, out int r, out int g, out int b) { r = (argb >> 16) & 0xFF; g = (argb >> 8) & 0xFF; b = argb & 0xFF; }
+
+        /// <summary>Deserialize a package file. Returns null on failure (e.g. an old hand-rolled JSON file).</summary>
+        private VehiclePackageData LoadPackageData(string filePath)
+        {
             try
             {
                 string json = File.ReadAllText(filePath);
+                return JsonConvert.DeserializeObject<VehiclePackageData>(json);
+            }
+            catch (Exception ex) { Log($"[Pkg] load '{filePath}': {ex.Message}"); return null; }
+        }
 
-                // Simple JSON parsing (avoid external dependencies)
-                // Parse mods section
-                int modsStart = json.IndexOf("\"mods\":");
-                if (modsStart >= 0)
+        #endregion
+
+        #region Vehicle Package — apply visual
+
+        /// <summary>Apply ONLY the visual (native) fields of a package to the current vehicle. Used for hover
+        /// preview AND restore. Each group is wrapped so one failure can't abort the rest.</summary>
+        private void ApplyPackageVisual(VehiclePackageData p, bool livePreview = false)
+        {
+            if (p == null || currentVehicle == null || !currentVehicle.Exists()) return;
+            var v = currentVehicle;
+
+            try { Function.Call(Hash.SET_VEHICLE_MOD_KIT, v, 0); } catch (Exception ex) { Log($"[Pkg] apply mod kit: {ex.Message}"); }
+
+            try { if (p.wheelType >= 0) Function.Call(Hash.SET_VEHICLE_WHEEL_TYPE, v, p.wheelType); } catch (Exception ex) { Log($"[Pkg] apply wheelType: {ex.Message}"); }
+
+            // Mods: write every non-toggle slot. Slots absent from the package are reset to stock (-1) so a
+            // preview/restore doesn't leave parts from the previous state behind.
+            try
+            {
+                for (int i = 0; i <= 48; i++)
                 {
-                    int modsObjStart = json.IndexOf("{", modsStart);
-                    int modsObjEnd = json.IndexOf("}", modsObjStart);
-                    string modsSection = json.Substring(modsObjStart + 1, modsObjEnd - modsObjStart - 1);
+                    if (IsToggleModSlot(i)) continue;
+                    int val = (p.mods != null && p.mods.TryGetValue(i, out int mv)) ? mv : -1;
+                    Function.Call(Hash.SET_VEHICLE_MOD, v, i, val, false);
+                }
+            }
+            catch (Exception ex) { Log($"[Pkg] apply mods: {ex.Message}"); }
 
-                    // Ensure mod kit is installed
-                    Function.Call(Hash.SET_VEHICLE_MOD_KIT, currentVehicle, 0);
+            try { Function.Call(Hash.TOGGLE_VEHICLE_MOD, v, 18, p.turbo); } catch (Exception ex) { Log($"[Pkg] apply turbo: {ex.Message}"); }
+            try { Function.Call(Hash.TOGGLE_VEHICLE_MOD, v, 22, p.xenon); } catch (Exception ex) { Log($"[Pkg] apply xenon: {ex.Message}"); }
 
-                    // Parse each mod
-                    string[] modEntries = modsSection.Split(',');
-                    foreach (string entry in modEntries)
+            try
+            {
+                Function.Call(Hash.TOGGLE_VEHICLE_MOD, v, 20, p.tireSmoke);
+                if (p.tireSmoke && p.tireSmokeArgb != 0)
+                {
+                    UnpackRgb(p.tireSmokeArgb, out int r, out int g, out int b);
+                    Function.Call(Hash.SET_VEHICLE_TYRE_SMOKE_COLOR, v, r, g, b);
+                }
+            }
+            catch (Exception ex) { Log($"[Pkg] apply tireSmoke: {ex.Message}"); }
+
+            try { Function.Call(Hash.SET_VEHICLE_COLOURS, v, p.primaryColor, p.secondaryColor); } catch (Exception ex) { Log($"[Pkg] apply colours: {ex.Message}"); }
+            try { Function.Call(Hash.SET_VEHICLE_EXTRA_COLOURS, v, p.pearlColor, p.rimColor); } catch (Exception ex) { Log($"[Pkg] apply extraColours: {ex.Message}"); }
+
+            try { if (p.primaryCustomArgb != 0) { UnpackRgb(p.primaryCustomArgb, out int r, out int g, out int b); Function.Call(Hash.SET_VEHICLE_CUSTOM_PRIMARY_COLOUR, v, r, g, b); } }
+            catch (Exception ex) { Log($"[Pkg] apply customPrimary: {ex.Message}"); }
+            try { if (p.secondaryCustomArgb != 0) { UnpackRgb(p.secondaryCustomArgb, out int r, out int g, out int b); Function.Call(Hash.SET_VEHICLE_CUSTOM_SECONDARY_COLOUR, v, r, g, b); } }
+            catch (Exception ex) { Log($"[Pkg] apply customSecondary: {ex.Message}"); }
+
+            // Neon
+            try
+            {
+                if (p.neonArgb != 0) { UnpackRgb(p.neonArgb, out int r, out int g, out int b); Function.Call((Hash)NEON_SET_COLOUR, v, r, g, b); }
+                Function.Call((Hash)NEON_SET_ENABLED, v, 0, p.neonLeft);
+                Function.Call((Hash)NEON_SET_ENABLED, v, 1, p.neonRight);
+                Function.Call((Hash)NEON_SET_ENABLED, v, 2, p.neonFront);
+                Function.Call((Hash)NEON_SET_ENABLED, v, 3, p.neonBack);
+            }
+            catch (Exception ex) { Log($"[Pkg] apply neon: {ex.Message}"); }
+
+            // Window tint — incl. the ELSC custom glass colour. During a live hover preview, drive it through the
+            // tint manager's exclusive PREVIEW slot so its per-frame AssertCar loop doesn't fight us; on restore/
+            // commit, release the preview so AssertCar re-asserts the car's real (saved) colour.
+            try
+            {
+                if (livePreview && windowTint != null && windowTint.CanPreview)
+                {
+                    windowTint.BeginPreview(v);
+                    if (p.customWindowColor != 0) windowTint.PreviewColor(v, p.customWindowColor);
+                    else Function.Call(Hash.SET_VEHICLE_WINDOW_TINT, v, p.windowTint);
+                }
+                else
+                {
+                    if (windowTint != null) windowTint.EndPreview();
+                    Function.Call(Hash.SET_VEHICLE_WINDOW_TINT, v, p.windowTint);
+                }
+            }
+            catch (Exception ex) { Log($"[Pkg] apply windowTint: {ex.Message}"); }
+            try { if (p.livery >= 0) Function.Call(Hash.SET_VEHICLE_LIVERY, v, p.livery); } catch (Exception ex) { Log($"[Pkg] apply livery: {ex.Message}"); }
+            // NOTE: deliberately do NOT apply p.plateText. The plate TEXT is the car's per-instance identity (the
+            // VehicleKey). Cloning the package author's plate onto the car would change its identity and orphan the
+            // ownership of any OTHER packages bought for this car. We keep the car's own plate; only the cosmetic
+            // plate STYLE (background) travels with the package.
+            try { Function.Call(Hash.SET_VEHICLE_NUMBER_PLATE_TEXT_INDEX, v, p.plateStyle); } catch (Exception ex) { Log($"[Pkg] apply plateStyle: {ex.Message}"); }
+
+            // Extras (1-14): turn on the ones in the package, off otherwise. SET_VEHICLE_EXTRA's flag is INVERTED.
+            try
+            {
+                for (int i = 1; i <= 14; i++)
+                {
+                    if (!Function.Call<bool>(Hash.DOES_EXTRA_EXIST, v, i)) continue;
+                    bool on = p.extras != null && p.extras.Contains(i);
+                    Function.Call(Hash.SET_VEHICLE_EXTRA, v, i, !on);
+                }
+            }
+            catch (Exception ex) { Log($"[Pkg] apply extras: {ex.Message}"); }
+
+            // Stance/fitment (camber, ride height, rake, track, wheel size/width) — push the package's values onto
+            // the live fitment controller so the preview/restore shows the actual stance, not just the wheel design.
+            // Done after the wheel mod/type above so VisualSize/Width have the right rims to scale. The per-frame
+            // wheelFitment.Update() applies these; restore writes the snapshot's values back the same way.
+            try
+            {
+                if (p.fitment != null && wheelFitment != null)
+                {
+                    if (!wheelFitment.IsInitialized || lastFitmentVehicle != currentVehicle) InitFitmentForVehicle();
+                    if (wheelFitment.IsInitialized)
                     {
-                        string trimmed = entry.Trim().Trim('"');
-                        if (string.IsNullOrEmpty(trimmed)) continue;
-
-                        int colonIndex = trimmed.IndexOf("\":");
-                        if (colonIndex > 0)
-                        {
-                            string modIndexStr = trimmed.Substring(0, colonIndex).Trim().Trim('"');
-                            string modValueStr = trimmed.Substring(colonIndex + 2).Trim();
-
-                            if (int.TryParse(modIndexStr, out int modIndex) && int.TryParse(modValueStr, out int modValue))
-                            {
-                                Function.Call(Hash.SET_VEHICLE_MOD, currentVehicle, modIndex, modValue, false);
-                            }
-                        }
+                        wheelFitment.FrontCamber = p.fitment.FrontCamber;
+                        wheelFitment.RearCamber = p.fitment.RearCamber;
+                        wheelFitment.FrontTrackWidth = p.fitment.FrontTrackWidth;
+                        wheelFitment.RearTrackWidth = p.fitment.RearTrackWidth;
+                        wheelFitment.FrontHeight = p.fitment.FrontHeight;
+                        wheelFitment.RearHeight = p.fitment.RearHeight;
+                        wheelFitment.Rake = p.fitment.Rake;
+                        wheelFitment.StockFake = p.fitment.StockFake;
+                        wheelFitment.VisualSize = p.fitment.VisualSize;
+                        wheelFitment.VisualWidth = p.fitment.VisualWidth;
                     }
                 }
-
-                // Parse turbo
-                if (json.Contains("\"turbo\": true"))
-                {
-                    Function.Call(Hash.TOGGLE_VEHICLE_MOD, currentVehicle, 18, true);
-                }
-
-                // Parse xenon
-                if (json.Contains("\"xenon\": true"))
-                {
-                    Function.Call(Hash.TOGGLE_VEHICLE_MOD, currentVehicle, 22, true);
-                }
-
-                ShowNotification("~g~Package loaded!");
-                Log($"Package loaded from: {filePath}");
             }
-            catch (Exception ex)
+            catch (Exception ex) { Log($"[Pkg] apply fitment: {ex.Message}"); }
+
+            // Speedometer look (global: style/units/colours). Apply IN-MEMORY (no file write) so a hover preview /
+            // restore can show it without persisting; on a live preview, set Speedo.Preview to the package's active
+            // style so the menu's demo gauge renders it. Restore (livePreview=false, p=snapshot) reverts + clears
+            // the preview; the actual persist happens in ApplyPackageElsc on commit.
+            try
             {
-                ShowNotification("~r~Failed to load package!");
-                Log($"Error loading package: {ex.Message}");
+                if (!string.IsNullOrEmpty(p.speedoConfig))
+                {
+                    Speedo.ImportConfig(p.speedoConfig, persist: false);
+                    Speedo.Preview = livePreview ? Speedo.ActiveStyleOf(p.speedoConfig) : null;
+                }
+                else if (!livePreview) Speedo.Preview = null;
+            }
+            catch (Exception ex) { Log($"[Pkg] apply speedo: {ex.Message}"); }
+        }
+
+        #endregion
+
+        #region Vehicle Package — apply ELSC features (commit only)
+
+        /// <summary>Apply the package's ELSC features (tuning, MT, custom suspension/fitment, NOS, engine swap,
+        /// custom window glass). Writes into VehicleSaveData via its setters then re-uses the existing apply
+        /// paths. Each feature wrapped so one failure can't abort the rest.</summary>
+        private void ApplyPackageElsc(VehiclePackageData p)
+        {
+            if (p == null || currentVehicle == null || !currentVehicle.Exists()) return;
+            string vn = VehicleKey(currentVehicle);
+
+            // Wheel fitment / custom suspension
+            try
+            {
+                if (p.fitment != null && (p.wheelFitmentOwned || p.customSuspensionEquipped))
+                {
+                    VehicleSaveData.SetFitmentData(vn, p.fitment);
+                    VehicleSaveData.SetWheelFitmentOwned(vn, true);
+                    // Mirror InitFitmentForVehicle: push the saved values onto the live fitment controller.
+                    if (!wheelFitment.IsInitialized || lastFitmentVehicle != currentVehicle)
+                        InitFitmentForVehicle();
+                    if (wheelFitment.IsInitialized)
+                    {
+                        wheelFitment.FrontCamber = p.fitment.FrontCamber;
+                        wheelFitment.RearCamber = p.fitment.RearCamber;
+                        wheelFitment.FrontTrackWidth = p.fitment.FrontTrackWidth;
+                        wheelFitment.RearTrackWidth = p.fitment.RearTrackWidth;
+                        wheelFitment.FrontHeight = p.fitment.FrontHeight;
+                        wheelFitment.RearHeight = p.fitment.RearHeight;
+                        wheelFitment.Rake = p.fitment.Rake;
+                        wheelFitment.StockFake = p.fitment.StockFake;
+                        wheelFitment.VisualSize = p.fitment.VisualSize;
+                        wheelFitment.VisualWidth = p.fitment.VisualWidth;
+                    }
+                    if (p.customSuspensionEquipped) EquipCustomSuspension();   // drops vanilla level, flags equipped, re-applies ride height
+                }
+            }
+            catch (Exception ex) { Log($"[Pkg] applyElsc fitment: {ex.Message}"); }
+
+            // Engine swap (resolve id -> EngineSwap)
+            try
+            {
+                if (!string.IsNullOrEmpty(p.engineSwapId))
+                {
+                    var swap = EngineSwaps.Lookup(p.engineSwapId);
+                    if (swap != null) { ApplyEngineSwap(swap); VehicleSaveData.SetEngineSwapId(vn, swap.Id); }
+                }
+            }
+            catch (Exception ex) { Log($"[Pkg] applyElsc engineSwap: {ex.Message}"); }
+
+            // Manual transmission
+            try
+            {
+                if (p.mtOwned)
+                {
+                    VehicleSaveData.SetManualTransmissionOwned(vn, true);
+                    if (p.mtEquipped && ELSCTransmission.IsAvailable) EquipManualTransmission();   // sets equipped + enables shifting + rebuilds
+                }
+            }
+            catch (Exception ex) { Log($"[Pkg] applyElsc mt: {ex.Message}"); }
+
+            // Nitrous
+            try
+            {
+                if (p.nosOwnedTiers != 0)
+                {
+                    VehicleSaveData.SetNosOwnedTiers(vn, p.nosOwnedTiers);
+                    VehicleSaveData.SetNosEquippedTier(vn, p.nosEquippedTier);
+                    if (elscTransmission != null)
+                    {
+                        elscTransmission.NosInstalled = p.nosEquippedTier >= 0;
+                        if (p.nosEquippedTier >= 0) elscTransmission.ActiveFxIndex = p.nosEquippedTier;
+                    }
+                }
+            }
+            catch (Exception ex) { Log($"[Pkg] applyElsc nos: {ex.Message}"); }
+
+            // Handling tune
+            try
+            {
+                if (p.tuning != null)
+                {
+                    VehicleSaveData.SetTuningData(vn, p.tuning);
+                    currentTuning = p.tuning;
+                    InitTuningForVehicle();   // caches stock + applies the tune
+                    ApplyTuning();
+                }
+            }
+            catch (Exception ex) { Log($"[Pkg] applyElsc tuning: {ex.Message}"); }
+
+            // Custom window glass colour
+            try
+            {
+                if (p.customWindowColor != 0 && windowTint != null && windowTint.Ready)
+                    windowTint.ApplyCustomColor(currentVehicle, p.customWindowColor);
+            }
+            catch (Exception ex) { Log($"[Pkg] applyElsc windowGlass: {ex.Message}"); }
+
+            // Speedometer look (global) — persist it now (the active style is applied only if owned). Also record
+            // the package's style PER-CAR so the gauge sticks on this car (and only this car).
+            try
+            {
+                if (!string.IsNullOrEmpty(p.speedoConfig))
+                {
+                    Speedo.Preview = null;
+                    Speedo.ImportConfig(p.speedoConfig, persist: true);
+                    if (currentVehicle != null && currentVehicle.Exists())
+                    {
+                        VehicleSaveData.SetSpeedoStyle(VehicleKey(currentVehicle), (int)Speedo.Active);
+                        SyncSpeedoToCar(currentVehicle);
+                    }
+                }
+            }
+            catch (Exception ex) { Log($"[Pkg] applyElsc speedo: {ex.Message}"); }
+
+            try { VehicleSaveData.Save(); } catch (Exception ex) { Log($"[Pkg] applyElsc save: {ex.Message}"); }
+        }
+
+        #endregion
+
+        #region Vehicle Package — cost offset
+
+        /// <summary>Total cost of every part in the package that the player does NOT already own for this
+        /// vehicle (owned => 0). Approximate where the buy flow doesn't track per-part ownership.</summary>
+        private int ComputePackageOffset(VehiclePackageData p)
+        {
+            if (ModSettings.AllItemsFree) return 0;   // INI: everything's free
+            if (p == null || currentVehicle == null || !currentVehicle.Exists()) return 0;
+            string vn = VehicleKey(currentVehicle);
+            int total = 0;
+
+            // Mods (cosmetic + performance). value 0 on a cosmetic slot is usually "stock part" — only charge
+            // for installed (>=0) parts the player doesn't already own.
+            try
+            {
+                if (p.mods != null)
+                    foreach (var kv in p.mods)
+                    {
+                        int slot = kv.Key, val = kv.Value;
+                        if (val < 0) continue;
+                        if (!VehicleSaveData.IsModOwned(vn, slot, val))
+                            total += ModPricing.GetModPriceByIndex(slot, val);
+                    }
+            }
+            catch (Exception ex) { Log($"[Pkg] offset mods: {ex.Message}"); }
+
+            // Wheels (slot 23 value) — charge per the wheel category if a non-stock design is set and unowned.
+            try
+            {
+                if (p.mods != null && p.mods.TryGetValue(23, out int wIdx) && wIdx >= 0)
+                {
+                    int ownKey = WheelOwnKey(p.wheelType, wIdx);
+                    if (!VehicleSaveData.IsModOwned(vn, 23, ownKey))
+                        total += ModPricing.GetWheelPrice(p.wheelType, wIdx);
+                }
+            }
+            catch (Exception ex) { Log($"[Pkg] offset wheels: {ex.Message}"); }
+
+            // Toggle mods
+            try { if (p.turbo && !VehicleSaveData.IsTurboOwned(vn)) total += ModPricing.TurboPrice; } catch (Exception ex) { Log($"[Pkg] offset turbo: {ex.Message}"); }
+            try { if (p.xenon && !VehicleSaveData.IsXenonOwned(vn)) total += ModPricing.XenonLightsPrice; } catch (Exception ex) { Log($"[Pkg] offset xenon: {ex.Message}"); }
+
+            // Window tint (preset index)
+            try
+            {
+                if (p.windowTint > 0 && !VehicleSaveData.IsTintOwned(vn, p.windowTint))
+                {
+                    int ti = p.windowTint;
+                    total += (ti >= 0 && ti < ModPricing.WindowTintPrices.Length) ? ModPricing.WindowTintPrices[ti] : 0;
+                }
+            }
+            catch (Exception ex) { Log($"[Pkg] offset tint: {ex.Message}"); }
+
+            // Plate style
+            try
+            {
+                if (p.plateStyle >= 0 && !VehicleSaveData.IsPlateOwned(vn, p.plateStyle))
+                    total += (p.plateStyle < ModPricing.PlatePrices.Length) ? ModPricing.PlatePrices[p.plateStyle] : 0;
+            }
+            catch (Exception ex) { Log($"[Pkg] offset plate: {ex.Message}"); }
+
+            // Livery (slot 48 in ELSC's ownership map)
+            try
+            {
+                if (p.livery >= 0 && !VehicleSaveData.IsModOwned(vn, 48, p.livery))
+                    total += ModPricing.GetModPriceByIndex(48, p.livery);
+            }
+            catch (Exception ex) { Log($"[Pkg] offset livery: {ex.Message}"); }
+
+            // ---- ELSC features ----
+            try { if ((p.wheelFitmentOwned || p.customSuspensionEquipped) && !VehicleSaveData.IsWheelFitmentOwned(vn)) total += ModPricing.CustomSuspensionPrice; } catch (Exception ex) { Log($"[Pkg] offset susp: {ex.Message}"); }
+            try { if (p.mtOwned && !VehicleSaveData.IsManualTransmissionOwned(vn)) total += ModPricing.ManualTransmissionPrice; } catch (Exception ex) { Log($"[Pkg] offset mt: {ex.Message}"); }
+
+            // NOS tiers: charge each owned tier in the package the player doesn't already own.
+            try
+            {
+                int have = VehicleSaveData.GetNosOwnedTiers(vn);
+                for (int tier = 0; tier < ModPricing.NosTierPrices.Length; tier++)
+                {
+                    bool inPkg = (p.nosOwnedTiers & (1 << tier)) != 0;
+                    bool owned = (have & (1 << tier)) != 0;
+                    if (inPkg && !owned) total += ModPricing.NosTierPrices[tier];
+                }
+            }
+            catch (Exception ex) { Log($"[Pkg] offset nos: {ex.Message}"); }
+
+            // Engine swap (no per-vehicle ownership tracking — charge unless this swap is already installed here).
+            try
+            {
+                if (!string.IsNullOrEmpty(p.engineSwapId))
+                {
+                    var swap = EngineSwaps.Lookup(p.engineSwapId);
+                    if (swap != null && VehicleSaveData.GetEngineSwapId(vn) != swap.Id) total += swap.Price;
+                }
+            }
+            catch (Exception ex) { Log($"[Pkg] offset engineSwap: {ex.Message}"); }
+
+            return total;
+        }
+
+        #endregion
+
+        #region Vehicle Package — commit, snapshot, preview
+
+        /// <summary>Commit a package: charge the cost offset (parts not yet owned), mark everything owned, then
+        /// apply the full visual + ELSC build. Aborts (and reverts to snapshot) if the player can't afford it.</summary>
+        private void LoadVehiclePackage(string filePath)
+        {
+            if (currentVehicle == null || !currentVehicle.Exists()) { ShowNotification("~r~No vehicle!"); return; }
+
+            var p = LoadPackageData(filePath);
+            if (p == null) { ShowNotification("~r~Failed to load package!"); RestoreVehicleModSnapshot(); return; }
+
+            string vn = VehicleKey(currentVehicle);
+            int offset = ComputePackageOffset(p);
+
+            // Charge (or block). TryPurchase returns false if it can't afford OR we're in edit mode — abort cleanly.
+            if (offset > 0 && !TryPurchase(offset, false))
+            {
+                RestoreVehicleModSnapshot();   // undo any hover preview
+                return;
+            }
+            else if (offset == 0 && EditBlockApply())   // free package still blocked while editing
+            {
+                RestoreVehicleModSnapshot();
+                return;
+            }
+
+            _packageCommitted = true;   // keep it on close (don't revert the preview)
+
+            // The car KEEPS its own plate (identity). We do NOT apply the package author's plate text (see
+            // ApplyPackageVisual) and we no longer randomize it — so the car's per-instance key stays STABLE and
+            // ownership ACCUMULATES across every package you buy for this car (buying a second leaves the first
+            // owned, re-equippable for free). Apply ELSC features before deriving the final key, since the custom
+            // window glass can re-plate the car on a collision; write ownership/equipped under that same final key.
+            ApplyPackageVisual(p);
+            ApplyPackageElsc(p);
+            vn = VehicleKey(currentVehicle);   // FINAL per-instance key (after any window-glass re-plate)
+            MarkPackageOwned(p);
+
+            // Remember it as this car's equipped package (drives the garage marker) + refresh the list markers.
+            VehicleSaveData.SetEquippedPackage(vn, PackageDisplayName(filePath));
+            RefreshPackagesMenu();
+
+            if (offset > 0) ShowNotification($"~g~Package applied~w~ — ${offset:N0} charged");
+            else ShowNotification("~g~Package applied~w~ — all parts owned");
+            Log($"Package committed from: {filePath} (offset ${offset})");
+        }
+
+        // Friendly package name from its file path: "{model}_{Name}.json" -> "Name".
+        private string PackageDisplayName(string filePath)
+        {
+            string fileName = Path.GetFileNameWithoutExtension(filePath);
+            return fileName.Contains("_") ? fileName.Substring(fileName.IndexOf("_") + 1) : fileName;
+        }
+
+        // ---- Delete a package: press X on a package row -> "are you sure?" prompt -> delete the file ----
+        private NativeMenu _pkgDeleteMenu;
+        private NativeItem _pkgDeleteItem;       // the "Delete" row (its title is re-stamped per target)
+        private string _pkgDeleteTarget, _pkgDeleteName;
+
+        // Called every frame while the LSC menu is up: X on a highlighted package opens the confirm prompt.
+        private void CheckPackageDeleteInput()
+        {
+            if (packagesMenu == null || !packagesMenu.Visible) return;
+            if (isWalkAroundActive) return;   // X opens doors in walk-around mode — don't let it delete a package
+            if (_pkgDeleteMenu != null && _pkgDeleteMenu.Visible) return;   // already confirming
+            var sel = packagesMenu.SelectedItem as NativeItem;
+            if (sel == null || !_packageItemPaths.TryGetValue(sel, out string path)) return;
+            bool xPressed = Function.Call<bool>(Hash.IS_DISABLED_CONTROL_JUST_PRESSED, 0, (int)GTA.Control.FrontendX)
+                         || Function.Call<bool>(Hash.IS_CONTROL_JUST_PRESSED, 0, (int)GTA.Control.FrontendX);
+            if (xPressed) OpenPackageDeleteConfirm(path, PackageDisplayName(path));
+        }
+
+        private void OpenPackageDeleteConfirm(string filePath, string displayName)
+        {
+            _pkgDeleteTarget = filePath; _pkgDeleteName = displayName;
+            if (_pkgDeleteMenu == null)
+            {
+                _pkgDeleteMenu = CreateMenu("DELETE PACKAGE");
+                var cancel = new NativeItem("Cancel", "Keep this package. (Back also cancels.)");
+                cancel.Activated += (s, e) => ClosePackageDeleteConfirm();
+                _pkgDeleteMenu.Add(cancel);
+                _pkgDeleteItem = new NativeItem("Delete", "Permanently delete this package file. This cannot be undone.");
+                _pkgDeleteItem.Activated += (s, e) =>
+                {
+                    try
+                    {
+                        if (File.Exists(_pkgDeleteTarget)) File.Delete(_pkgDeleteTarget);
+                        if (currentVehicle != null && string.Equals(VehicleSaveData.GetEquippedPackage(VehicleKey(currentVehicle)), _pkgDeleteName, StringComparison.OrdinalIgnoreCase))
+                            VehicleSaveData.SetEquippedPackage(VehicleKey(currentVehicle), null);
+                        ShowNotification($"~g~Deleted package: {_pkgDeleteName}");
+                    }
+                    catch (Exception ex) { ShowNotification("~r~Failed to delete package!"); Log($"Delete package: {ex.Message}"); }
+                    RefreshPackagesMenu();
+                    ClosePackageDeleteConfirm();
+                };
+                _pkgDeleteMenu.Add(_pkgDeleteItem);
+                _pkgDeleteMenu.Closed += (s, e) => { if (!isNavigatingMenu && packagesMenu != null) packagesMenu.Visible = true; };
+            }
+            _pkgDeleteItem.Title = $"Delete \"{displayName}\"";
+            _pkgDeleteMenu.SelectedIndex = 0;   // default to Cancel (safer)
+            isNavigatingMenu = true; packagesMenu.Visible = false; _pkgDeleteMenu.Visible = true; isNavigatingMenu = false;
+        }
+
+        private void ClosePackageDeleteConfirm()
+        {
+            if (_pkgDeleteMenu == null) return;
+            isNavigatingMenu = true; _pkgDeleteMenu.Visible = false; if (packagesMenu != null) packagesMenu.Visible = true; isNavigatingMenu = false;
+        }
+
+        /// <summary>Mark every part in the package as owned for this vehicle (so re-applying is free).</summary>
+        private void MarkPackageOwned(VehiclePackageData p)
+        {
+            if (p == null || currentVehicle == null || !currentVehicle.Exists()) return;
+            string vn = VehicleKey(currentVehicle);
+            try
+            {
+                if (p.mods != null)
+                    foreach (var kv in p.mods)
+                        if (kv.Value >= 0)
+                        {
+                            if (kv.Key == 23) VehicleSaveData.SetModOwned(vn, 23, WheelOwnKey(p.wheelType, kv.Value));
+                            else VehicleSaveData.SetModOwned(vn, kv.Key, kv.Value);
+                        }
+            }
+            catch (Exception ex) { Log($"[Pkg] own mods: {ex.Message}"); }
+            try { if (p.turbo) VehicleSaveData.SetTurboOwned(vn); } catch (Exception ex) { Log($"[Pkg] own turbo: {ex.Message}"); }
+            try { if (p.xenon) VehicleSaveData.SetXenonOwned(vn); } catch (Exception ex) { Log($"[Pkg] own xenon: {ex.Message}"); }
+            try { if (p.windowTint > 0) VehicleSaveData.SetTintOwned(vn, p.windowTint); } catch (Exception ex) { Log($"[Pkg] own tint: {ex.Message}"); }
+            try { if (p.plateStyle >= 0) VehicleSaveData.SetPlateOwned(vn, p.plateStyle); } catch (Exception ex) { Log($"[Pkg] own plate: {ex.Message}"); }
+            try { if (p.livery >= 0) VehicleSaveData.SetModOwned(vn, 48, p.livery); } catch (Exception ex) { Log($"[Pkg] own livery: {ex.Message}"); }
+            try { if (p.wheelFitmentOwned || p.customSuspensionEquipped) VehicleSaveData.SetWheelFitmentOwned(vn, true); } catch (Exception ex) { Log($"[Pkg] own susp: {ex.Message}"); }
+            try { if (p.mtOwned) VehicleSaveData.SetManualTransmissionOwned(vn, true); } catch (Exception ex) { Log($"[Pkg] own mt: {ex.Message}"); }
+            try { if (p.nosOwnedTiers != 0) VehicleSaveData.SetNosOwnedTiers(vn, VehicleSaveData.GetNosOwnedTiers(vn) | p.nosOwnedTiers); } catch (Exception ex) { Log($"[Pkg] own nos: {ex.Message}"); }
+            try { VehicleSaveData.Save(); } catch (Exception ex) { Log($"[Pkg] own save: {ex.Message}"); }
+        }
+
+        /// <summary>Snapshot the car's current visual build (so a package preview can be reverted exactly).</summary>
+        private void CaptureVehicleModSnapshot()
+        {
+            if (currentVehicle == null || !currentVehicle.Exists()) { _packageSnapshot = null; return; }
+            _packageSnapshot = CaptureCurrentPackage();
+        }
+
+        /// <summary>Put the car's visuals back to the snapshot taken when the Packages menu opened. (Functional
+        /// ELSC features aren't touched during preview, so restoring visuals is sufficient.)</summary>
+        private void RestoreVehicleModSnapshot()
+        {
+            if (_packageSnapshot == null || currentVehicle == null || !currentVehicle.Exists()) return;
+            ApplyPackageVisual(_packageSnapshot);
+        }
+
+        /// <summary>Revert to the snapshot, then (if hovering a package row) apply that package's visuals as a
+        /// silent live preview.</summary>
+        private void PreviewSelectedPackage()
+        {
+            if (_packageSnapshot == null || packagesMenu == null) return;
+            RestoreVehicleModSnapshot();   // clean baseline so previews don't stack
+            var sel = packagesMenu.SelectedItem as NativeItem;
+            if (sel != null && _packageItemPaths.TryGetValue(sel, out string path))
+            {
+                var p = LoadPackageData(path);
+                if (p != null) ApplyPackageVisual(p, livePreview: true);
             }
         }
+
+        #endregion
 
         #endregion
 
@@ -6324,43 +7566,58 @@ namespace ExtendedLSC
                 return;
             }
 
-            // Check if MT was previously purchased for this vehicle
-            bool isOwned = VehicleSaveData.IsManualTransmissionOwned(currentVehicle.DisplayName);
+            string vn = VehicleKey(currentVehicle);
+            bool owned = VehicleSaveData.IsManualTransmissionOwned(vn);
+            bool equipped = owned && VehicleSaveData.IsManualTransmissionEquipped(vn);
 
-            // If owned but not currently enabled, auto-enable it
-            if (isOwned && !elscTransmission.IsEnabled)
-            {
-                elscTransmission.SetVehicle(currentVehicle);
-                elscTransmission.Enable();
-            }
+            // Keep the live transmission state in sync with the saved equipped flag (persist across reloads /
+            // vehicle switches): enabled only when this car has MT equipped.
+            if (equipped && !elscTransmission.IsEnabled) { elscTransmission.SetVehicle(currentVehicle); elscTransmission.Enable(); }
+            else if (!equipped && elscTransmission.IsEnabled) { elscTransmission.Disable(); }
 
+            // Three states, mirroring Custom Suspension: NOT owned -> price; owned but NOT the active transmission
+            // -> owned tick + "Select to equip"; owned AND equipped -> equipped garage icon + "Select to edit".
             var mtItem = new NativeItem("Manual Transmission");
-            mtItem.AltTitle = elscTransmission.IsEnabled ? "" : "$0"; // Empty when installed - sprite shows instead
-            mtItem.Description = elscTransmission.IsEnabled
-                ? $"Shift Up: {ModSettings.ShiftUpKey} | Shift Down: {ModSettings.ShiftDownKey} | Select to disable"
-                : "Select to enable and configure shift buttons";
-            if (elscTransmission.IsEnabled)
+            if (!owned)
+            {
+                mtItem.AltTitle = $"${ModPricing.ManualTransmissionPrice}";
+                mtItem.Description = "Buy manual shifting — also unlocks the transmission tuning (Final Drive, Gears). You'll set your shift buttons.";
+            }
+            else if (equipped)
+            {
+                mtItem.AltTitle = "";
                 itemOwnershipStatus[mtItem] = STATUS_INSTALLED;
+                mtItem.Description = $"Shift Up: {ModSettings.ShiftUpKey} | Shift Down: {ModSettings.ShiftDownKey}  ·  Select to edit keys";
+            }
+            else
+            {
+                mtItem.AltTitle = "";
+                itemOwnershipStatus[mtItem] = STATUS_OWNED;
+                mtItem.Description = "Select to equip your manual transmission.";
+            }
 
             mtItem.Activated += (s, e) =>
             {
-                if (elscTransmission.IsEnabled)
+                if (currentVehicle == null) return;
+                string v = VehicleKey(currentVehicle);
+                bool own = VehicleSaveData.IsManualTransmissionOwned(v);
+                bool eq = own && VehicleSaveData.IsManualTransmissionEquipped(v);
+
+                if (!own)
                 {
-                    // Disable manual transmission and save state
-                    elscTransmission.Disable();
-                    VehicleSaveData.SetManualTransmissionOwned(currentVehicle.DisplayName, false);
-                    VehicleSaveData.Save();
-                    mtItem.AltTitle = "$0";
-                    mtItem.Description = "Select to enable and configure shift buttons";
-                    itemOwnershipStatus.Remove(mtItem);
-                    ShowNotification("~y~Manual Transmission disabled");
+                    // Charge, then configure keys; FinishMTBinding equips it (removes vanilla auto, rebuilds).
+                    if (!TryPurchase(ModPricing.ManualTransmissionPrice, false)) return;
+                    VehicleSaveData.SetManualTransmissionOwned(v, true);
+                    mtBindingState = 1; mtBindingItem = mtItem;
+                    return;
                 }
-                else
+                if (!eq)
                 {
-                    // Start key binding sequence - store item reference for updating later
-                    mtBindingState = 1;
-                    mtBindingItem = mtItem;
+                    EquipManualTransmission();   // equip; select again to edit keys
+                    return;
                 }
+                // Equipped -> edit keys (re-bind).
+                mtBindingState = 1; mtBindingItem = mtItem;
             };
             menu.Add(mtItem);
         }
@@ -6371,7 +7628,7 @@ namespace ExtendedLSC
         {
             var menu = CreateMenu("LIVERY");
             bool isNative = useNativeLivery;
-            string vehicleName = currentVehicle.DisplayName;
+            string vehicleName = VehicleKey(currentVehicle);
 
             // Get current livery based on system used
             int currentLivery;
@@ -6502,7 +7759,7 @@ namespace ExtendedLSC
             {
                 if (obj is NativeMenu menu && menu.Name == "LIVERY")
                 {
-                    string vehicleName = currentVehicle?.DisplayName ?? "";
+                    string vehicleName = VehicleKey(currentVehicle);
 
                     for (int i = 0; i < menu.Items.Count; i++)
                     {
@@ -6545,6 +7802,9 @@ namespace ExtendedLSC
         // Plate-style + neon-color live preview state (revert on close if not purchased)
         private int origPlateStyle = -1;
         private bool platePurchased = false;
+        // Window-tint live preview state (revert on close if not purchased)
+        private int origWindowTint = -1;
+        private bool windowTintPurchased = false;
         private readonly int[] origNeonRGB = new int[3];
         private readonly bool[] origNeonOn = new bool[4];
         private bool neonColorPurchased = false;
@@ -7120,7 +8380,7 @@ namespace ExtendedLSC
 
             int currentHorn = currentVehicle.Mods[VehicleModType.Horns].Index;
             int count = Function.Call<int>(Hash.GET_NUM_VEHICLE_MODS, currentVehicle, (int)VehicleModType.Horns);
-            string vehicleName = currentVehicle.DisplayName;
+            string vehicleName = VehicleKey(currentVehicle);
 
             // Set the highlighted horn as the installed one so pressing L3 (handled in OnTick) auditions it;
             // revert to the real/purchased horn when leaving the menu. itemModIndex maps menu position -> horn
@@ -7147,7 +8407,7 @@ namespace ExtendedLSC
                 bool isInstalled = currentHorn == i;
                 bool isOwned = i >= 0 && VehicleSaveData.IsHornOwned(vehicleName, i);
                 var item = new NativeItem(name);
-                item.Description = "Press L3 to preview this horn.";
+                item.Description = "Hold Preview to hear this horn.";
 
                 if (isInstalled)
                 {
@@ -7169,14 +8429,14 @@ namespace ExtendedLSC
                 int hornPrice = i == -1 ? 0 : 100; // Stock is free, others $100
                 item.Activated += (s, e) =>
                 {
-                    bool owned = hornIndex >= 0 && VehicleSaveData.IsHornOwned(currentVehicle.DisplayName, hornIndex);
+                    bool owned = hornIndex >= 0 && VehicleSaveData.IsHornOwned(VehicleKey(currentVehicle), hornIndex);
                     if (!TryPurchase(hornPrice, owned)) return;
 
                     ApplyHorn(hornIndex);
                     previewBaseHorn = hornIndex;  // purchased horn becomes the revert target on menu close
                     if (hornIndex >= 0 && !owned)
                     {
-                        VehicleSaveData.SetHornOwned(currentVehicle.DisplayName, hornIndex);
+                        VehicleSaveData.SetHornOwned(VehicleKey(currentVehicle), hornIndex);
                         VehicleSaveData.Save();
                     }
                 };
@@ -7189,43 +8449,84 @@ namespace ExtendedLSC
         private NativeMenu CreateNosColorMenu()
         {
             var menu = CreateMenu("Nitrous (NOS)");
+            string vn = VehicleKey(currentVehicle);
 
-            // Tier purchases — each NOS tier is its own buy, rising in price; selecting an owned tier equips it.
+            // Per-vehicle nitrous (mirrors the equip model): each tier is bought + equipped per car; an Off item
+            // un-equips without losing what you bought; re-selecting the equipped tier re-binds the spray key.
             int tierCount = ManualTransmission.ELSCTransmission.FxCatalog.Length;
             var refreshers = new List<Action>();
-            nosPreviewFx = Math.Max(0, Math.Min(tierCount - 1, ModSettings.NosFxIndex));
+            int equippedTier = VehicleSaveData.GetNosEquippedTier(vn);
+            nosPreviewFx = Math.Max(0, Math.Min(tierCount - 1, equippedTier >= 0 ? equippedTier : 0));
+
+            // Off / No Nitrous — equipped (garage) when nothing is active; select to un-equip.
+            var offItem = new NativeItem("Off (No Nitrous)");
+            offItem.Description = "Disable nitrous on this car (keeps any tiers you've bought).";
+            Action refreshOff = () =>
+            {
+                if (VehicleSaveData.GetNosEquippedTier(VehicleKey(currentVehicle)) < 0)
+                { offItem.AltTitle = ""; itemOwnershipStatus[offItem] = STATUS_INSTALLED; }
+                else { offItem.AltTitle = ""; itemOwnershipStatus.Remove(offItem); }
+            };
+            refreshers.Add(refreshOff);
+            offItem.Activated += (s, e) =>
+            {
+                VehicleSaveData.SetNosEquippedTier(VehicleKey(currentVehicle), -1);
+                VehicleSaveData.Save();
+                if (elscTransmission != null) elscTransmission.NosInstalled = false;
+                foreach (var r in refreshers) r();
+                ShowNotification("~y~Nitrous removed");
+            };
+            menu.Add(offItem);
+
             for (int ti = 0; ti < tierCount; ti++)
             {
                 int idx = ti;
                 int price = idx < ModPricing.NosTierPrices.Length ? ModPricing.NosTierPrices[idx]
                                                                   : ModPricing.NosTierPrices[ModPricing.NosTierPrices.Length - 1];
                 var tierItem = new NativeItem(ManualTransmission.ELSCTransmission.FxCatalog[idx].Name);
-                bool ownedNow = (ModSettings.NosOwnedTiers & (1 << idx)) != 0;
-                tierItem.Description = $"{ManualTransmission.ELSCTransmission.FxCatalog[idx].Buff}. Hold {ModSettings.NosKey} to preview; select to {(ownedNow ? "equip." : "buy & equip.")}";
                 Action refresh = () =>
                 {
-                    bool owned = (ModSettings.NosOwnedTiers & (1 << idx)) != 0;
-                    if (ModSettings.NosFxIndex == idx && owned) { tierItem.AltTitle = ""; itemOwnershipStatus[tierItem] = STATUS_INSTALLED; }
-                    else if (owned) { tierItem.AltTitle = ""; itemOwnershipStatus[tierItem] = STATUS_OWNED; }
-                    else { tierItem.AltTitle = $"${price:N0}"; itemOwnershipStatus.Remove(tierItem); }
+                    string v = VehicleKey(currentVehicle);
+                    bool owned = (VehicleSaveData.GetNosOwnedTiers(v) & (1 << idx)) != 0;
+                    bool active = VehicleSaveData.GetNosEquippedTier(v) == idx;
+                    if (active && owned) { tierItem.AltTitle = ""; itemOwnershipStatus[tierItem] = STATUS_INSTALLED; tierItem.Description = $"{ManualTransmission.ELSCTransmission.FxCatalog[idx].Buff}. Select to edit the spray key."; }
+                    else if (owned) { tierItem.AltTitle = ""; itemOwnershipStatus[tierItem] = STATUS_OWNED; tierItem.Description = $"{ManualTransmission.ELSCTransmission.FxCatalog[idx].Buff}. Select to equip."; }
+                    else { tierItem.AltTitle = $"${price:N0}"; itemOwnershipStatus.Remove(tierItem); tierItem.Description = $"{ManualTransmission.ELSCTransmission.FxCatalog[idx].Buff}. Select to buy & equip."; }
                 };
                 refreshers.Add(refresh);
                 refresh();
                 tierItem.Activated += (s, e) =>
                 {
-                    bool owned = (ModSettings.NosOwnedTiers & (1 << idx)) != 0;
-                    bool firstNos = ModSettings.NosOwnedTiers == 0;
+                    string v = VehicleKey(currentVehicle);
+                    int ownedMask = VehicleSaveData.GetNosOwnedTiers(v);
+                    bool owned = (ownedMask & (1 << idx)) != 0;
+                    bool active = VehicleSaveData.GetNosEquippedTier(v) == idx;
+                    bool firstNos = ownedMask == 0;
+
+                    if (active)
+                    {
+                        // Already equipped -> edit the spray key (re-bind).
+                        nosBindingState = 1; nosBindingItem = tierItem;
+                        return;
+                    }
                     if (!owned)
                     {
                         if (!TryPurchase(price, false)) return;
-                        ModSettings.NosOwnedTiers |= (1 << idx);
-                        if (elscTransmission != null) elscTransmission.NosInstalled = true;
+                        VehicleSaveData.SetNosOwnedTiers(v, ownedMask | (1 << idx));
                         MechanicSpeak();
                     }
-                    ModSettings.NosFxIndex = idx;
-                    ModSettings.Save();
+                    // Equip this tier.
+                    VehicleSaveData.SetNosEquippedTier(v, idx);
+                    VehicleSaveData.Save();
                     nosPreviewFx = idx;
-                    if (elscTransmission != null) elscTransmission.ActiveFxIndex = idx;
+                    if (elscTransmission != null) { elscTransmission.NosInstalled = true; elscTransmission.ActiveFxIndex = idx; }
+                    // Nitrous needs a gauge (the bottle/turbo meter) — turn one on for THIS car if it has none (matches MT).
+                    if (VehicleSaveData.GetSpeedoStyle(v) == 0)
+                    {
+                        VehicleSaveData.SetSpeedoStyle(v, (int)SpeedoStyle.Simple);
+                        Speedo.Active = SpeedoStyle.Simple;
+                        ShowNotification("~g~Speedometer enabled for Nitrous");
+                    }
                     foreach (var r in refreshers) r();
                     if (firstNos) { nosBindingState = 1; nosBindingItem = tierItem; }   // prompt spray-button bind once
                 };
@@ -7233,7 +8534,7 @@ namespace ExtendedLSC
             }
 
             // Preview-on-hover: holding the NOS button shows the highlighted tier (even before buying).
-            menu.SelectedIndexChanged += (s, e) => { if (e.Index >= 0 && e.Index < tierCount) nosPreviewFx = e.Index; };
+            menu.SelectedIndexChanged += (s, e) => { int t = e.Index - 1; if (t >= 0 && t < tierCount) nosPreviewFx = t; };
 
             // Colour picker deferred to a future update (no tint-respecting flame asset yet). The saved colour
             // value stays in ModSettings.NosFlameColorArgb for that update + the planned speedometer integration.
@@ -7247,26 +8548,62 @@ namespace ExtendedLSC
             var styles = new[] { SpeedoStyle.Off, SpeedoStyle.Simple, SpeedoStyle.Nfsu };
             var refreshers = new List<Action>();
 
+            // The editor (colors + units + size/position) opens by SELECTING the equipped gauge — no separate
+            // "Customize" category. Built once here, shown from the equipped style's Activated handler.
+            var custMenu = CreateSpeedoCustomizationMenu();
+            custMenu.Closed += (s, e) => { if (!isNavigatingMenu) { menu.Visible = true; Speedo.Preview = Speedo.Active; } };
+
             foreach (var stEach in styles)
             {
                 SpeedoStyle st = stEach;
                 int price = st == SpeedoStyle.Nfsu ? ModPricing.SpeedoNfsuPrice : 0;
                 var item = new NativeItem(Speedo.StyleName(st));
-                item.Description = st == SpeedoStyle.Nfsu
-                    ? "Underground-2-style gauge. Hover to preview; buy & equip."
-                    : "ELSC's built-in HUD. Hover to preview; select to equip.";
 
                 Action refresh = () =>
                 {
-                    if (Speedo.Active == st) { item.AltTitle = ""; itemOwnershipStatus[item] = STATUS_INSTALLED; }
-                    else if (Speedo.IsOwned(st)) { item.AltTitle = ""; itemOwnershipStatus[item] = STATUS_OWNED; }
-                    else { item.AltTitle = price == 0 ? "Free" : $"${price:N0}"; itemOwnershipStatus.Remove(item); }
+                    bool active = Speedo.Active == st;
+                    if (active)
+                    {
+                        item.AltTitle = ""; itemOwnershipStatus[item] = STATUS_INSTALLED;
+                        item.Description = st == SpeedoStyle.Off ? "No gauge shown. Select another style to show one."
+                                                                : "Equipped. Select to edit colors & units.";
+                    }
+                    else if (Speedo.IsOwned(st))
+                    {
+                        item.AltTitle = ""; itemOwnershipStatus[item] = STATUS_OWNED;
+                        item.Description = st == SpeedoStyle.Off ? "Hide the gauge. Select to equip." : "Owned. Select to equip.";
+                    }
+                    else
+                    {
+                        item.AltTitle = price == 0 ? "Free" : $"${price:N0}"; itemOwnershipStatus.Remove(item);
+                        item.Description = "Arcade-racer street gauge. Hover to preview; select to buy & equip.";
+                    }
                 };
                 refreshers.Add(refresh);
                 refresh();
 
                 item.Activated += (s, e) =>
                 {
+                    // Equipped gauge -> open the editor (Off has nothing to edit).
+                    if (Speedo.Active == st)
+                    {
+                        if (st == SpeedoStyle.Off) { ShowNotification("~y~No gauge to customize — equip a style first."); return; }
+                        isNavigatingMenu = true; Speedo.Preview = Speedo.Active; menu.Visible = false; custMenu.Visible = true; isNavigatingMenu = false;
+                        return;
+                    }
+                    // Block turning the gauge Off while this car has Manual Transmission OR Nitrous equipped — both
+                    // read off the gauge (gear/RPM for MT, the bottle/turbo meter for NOS).
+                    if (st == SpeedoStyle.Off && currentVehicle != null && currentVehicle.Exists())
+                    {
+                        bool mtEq = VehicleSaveData.IsManualTransmissionEquipped(VehicleKey(currentVehicle));
+                        bool nosEq = VehicleSaveData.GetNosEquippedTier(VehicleKey(currentVehicle)) >= 0;
+                        if (mtEq || nosEq)
+                        {
+                            string need = mtEq && nosEq ? "Manual Transmission & Nitrous" : mtEq ? "Manual Transmission" : "Nitrous";
+                            ShowNotification($"~y~{need} needs a speedometer — pick a gauge style.");
+                            return;
+                        }
+                    }
                     if (!Speedo.IsOwned(st))
                     {
                         if (!TryPurchase(price, false)) return;
@@ -7274,19 +8611,14 @@ namespace ExtendedLSC
                     }
                     Speedo.Preview = st;
                     ShowNotification(Speedo.Equip(st));
+                    // Persist the choice PER-CAR so it shows only on this vehicle (not globally on every car).
+                    if (currentVehicle != null && currentVehicle.Exists())
+                        VehicleSaveData.SetSpeedoStyle(VehicleKey(currentVehicle), (int)st);
                     foreach (var r in refreshers) r();
                     MechanicSpeak();
                 };
                 menu.Add(item);
             }
-
-            // Customization submenu
-            var custMenu = CreateSpeedoCustomizationMenu();
-            custMenu.Closed += (s, e) => { if (!isNavigatingMenu) { menu.Visible = true; Speedo.Preview = Speedo.Active; } };
-            var custNav = new NativeItem("Customization") { AltTitle = ">>" };
-            custNav.Description = "Units, size, position and accent color.";
-            custNav.Activated += (s, e) => { isNavigatingMenu = true; Speedo.Preview = Speedo.Active; menu.Visible = false; custMenu.Visible = true; isNavigatingMenu = false; };
-            menu.Add(custNav);
 
             // Preview-on-hover: show whichever style is highlighted (Customization row falls back to the active one).
             menu.SelectedIndexChanged += (s, e) =>
@@ -7301,10 +8633,12 @@ namespace ExtendedLSC
         {
             var menu = CreateMenu("Speedo Customization");
 
-            var units = new NativeListItem<string>("Units", "MPH", "KM/H") { SelectedIndex = Speedo.Mph ? 0 : 1 };
-            units.Description = "Speed units shown on the gauge.";
-            units.ItemChanged += (s, e) => { Speedo.Mph = e.Index == 0; Speedo.SaveConfig(); };
-            NoWrap(units); menu.Add(units);
+            // Units as a SELECT toggle (a 2-item left/right list wasn't registering input in this menu, while
+            // the multi-item color/size lists do). Select flips MPH <-> KM/H reliably.
+            var units = new NativeItem("Units") { AltTitle = Speedo.Mph ? "MPH" : "KM/H" };
+            units.Description = "Select to switch between MPH and KM/H.";
+            units.Activated += (s, e) => { Speedo.Mph = !Speedo.Mph; Speedo.SaveConfig(); units.AltTitle = Speedo.Mph ? "MPH" : "KM/H"; };
+            menu.Add(units);
 
             var sizes = new List<string>();
             for (int p = 70; p <= 150; p += 10) sizes.Add(p + "%");
@@ -7314,18 +8648,68 @@ namespace ExtendedLSC
             size.ItemChanged += (s, e) => { Speedo.Scale = (70 + e.Index * 10) / 100f; Speedo.SaveConfig(); };
             NoWrap(size); menu.Add(size);
 
-            var colorNames = new[] { "Red", "Cyan", "Green", "White", "Amber", "Purple" };
-            var colorVals = new[]
+            // ---- Per-element colors (customize EVERY color on the gauge) ----
+            var palNames = new[] { "Red", "Orange", "Amber", "Yellow", "Lime", "Green", "Teal", "Cyan", "Blue", "Purple", "Magenta", "Pink", "White", "Gray", "Black" };
+            var palVals = new[]
             {
-                Color.FromArgb(255,235,60,60), Color.FromArgb(255,80,210,255), Color.FromArgb(255,90,230,120),
-                Color.White, Color.FromArgb(255,255,180,40), Color.FromArgb(255,190,120,255)
+                Color.FromArgb(255,235,60,60),  Color.FromArgb(255,255,140,0),  Color.FromArgb(255,255,191,0),
+                Color.FromArgb(255,255,235,59), Color.FromArgb(255,170,255,60), Color.FromArgb(255,90,230,120),
+                Color.FromArgb(255,0,200,180),  Color.FromArgb(255,80,210,255), Color.FromArgb(255,40,120,255),
+                Color.FromArgb(255,160,90,255), Color.FromArgb(255,230,80,230), Color.FromArgb(255,255,120,180),
+                Color.White,                    Color.FromArgb(255,200,200,200), Color.FromArgb(255,20,20,20)
             };
-            int colIdx = 0;
-            for (int i = 0; i < colorVals.Length; i++) if (colorVals[i].ToArgb() == Speedo.Accent.ToArgb()) colIdx = i;
-            var color = new NativeListItem<string>("Accent Color", colorNames) { SelectedIndex = colIdx };
-            color.Description = "Needle / highlight color.";
-            color.ItemChanged += (s, e) => { Speedo.Accent = colorVals[e.Index]; Speedo.SaveConfig(); };
-            NoWrap(color); menu.Add(color);
+            int Nearest(Color c)
+            {
+                int best = 0; double bd = double.MaxValue;
+                for (int i = 0; i < palVals.Length; i++)
+                {
+                    var p = palVals[i];
+                    double d = (p.R - c.R) * (p.R - c.R) + (p.G - c.G) * (p.G - c.G) + (p.B - c.B) * (p.B - c.B);
+                    if (d < bd) { bd = d; best = i; }
+                }
+                return best;
+            }
+            // Colors edit the ACTIVE style's palette, so Simple and FASTandSPEEDY keep separate colors.
+            Speedo.Palette Cur() => Speedo.ColorsFor(Speedo.Active);
+            var colorRefreshers = new List<Action>();
+            void AddColor(string label, string desc, Func<Color> get, Action<Color> set)
+            {
+                var item = new NativeListItem<string>(label, palNames) { SelectedIndex = Nearest(get()) };
+                item.Description = desc;
+                item.ItemChanged += (s, e) => { set(palVals[e.Index]); Speedo.SaveConfig(); };
+                colorRefreshers.Add(() => item.SelectedIndex = Nearest(get()));
+                NoWrap(item); menu.Add(item);
+            }
+            AddColor("Accent Color", "RPM bar fill / needle.",     () => Cur().Accent,  c => Cur().Accent = c);
+            AddColor("Speed Color",  "The speed number.",          () => Cur().Speed,   c => Cur().Speed = c);
+            AddColor("Units Color",  "The MPH / KM·H label.",      () => Cur().Unit,    c => Cur().Unit = c);
+            AddColor("Gear Color",   "The gear number.",           () => Cur().Gear,    c => Cur().Gear = c);
+            AddColor("NOS Color",    "The nitrous bar.",           () => Cur().Nos,     c => Cur().Nos = c);
+            AddColor("Redline Color","Redline zone / warning.",    () => Cur().Redline, c => Cur().Redline = c);
+            // FASTandSPEEDY dial fills (Color 1 = big circle, Color 2 = small circle) + brightness sliders.
+            AddColor("Big Circle (Color 1)",   "FASTandSPEEDY main dial fill.",  () => Cur().Circle1, c => Cur().Circle1 = c);
+            AddColor("Small Circle (Color 2)", "FASTandSPEEDY turbo dial fill.", () => Cur().Circle2, c => Cur().Circle2 = c);
+
+            // Brightness 0..100% in steps of 5 — how brightly the circle colour shows over the dark dial.
+            var brite = new List<string>(); for (int p = 0; p <= 100; p += 5) brite.Add(p + "%");
+            int B2I(int a) => Math.Max(0, Math.Min(brite.Count - 1, (int)Math.Round(a / 255f * 100f / 5f)));
+            var c1b = new NativeListItem<string>("Big Circle Brightness", brite.ToArray()) { SelectedIndex = B2I(Cur().Circle1Alpha) };
+            c1b.Description = "How brightly the big dial colour shows.";
+            c1b.ItemChanged += (s, e) => { Cur().Circle1Alpha = (int)Math.Round(e.Index * 5 / 100f * 255f); Speedo.SaveConfig(); };
+            colorRefreshers.Add(() => c1b.SelectedIndex = B2I(Cur().Circle1Alpha));
+            menu.Add(c1b);
+            var c2b = new NativeListItem<string>("Small Circle Brightness", brite.ToArray()) { SelectedIndex = B2I(Cur().Circle2Alpha) };
+            c2b.Description = "How brightly the small dial colour shows.";
+            c2b.ItemChanged += (s, e) => { Cur().Circle2Alpha = (int)Math.Round(e.Index * 5 / 100f * 255f); Speedo.SaveConfig(); };
+            colorRefreshers.Add(() => c2b.SelectedIndex = B2I(Cur().Circle2Alpha));
+            menu.Add(c2b);
+
+            // When the editor opens, sync every picker to the (now-active) style's palette + the unit toggle.
+            menu.Shown += (s, e) =>
+            {
+                units.AltTitle = Speedo.Mph ? "MPH" : "KM/H";
+                foreach (var r in colorRefreshers) r();
+            };
 
             var up = new NativeItem("Move Up"); up.Activated += (s, e) => { Speedo.OffY -= 0.01f; Speedo.SaveConfig(); };
             var down = new NativeItem("Move Down"); down.Activated += (s, e) => { Speedo.OffY += 0.01f; Speedo.SaveConfig(); };
@@ -7341,7 +8725,7 @@ namespace ExtendedLSC
         {
             var menu = CreateMenu("Tire Design");
             const string catPath = "Wheels/Tires/Tire Design";
-            string vehicleName = currentVehicle.DisplayName;
+            string vehicleName = VehicleKey(currentVehicle);
             bool curCustom = Function.Call<bool>(Hash.GET_VEHICLE_MOD_VARIATION, currentVehicle, 23);
 
             // value: 0 = Stock (free), 1 = Custom (priced aftermarket tire)
@@ -7377,12 +8761,12 @@ namespace ExtendedLSC
                 int itemPrice = price;
                 item.Activated += (s, e) =>
                 {
-                    bool owned = val == 0 || VehicleSaveData.IsCustomItemOwned(currentVehicle.DisplayName, catPath, val);
+                    bool owned = val == 0 || VehicleSaveData.IsCustomItemOwned(VehicleKey(currentVehicle), catPath, val);
                     if (!TryPurchase(itemPrice, owned)) return;
                     ApplyCustomTires(val == 1);
                     if (val > 0 && !owned)
                     {
-                        VehicleSaveData.SetCustomItemOwned(currentVehicle.DisplayName, catPath, val);
+                        VehicleSaveData.SetCustomItemOwned(VehicleKey(currentVehicle), catPath, val);
                         VehicleSaveData.Save();
                     }
                 };
@@ -7408,7 +8792,7 @@ namespace ExtendedLSC
 
             int currentTint = (int)currentVehicle.Mods.WindowTint;
 
-            string vehicleName = currentVehicle.DisplayName;
+            string vehicleName = VehicleKey(currentVehicle);
             for (int i = 0; i < tintOptions.Length; i++)
             {
                 var (name, tintValue) = tintOptions[i];
@@ -7438,12 +8822,12 @@ namespace ExtendedLSC
                 item.Activated += (s, e) =>
                 {
                     bool owned = idx == 0 || (int)currentVehicle.Mods.WindowTint == idx ||
-                                 VehicleSaveData.IsTintOwned(currentVehicle.DisplayName, idx);
+                                 VehicleSaveData.IsTintOwned(VehicleKey(currentVehicle), idx);
                     if (!TryPurchase(itemPrice, owned)) return;
                     ApplyWindowTint(idx);
                     if (idx > 0)
                     {
-                        VehicleSaveData.SetTintOwned(currentVehicle.DisplayName, idx);
+                        VehicleSaveData.SetTintOwned(VehicleKey(currentVehicle), idx);
                         VehicleSaveData.Save();
                     }
                 };
@@ -7497,7 +8881,7 @@ namespace ExtendedLSC
             string[] plates = { "Blue on White 1", "Yellow on Black", "Yellow on Blue", "Blue on White 2", "Blue on White 3", "Yankton" };
             int currentPlate = (int)currentVehicle.Mods.LicensePlateStyle;
 
-            string vehicleName = currentVehicle.DisplayName;
+            string vehicleName = VehicleKey(currentVehicle);
             for (int i = 0; i < plates.Length; i++)
             {
                 bool isInstalled = currentPlate == i;
@@ -7524,14 +8908,14 @@ namespace ExtendedLSC
                 int platePrice = 200;
                 item.Activated += (s, e) =>
                 {
-                    bool owned = VehicleSaveData.IsPlateOwned(currentVehicle.DisplayName, plateIndex);
+                    bool owned = VehicleSaveData.IsPlateOwned(VehicleKey(currentVehicle), plateIndex);
                     if (!TryPurchase(platePrice, owned)) return;
 
                     platePurchased = true; // keep the previewed style, don't revert on close
                     ApplyPlateStyle(plateIndex);
                     if (!owned)
                     {
-                        VehicleSaveData.SetPlateOwned(currentVehicle.DisplayName, plateIndex);
+                        VehicleSaveData.SetPlateOwned(VehicleKey(currentVehicle), plateIndex);
                         VehicleSaveData.Save();
                     }
                 };
@@ -7609,7 +8993,7 @@ namespace ExtendedLSC
         {
             if (!modMenusByIndex.TryGetValue(modIndex, out var menu)) return;
 
-            string vehicleName = currentVehicle?.DisplayName ?? "";
+            string vehicleName = VehicleKey(currentVehicle);
 
             // Check if this mod type has no stock option (performance mods)
             bool noStockOption = false;
@@ -7659,7 +9043,7 @@ namespace ExtendedLSC
         private void RefreshHornMenuStatus(int newInstalledIndex)
         {
             if (hornMenu == null) return;
-            string vehicleName = currentVehicle?.DisplayName ?? "";
+            string vehicleName = VehicleKey(currentVehicle);
 
             for (int i = 0; i < hornMenu.Items.Count; i++)
             {
@@ -7695,15 +9079,20 @@ namespace ExtendedLSC
         private void RefreshPlateMenuStatus(int newInstalledIndex)
         {
             if (plateMenu == null) return;
-            string vehicleName = currentVehicle?.DisplayName ?? "";
+            string vehicleName = VehicleKey(currentVehicle);
 
             for (int i = 0; i < plateMenu.Items.Count; i++)
             {
                 var item = plateMenu.Items[i] as NativeItem;
                 if (item == null) continue;
 
-                bool isNowInstalled = (i == newInstalledIndex);
-                bool isOwned = VehicleSaveData.IsPlateOwned(vehicleName, i);
+                // Menu items 0 and 1 are the "Custom Plate Text" / "Random Plate" headers; the plate STYLES
+                // start at item 2. The style index = item index - 2 (matches CreatePlateMenu's layout note).
+                int styleIdx = i - 2;
+                if (styleIdx < 0) continue;   // skip the two header items
+
+                bool isNowInstalled = (styleIdx == newInstalledIndex);
+                bool isOwned = VehicleSaveData.IsPlateOwned(vehicleName, styleIdx);
 
                 itemOwnershipStatus.Remove(item);
 
@@ -7739,7 +9128,7 @@ namespace ExtendedLSC
         private void RefreshTurboMenuStatus(bool turboEnabled)
         {
             if (turboMenu == null || turboMenu.Items.Count < 2) return;
-            string vehicleName = currentVehicle?.DisplayName ?? "";
+            string vehicleName = VehicleKey(currentVehicle);
             bool turboOwned = VehicleSaveData.IsTurboOwned(vehicleName);
 
             // Item 0 is "None", Item 1 is "Turbo Tuning"
@@ -7786,7 +9175,7 @@ namespace ExtendedLSC
         private void RefreshHeadlightsMenuStatus(bool xenonEnabled)
         {
             if (headlightsMenu == null || headlightsMenu.Items.Count < 2) return;
-            string vehicleName = currentVehicle?.DisplayName ?? "";
+            string vehicleName = VehicleKey(currentVehicle);
             bool xenonOwned = VehicleSaveData.IsXenonOwned(vehicleName);
 
             // Item 0 is "Stock Lights", Item 1 is "Xenon Lights"
@@ -8163,7 +9552,8 @@ namespace ExtendedLSC
         {
             if (currentVehicle == null) return;
 
-            currentVehicle.Repair();
+            currentVehicle.Repair();                                                   // SET_VEHICLE_FIXED (health + scuffs)
+            try { Function.Call(Hash.SET_VEHICLE_DEFORMATION_FIXED, currentVehicle); } catch { }  // pop dents/nicks back out
             ShowNotification("~g~Vehicle repaired!");
             MechanicSpeak();
         }
@@ -8349,6 +9739,54 @@ namespace ExtendedLSC
             // in real time and navigate reliably instead of blind key-counting. Throttled internally.
             DumpMenuState();
 
+            // Customize Radio: loop the player's own tracks while in an LSC. Crossfades between states instead of
+            // cutting out — normal while editing (menu open), quieter when the menu's closed but you're still in the
+            // shop, and a gentle fade to silence when you leave LSC. Reopening ELSC in the shop normalizes it again.
+            try
+            {
+                if (customizeRadio != null)
+                {
+                    bool available = ModSettings.CustomizeRadio && customizeRadio.HasTracks;
+                    // Target level for the current state. Only at an ACTUAL Los Santos Customs (isInLSC) — not when
+                    // the menu is opened anywhere in free roam via OpenAnywhere.
+                    float target;
+                    if (!available)                       target = 0f;
+                    else if (isInLSC && isMenuActive)      target = 1f;                  // editing → normal
+                    else if (isInLSC)                      target = RADIO_QUIET_LEVEL;   // in shop, menu closed → quiet
+                    else                                   target = 0f;                  // left LSC → fade out
+
+                    // Rise quickly (snappy "normalize"), fall gently (smooth fade-out / quieten).
+                    float rate = target > _radioFade ? 0.18f : 0.045f;
+                    _radioFade += (target - _radioFade) * rate;
+                    if (_radioFade < 0.0025f) _radioFade = 0f;   // floor so the fade-out fully completes
+
+                    // Keep playing while we still have any level to render; stop once fully faded (or unavailable).
+                    if (available && _radioFade > 0f)
+                    {
+                        // Follow the game's Music volume (GET_PROFILE_SETTING 301, 0-10), scaled by the INI ceiling
+                        // — so lowering Music volume in GTA settings quiets/mutes the customize radio.
+                        int musicVol = 10;
+                        try { musicVol = Function.Call<int>(Hash.GET_PROFILE_SETTING, 301); } catch { }
+                        if (musicVol < 0) musicVol = 0; else if (musicVol > 10) musicVol = 10;
+                        customizeRadio.Volume = (musicVol / 10f) * ModSettings.CustomizeRadioVolume * _radioFade;
+                        customizeRadio.Start();
+                        customizeRadio.Tick();
+                    }
+                    else { customizeRadio.Stop(); _radioFade = 0f; }
+                }
+            }
+            catch { }
+
+            // While Manual Transmission is active, disable drive-by so aiming a gun in the car can't roll down /
+            // break the windows (SET_PLAYER_CAN_DO_DRIVE_BY). Only when MT is on — restored the moment it's off.
+            try
+            {
+                bool mtOn = elscTransmission != null && elscTransmission.IsEnabled;
+                if (mtOn) { Function.Call(Hash.SET_PLAYER_CAN_DO_DRIVE_BY, Game.Player, false); _driveByDisabled = true; }
+                else if (_driveByDisabled) { Function.Call(Hash.SET_PLAYER_CAN_DO_DRIVE_BY, Game.Player, true); _driveByDisabled = false; }
+            }
+            catch { }
+
             // Speedometer design-preview harness (white-screen isolate for screenshot iteration).
             try { Speedo.DrawPreviewIfRequested(); } catch { }
 
@@ -8388,6 +9826,13 @@ namespace ExtendedLSC
             }
 
 
+            // Per-car plate identity MUST run BEFORE any apply-by-plate sweep below (window tint + snapshot), or a
+            // duplicate-plate car gets another car's saved look applied before it's re-plated.
+            // 1) The car the player just got into (auto-rename empty/colliding plates), once per car.
+            BindPlateForCurrentVehicle();
+            // 2) Spawned duplicates (e.g. several Menyoo cars all plated "MENYOO") -> give the extras unique plates.
+            DedupeWorldPlates();
+
             // Custom window color: advance the one-time table scan, and re-assert the driven car's color.
             try { windowTint.Tick(Game.Player.Character?.CurrentVehicle); } catch { }
 
@@ -8409,7 +9854,7 @@ namespace ExtendedLSC
             // Re-assert the menu's default-camera framing for a short window after open, so it survives the LSC
             // cinematic-end / follow-cam re-centering (a single SET on the open frame gets overridden). Released
             // after the window so the player can move the camera freely. Skipped during orbital Camera Mode.
-            if (isMenuActive && !isWalkAroundActive && Game.GameTime < menuCamUntil)
+            if (isMenuActive && !isWalkAroundActive && !isFirstPersonActive && Game.GameTime < menuCamUntil)
             {
                 Function.Call(Hash.SET_GAMEPLAY_CAM_RELATIVE_HEADING, MENU_CAM_HEADING);
                 Function.Call(Hash.SET_GAMEPLAY_CAM_RELATIVE_PITCH, MENU_CAM_PITCH, 1.0f);
@@ -8428,6 +9873,7 @@ namespace ExtendedLSC
             UpdateNameWheel();         // edit mode: name a re-shelved rim
             UpdateEditItemName();      // edit mode: edit an item's name (pre-filled)
             UpdateEditItemPrice();     // edit mode: edit an item's price (pre-filled)
+            UpdateNamePackage();       // packages: on-screen keyboard for naming a saved package
 
             // Handle custom plate-text editor (on-screen keyboard)
             UpdatePlateEditor();
@@ -8435,10 +9881,10 @@ namespace ExtendedLSC
             // Check for X to edit/cancel description (editor mode)
             CheckDescriptionEditInput();
 
-            // Skip input processing while an on-screen keyboard is open (description OR plate text), so button
-            // presses go to the text box and don't leak through to the menu underneath.
-            // But still draw the menu and custom UI.
-            if (isEditingDescription || isEditingPlate || isAddingCategory || isNamingPart || isPricingPart || isRenamingCategory || isNamingWheel || isAddingWheelCategory || isEditingItemName || isEditingItemPrice)
+            // Skip input processing while ANY on-screen keyboard is open (description, plate, package name, etc.) so
+            // the keys being typed go to the text box and don't leak through to the menu / gameplay underneath
+            // (e.g. a letter in the package name triggering the walk-around toggle). Still draw the menu + custom UI.
+            if (IsTypingText)
             {
                 Game.DisableAllControlsThisFrame();
                 menuPool.Process();
@@ -9096,6 +10542,10 @@ namespace ExtendedLSC
             // immediately while the player is adjusting them, instead of floating until they drive off.
             UpdateWheelFitment();
 
+            // Hold an inspected car's wheels at the chosen angle (in AND out of the menu, incl. after the player
+            // leaves it parked in free roam). Released the moment it's actually driven.
+            UpdateSteeringHold();
+
             // Auto-apply saved stances to specific cars within range (skips the player's current car).
             // Guarded like fitment: on error, disable for the session rather than crash the script.
             if (_stanceMgrInit && ModSettings.VStancerIntegration)
@@ -9104,24 +10554,73 @@ namespace ExtendedLSC
                 catch (Exception ex) { Log($"[Stance] OnTick error: {ex.Message}"); _stanceMgrInit = false; Log("[Stance] Disabled due to errors"); }
             }
 
-            // Handle custom menu input with native GTA-style acceleration
-            HandleMenuInput();
+            // Idle showcase cinematic: after ~10s of no input it fades to black, hides the HUD + menu, and slowly
+            // orbits the car (fading on each side switch). Any input snaps back + unhides. Owns its own camera.
+            UpdateIdleCinematic();
 
-            // Capture + clear the selected item's native description BEFORE LemonUI draws it, so its un-offset
-            // native description never flashes; DrawCustomBanner redraws it below the scroll arrows.
-            PreClearVisibleDescription();
+            if (_idleHideUI)
+            {
+                // The cinematic owns the screen now: hide the game HUD/radar and block input. The ELSC menu + custom
+                // UI below are skipped so nothing draws over the shot. (During the initial fade-out the menu still
+                // draws so it fades to black WITH the menu, then we hide once black.)
+                Function.Call(Hash.HIDE_HUD_AND_RADAR_THIS_FRAME);
+                Game.DisableAllControlsThisFrame();
+            }
+            else
+            {
+                // In walk-around, D-pad Left/Right steers the wheels for inspection — block the menu from also
+                // consuming them (it would change a highlighted list item). Disabled BEFORE input is processed so
+                // neither HandleMenuInput nor LemonUI sees them; UpdateWalkAround reads them as disabled controls.
+                if (isWalkAroundActive && ModSettings.KeepSteeringAngle)
+                {
+                    Game.DisableControlThisFrame(GTA.Control.FrontendLeft);
+                    Game.DisableControlThisFrame(GTA.Control.FrontendRight);
+                }
 
-            menuPool.Process();
+                // Handle custom menu input with native GTA-style acceleration
+                HandleMenuInput();
 
-            // Draw custom banner overlay
-            DrawCustomBanner();
+                // Capture + clear the selected item's native description BEFORE LemonUI draws it, so its un-offset
+                // native description never flashes; DrawCustomBanner redraws it below the scroll arrows.
+                PreClearVisibleDescription();
 
-            // Draw sprite browser if enabled (F6 to toggle)
-            DrawSpriteBrowser();
+                menuPool.Process();
 
-            // Speedometer preview while its menu / customization is open (preview-before-buy + live tuning).
-            if (Speedo.Preview != null && currentVehicle != null && currentVehicle.Exists())
-                DrawSpeedometer(currentVehicle);
+                // Packages: X on a highlighted package opens the delete-confirm prompt.
+                CheckPackageDeleteInput();
+
+                // Turn the wheels with D-pad Left/Right in the normal menu too (not just walk-around). Stands down on
+                // list/slider items (there Left/Right adjusts the item) so it never fights menu value changes.
+                if (isMenuActive && !isWalkAroundActive)
+                {
+                    var sm = GetVisibleMenu();
+                    if (sm == null || !ItemUsesLeftRight(sm.SelectedItem))
+                        HandleInspectSteering(currentVehicle);
+                }
+
+                // Draw custom banner overlay
+                DrawCustomBanner();
+
+                // Draw sprite browser if enabled (F6 to toggle)
+                DrawSpriteBrowser();
+            }
+
+            // Speedometer preview — ONLY while a menu is open. DEMO telemetry (88 mph, gear 4, NOS) so units +
+            // colors are visible while parked. CRITICAL: if the menu isn't open, clear Preview — otherwise it
+            // leaks into driving and the static demo gauge draws ON TOP of the real one (ghosted/overlaid digits).
+            if (!isMenuActive)
+            {
+                Speedo.Preview = null;
+            }
+            else if (!_idleHideUI && Speedo.Preview != null && currentVehicle != null && currentVehicle.Exists())
+            {
+                Speedo.Draw(new SpeedoFrame
+                {
+                    SpeedMph = 88f, Rpm01 = 0.72f, GearText = "4", Redline = false,
+                    HasTurbo = true, Turbo01 = 0.72f, HasNos = true, Nos01 = 0.66f,
+                    HasShiftPoints = true, PerfectMin01 = 0.90f, PerfectMax01 = 0.98f
+                });
+            }
 
             // Keep handbrake on while menu is active (allows rev with just RT)
             // Keep handbrake on while menu is active (allows rev with just RT)
@@ -9151,28 +10650,29 @@ namespace ExtendedLSC
                 }
             }
 
-            // Check mechanic cleanup
-            CheckMechanicCleanup();
-
-            // Make mechanic face player
-            UpdateMechanicBehavior();
-
-            // Walk-around camera mode
-            if (isWalkAroundActive)
+            // Walk-around / first-person camera modes. Skipped while the idle cinematic owns the screen so the
+            // custom camera doesn't fight the cinematic cam; on input the cinematic restores it.
+            if (isWalkAroundActive && !_idleHideUI)
             {
                 UpdateWalkAround();
+            }
+            else if (isFirstPersonActive && !_idleHideUI)
+            {
+                UpdateFirstPerson();
             }
 
             // Cooldown timer for camera mode
             if (cameraModeCooldown > 0)
                 cameraModeCooldown--;
 
-            // Controller input for walk-around (Y button) - only when menu is open and custom camera enabled
-            if (ModSettings.CustomCamera && isMenuActive && !isWalkAroundActive && cameraModeCooldown == 0)
+            // Camera cycle (Y button): Basic -> Walk-Around -> First-Person -> Basic. Single handler for ALL modes.
+            if (ModSettings.CustomCamera && isMenuActive && _lscEjectPhase == 0 && cameraModeCooldown == 0)
             {
-                if (Game.IsControlJustPressed((GTA.Control)ModSettings.WalkAroundButton)) // default Y
+                // Detect the press while the control stays DISABLED, so the game never runs its
+                // native exit-vehicle behaviour for this button (default Y / VehicleExit).
+                if (Function.Call<bool>(Hash.IS_DISABLED_CONTROL_JUST_PRESSED, 0, ModSettings.WalkAroundButton))
                 {
-                    EnterWalkAround();
+                    CycleCamera();
                 }
             }
 
@@ -9268,7 +10768,9 @@ namespace ExtendedLSC
                     Game.EnableControlThisFrame(GTA.Control.PhoneCancel);
                     Game.EnableControlThisFrame(GTA.Control.LookLeftRight);
                     Game.EnableControlThisFrame(GTA.Control.LookUpDown);
-                    Game.EnableControlThisFrame(GTA.Control.VehicleExit); // Y for walk-around
+                    // NOTE: VehicleExit is intentionally LEFT DISABLED. Enabling it let the game's native
+                    // "hold Y to exit vehicle" fire (spamming the walk-around button ejected the player).
+                    // The walk-around button press is detected via IS_DISABLED_CONTROL_JUST_PRESSED below.
                     Game.EnableControlThisFrame(GTA.Control.Aim); // LB for edit mode
                     Game.EnableControlThisFrame(GTA.Control.Sprint); // Shift for edit mode (keyboard)
                     Game.EnableControlThisFrame(GTA.Control.VehicleDuck); // X for edit description
@@ -9278,12 +10780,28 @@ namespace ExtendedLSC
                 }
             }
 
+            // Fake-fade: advance the overlay alpha and draw it LAST so it covers the menu + HUD. Runs every frame
+            // (even with the cinematic stopped) so an interrupted fade can still finish clearing.
+            UpdateIdleFade();
+            DrawIdleFadeOverlay();
+
             // LSC detection
             CheckLSCEntry();
         }
 
         private void OnKeyDown(object sender, KeyEventArgs e)
         {
+            // While the player is typing into an on-screen keyboard, swallow every key here too — otherwise a letter
+            // in their text (package name, plate, etc.) could fire an edit-mode hotkey or other ELSC action.
+            if (IsTypingText) return;
+
+            // Open ELSC ANYWHERE (INI OpenAnywhere, off by default): the menu key opens the menu without a shop.
+            if (ModSettings.OpenAnywhere && e.KeyCode == ModSettings.MenuKey && !isMenuActive)
+            {
+                TryOpenMenu();
+                return;
+            }
+
             // Control remapper: capture the next key press as the new binding (edit-mode CONTROLS menu).
             if (isRebindingKey)
             {
@@ -9485,6 +11003,7 @@ namespace ExtendedLSC
 
                 currentVehicle = player.CurrentVehicle;
                 currentVehicle.Mods.InstallModKit();
+                SyncSpeedoToCar(currentVehicle);   // per-car speedo: menu reflects THIS car's equipped style
 
                 // Cache screen resolution for coordinate conversion
                 UpdateCachedScreenResolution();
@@ -9531,6 +11050,10 @@ namespace ExtendedLSC
             {
                 ExitWalkAround();
             }
+            if (isFirstPersonActive)
+            {
+                ExitFirstPerson();
+            }
 
             // Release handbrake when menu closes
             if (currentVehicle != null && currentVehicle.Exists())
@@ -9555,15 +11078,73 @@ namespace ExtendedLSC
 
         // ---- Repair gate: like real LSC, a damaged car must be repaired before customizing. Cost scales with
         // how badly it's damaged (body + engine + tank health); checked on EVERY menu open. ----
+        /// <summary>Hand the view from the eject cams back to the gameplay camera (which is already AT the menu
+        /// framing, so the cut is seamless) and delete both temp cams. ease only used for the misdetect bail.</summary>
+        private void ReleaseLscHoldCam(bool ease)
+        {
+            if (_lscHoldCam == null && _lscMenuCam == null) return;
+            try { Function.Call(Hash.RENDER_SCRIPT_CAMS, false, ease, ease ? 400 : 0, true, false, 0); } catch { }
+            if (ease) { _lscHoldCamReleaseAt = Game.GameTime + 450; }   // keep alive through the brief blend, then reap
+            else
+            {
+                try { if (_lscHoldCam != null) _lscHoldCam.Delete(); } catch { }
+                try { if (_lscMenuCam != null) _lscMenuCam.Delete(); } catch { }
+                _lscHoldCam = null; _lscMenuCam = null; _lscHoldCamReleaseAt = 0;
+            }
+        }
+
+        // True while the game's mod-shop script (carmod_shop) is running — i.e. the player is actually at a Los Santos
+        // Customs shop (vanilla or a modded one that uses it). It is NOT running during Menyoo Spooner / trainers, so
+        // this distinguishes "the real customs menu opened" from "another mod just disabled my control in a parked car".
+        private int _carmodShopHash = 0;
+        private bool CarmodShopRunning()
+        {
+            try
+            {
+                if (_carmodShopHash == 0) _carmodShopHash = Function.Call<int>(Hash.GET_HASH_KEY, "carmod_shop");
+                return Function.Call<int>(Hash.GET_NUMBER_OF_THREADS_RUNNING_THE_SCRIPT_WITH_THIS_HASH, _carmodShopHash) > 0;
+            }
+            catch { return false; }
+        }
+
+        // Faithful port of vanilla LSC's damage assessment (carmod_shop func_3162): a component-based POINT
+        // system, not a pure health check. Crucially it counts visual-only damage — scratches/scuff DECALS,
+        // dinged doors, burst tyres, cracked glass, popped bumpers, dead headlights — none of which move the
+        // body/engine/tank health floats. That's why the old health-only check never saw "scratches and nicks".
         private int ComputeRepairCost()
         {
             if (currentVehicle == null || !currentVehicle.Exists()) return 0;
-            float Clamp(float v) => v < 0f ? 0f : (v > 1000f ? 1000f : v);
-            float body = Clamp(currentVehicle.BodyHealth);
-            float engine = Clamp(currentVehicle.EngineHealth);
-            float tank = Clamp(currentVehicle.PetrolTankHealth);
-            float dmg = (1000f - body) + (1000f - engine) + (1000f - tank);   // 0 (mint) .. 3000 (wrecked)
-            return (int)(Math.Round(dmg * 2f / 50.0) * 50);                   // ~$2/point, $50 steps, ~$6000 max
+            var v = currentVehicle;
+            bool B(Hash h, params InputArgument[] a) { try { var args = new InputArgument[a.Length + 1]; args[0] = v; Array.Copy(a, 0, args, 1, a.Length); return Function.Call<bool>(h, args); } catch { return false; } }
+            int pts = 0;
+
+            // Mechanical health tiers (engine / petrol tank / body[entity] health) — LSC's exact thresholds.
+            float eng = Math.Max(0f, v.EngineHealth) / 1000f;
+            pts += eng > 0.99f ? 0 : eng > 0.8f ? 20 : eng > 0.6f ? 40 : eng > 0.4f ? 80 : 100;
+            float tank = Math.Max(0f, v.PetrolTankHealth) / 1000f;
+            pts += tank > 0.99f ? 0 : tank > 0.8f ? 20 : tank > 0.6f ? 40 : tank > 0.4f ? 60 : 75;
+            float body = Math.Max(0, v.Health) / 1000f;
+            pts += body > 0.99f ? 0 : body > 0.8f ? 40 : body > 0.6f ? 80 : body > 0.4f ? 150 : 200;
+
+            // Visual damage (the part the old code missed entirely).
+            if (B(Hash.GET_DOES_VEHICLE_HAVE_DAMAGE_DECALS)) pts += 50;              // scratches / scuffs
+            if (B(Hash.IS_VEHICLE_BUMPER_BROKEN_OFF, true))  pts += 50;              // front bumper off
+            if (B(Hash.IS_VEHICLE_BUMPER_BROKEN_OFF, false)) pts += 50;              // rear bumper off
+            if (!B(Hash.ARE_ALL_VEHICLE_WINDOWS_INTACT))
+            {
+                pts += 20;
+                if (!B(Hash.IS_VEHICLE_WINDOW_INTACT, 6)) pts += 40;                 // windscreen
+                if (!B(Hash.IS_VEHICLE_WINDOW_INTACT, 7)) pts += 40;                 // rear windscreen
+            }
+            for (int d = 0; d < 6; d++) if (B(Hash.IS_VEHICLE_DOOR_DAMAGED, d)) pts += 25;
+            if (B(Hash.GET_IS_LEFT_VEHICLE_HEADLIGHT_DAMAGED))  pts += 15;
+            if (B(Hash.GET_IS_RIGHT_VEHICLE_HEADLIGHT_DAMAGED)) pts += 15;
+            for (int t = 0; t < 8; t++) if (B(Hash.IS_VEHICLE_TYRE_BURST, t, false)) pts += 25;
+
+            if (pts <= 0) return 0;   // genuinely pristine -> no repair prompt
+            int cost = pts * 2 + 50;  // points -> dollars with LSC's $50 base fee
+            if (cost > 5000) cost = 5000;
+            return (int)(Math.Round(cost / 25.0) * 25);
         }
 
         // Open the customization menu — but if the car is damaged, show the repair prompt first. Paying the
@@ -9571,7 +11152,7 @@ namespace ExtendedLSC
         private void ShowMenuWithRepairGate()
         {
             int cost = ComputeRepairCost();
-            if (cost < 100) { mainMenu.Visible = true; return; }   // negligible damage -> straight in
+            if (cost <= 0) { mainMenu.Visible = true; return; }   // pristine -> straight in (any damage shows the prompt)
 
             if (repairMenu != null) { menuPool.Remove(repairMenu); repairMenu = null; }
             repairMenu = CreateMenu("Repair");
@@ -9599,11 +11180,145 @@ namespace ExtendedLSC
 
         private void CheckLSCEntry()
         {
-            // In a mission/cutscene, stand down entirely: never intercept carmod_shop or auto-open — the vanilla
-            // LSC menu runs through untouched (we bail BEFORE any mechanic-deletion/takeover happens).
-            if (IsOnMission()) return;
+            // Reap the eject cams once their release blend has finished (deferred so the blend can complete).
+            if ((_lscHoldCam != null || _lscMenuCam != null) && _lscHoldCamReleaseAt != 0 && Game.GameTime > _lscHoldCamReleaseAt)
+            {
+                try { if (_lscHoldCam != null) _lscHoldCam.Delete(); } catch { }
+                try { if (_lscMenuCam != null) _lscMenuCam.Delete(); } catch { }
+                _lscHoldCam = null; _lscMenuCam = null; _lscHoldCamReleaseAt = 0;
+            }
 
             if (_recordVanillaLSC) return;   // TEMP: let vanilla carmod_shop run uninterrupted for timing capture
+
+            // NOTE: the eject takeover below runs BEFORE the IsOnMission() bail on purpose — the vanilla menu IS a
+            // control-off state, and IsOnMission() treats control-off as a mission, so bailing first would make the
+            // detection (which keys on control-off) impossible. We guard it with the REAL mission signals instead.
+
+            // ── UNIVERSAL EJECT TAKEOVER ───────────────────────────────────────────────────────────────────
+            // The vanilla customs menu = player IN a vehicle, control OFF, car STOPPED. (The car moves through the
+            // whole drive-in animation and only stops when the menu actually opens, so "control off + stopped"
+            // cleanly marks menu-open and not the cinematic. Missions/cutscenes are already bailed at the top.)
+            // There's no native to close that menu, but popping the player out of the driver seat (then instantly
+            // re-seating) makes carmod_shop abort it and hand control back — WITHOUT swapping the mechanic. Works at
+            // ANY shop, including MODDED ones. (Additive: known vanilla shops are usually preempted below first.)
+            // Guard against REAL missions/cutscenes (which are ALSO control-off) — but NOT on control-off itself.
+            bool realMission = false;
+            try { realMission = Function.Call<bool>(Hash.GET_MISSION_FLAG) || Game.IsCutsceneActive; } catch { }
+
+            // Run while idle-and-not-in-menu (to START a takeover) OR whenever a takeover is already in progress
+            // (phases 4-5 run AFTER ELSC opens, i.e. with isMenuActive true, to finish the camera interp).
+            if (!realMission && (_lscEjectPhase > 0 || !isMenuActive))
+            {
+                // Set OUR custom camera at the menu framing FIRST, eject behind it, then hand to ELSC's own camera:
+                // (0) detect, aim the hidden gameplay cam at the menu angle; (1) snapshot that into a script cam and
+                // cut to it; (2) eject; (3) re-seat; (4) control back -> open ELSC and hand the script cam back to the
+                // gameplay cam (already AT the same framing -> seamless). No drive-in freeze, no interp, no snap.
+                if (_lscEjectPhase == 0)
+                {
+                    var pv = Game.Player.Character?.CurrentVehicle;
+                    bool controlOff = !Function.Call<bool>(Hash.IS_PLAYER_CONTROL_ON, Game.Player);
+                    // MOD-CONFLICT GUARD: "in a stopped car with control off" also matches Menyoo's Spooner mode (and
+                    // other trainers), so ELSC used to keep yanking the camera there. The real customs menu is driven
+                    // by the game's carmod_shop script, which only runs while you're at a mod shop (vanilla OR a modded
+                    // one that uses it) and is NOT running during Spooner anywhere else. Gate the takeover on it.
+                    // (&& short-circuits, so the native only runs once we're actually stopped with control off.)
+                    bool looksLikeMenu = pv != null && pv.Exists() && controlOff && pv.Speed < 0.5f && CarmodShopRunning();
+                    if (!looksLikeMenu) _lscMenuMaybeSince = 0;
+                    else
+                    {
+                        if (_lscMenuMaybeSince == 0) _lscMenuMaybeSince = Game.GameTime;
+                        if (Game.GameTime - _lscMenuMaybeSince > 150)
+                        {
+                            // FIRST open this visit: remember the car's nice spot (the drive-in just parked it here).
+                            // RE-OPEN: carmod_shop re-teleports the car to an awkward canonical spot when its menu
+                            // re-triggers — snap it back to the captured spot/heading so re-opens look identical.
+                            if (!_lscCarCaptured)
+                            {
+                                _lscCarPos = pv.Position; _lscCarHeading = pv.Heading; _lscCarCaptured = true;
+                            }
+                            else
+                            {
+                                try
+                                {
+                                    Function.Call(Hash.SET_ENTITY_COORDS_NO_OFFSET, pv, _lscCarPos.X, _lscCarPos.Y, _lscCarPos.Z, false, false, false);
+                                    Function.Call(Hash.SET_ENTITY_HEADING, pv, _lscCarHeading);
+                                    Function.Call(Hash.SET_VEHICLE_ON_GROUND_PROPERLY, pv);
+                                }
+                                catch { }
+                            }
+                            // Aim the (hidden) gameplay cam at ELSC's menu framing so we can snapshot it next.
+                            Function.Call(Hash.SET_GAMEPLAY_CAM_RELATIVE_HEADING, MENU_CAM_HEADING);
+                            Function.Call(Hash.SET_GAMEPLAY_CAM_RELATIVE_PITCH, MENU_CAM_PITCH, 1.0f);
+                            _lscEjectVeh = pv; _lscEjectPhase = 1; _lscEjectSince = Game.GameTime; _lscMenuMaybeSince = 0;
+                            isInLSC = true; customizeSpot = pv.Position; lscWorldPos = pv.Position;
+                            Log("Customs menu detected -> aiming menu cam, begin eject takeover (mechanic untouched)");
+                        }
+                    }
+                }
+                else if (_lscEjectPhase == 1)
+                {
+                    // Hold the framing, and once it's applied snapshot it into our custom script cam and cut to it.
+                    Function.Call(Hash.SET_GAMEPLAY_CAM_RELATIVE_HEADING, MENU_CAM_HEADING);
+                    Function.Call(Hash.SET_GAMEPLAY_CAM_RELATIVE_PITCH, MENU_CAM_PITCH, 1.0f);
+                    if (Game.GameTime - _lscEjectSince > 120)
+                    {
+                        try
+                        {
+                            _lscMenuCam = World.CreateCamera(GameplayCamera.Position, GameplayCamera.Rotation, GameplayCamera.FieldOfView);
+                            _lscMenuCam.IsActive = true;
+                            Function.Call(Hash.RENDER_SCRIPT_CAMS, true, false, 0, true, false, 0);
+                        }
+                        catch { _lscMenuCam = null; }
+                        _lscEjectPhase = 2; _lscEjectSince = Game.GameTime;
+                    }
+                }
+                else if (_lscEjectPhase == 2)
+                {
+                    // Eject (pop out of the driver seat) — fully hidden behind the custom menu cam.
+                    if (_lscEjectVeh != null && _lscEjectVeh.Exists())
+                    {
+                        Function.Call(Hash.CLEAR_PED_TASKS_IMMEDIATELY, Game.Player.Character);
+                        Function.Call(Hash.SET_PED_INTO_VEHICLE, Game.Player.Character, _lscEjectVeh, -2);
+                    }
+                    _lscEjectPhase = 3; _lscEjectSince = Game.GameTime;
+                }
+                else if (_lscEjectPhase == 3)
+                {
+                    // Re-seat in the driver seat.
+                    if (_lscEjectVeh != null && _lscEjectVeh.Exists())
+                        Function.Call(Hash.SET_PED_INTO_VEHICLE, Game.Player.Character, _lscEjectVeh, -1);
+                    _lscEjectPhase = 4; _lscEjectSince = Game.GameTime;
+                }
+                else if (_lscEjectPhase == 4)
+                {
+                    // Control returning confirms it was the menu -> open ELSC (re-applies the SAME menu framing +
+                    // menuCamUntil), then hand our script cam back to the gameplay cam — same angle, so it's seamless.
+                    bool controlBack = Function.Call<bool>(Hash.IS_PLAYER_CONTROL_ON, Game.Player);
+                    if (controlBack)
+                    {
+                        TryOpenMenu();
+                        Function.Call(Hash.SET_MAX_WANTED_LEVEL, 0);
+                        Function.Call(Hash.CLEAR_PLAYER_WANTED_LEVEL, Game.Player);
+                        ReleaseLscHoldCam(false);   // RENDER_SCRIPT_CAMS off + delete the custom cam (seamless handoff)
+                        _lscEjectPhase = 0; _lscEjectVeh = null;
+                        Log("ELSC open -> handed menu cam back to ELSC's camera");
+                    }
+                    else if (Game.GameTime - _lscEjectSince > 700)
+                    {
+                        ReleaseLscHoldCam(false);   // misdetect -> stand down + clean up
+                        _lscEjectPhase = 0; _lscEjectVeh = null;
+                    }
+                }
+            }
+            else
+            {
+                _lscEjectPhase = 0; _lscEjectVeh = null;   // ELSC open / real mission -> reset the eject state machine
+                if ((_lscHoldCam != null || _lscMenuCam != null) && _lscHoldCamReleaseAt == 0) ReleaseLscHoldCam(false);   // never orphan a cam
+            }
+
+            // The rest of the LSC flow (interior preempt, marker, help suppression) stays gated on the old
+            // mission check (which includes control-off) — only the eject takeover above needed to bypass it.
+            if (IsOnMission()) return;
 
             var player = Game.Player.Character;
             int interior = Function.Call<int>(Hash.GET_INTERIOR_FROM_ENTITY, player);
@@ -9617,31 +11332,14 @@ namespace ExtendedLSC
 
                 if (enteredLSC && player.IsInVehicle())
                 {
-                    isInLSC = true;
-                    // Arm AUTO-open only on a genuine FRESH setup: first time ever, or we'd left the shop area
-                    // (>120m) since the last visit — which is when carmod_shop resets (mechanic respawns +
-                    // animation replays). A quick hop out and back stays close -> NOT a fresh setup -> don't
-                    // re-arm; the marker (drive within 5m of the customize spot + press) handles re-open.
-                    bool freshSetup = lscWorldPos == Vector3.Zero || lscWentFar;
-                    if (freshSetup)
-                    {
-                        Log("Entered LSC (fresh setup) - arming auto-open");
-                        waitingForVehicleStop = true;
-                        lscSwapped = false;
-                        lscWentFar = false;
-                    }
-                    else
-                    {
-                        Log("Re-entered LSC (near) - marker re-open only");
-                        waitingForVehicleStop = false;
-                    }
+                    isInLSC = true;   // the universal eject takeover auto-opens ELSC when the vanilla menu appears
                 }
                 else if (leftLSC)
                 {
                     Log("Left Los Santos Customs - closing menu");
                     isInLSC = false;
-                    waitingForVehicleStop = false;
                     lastVehiclePos = Vector3.Zero;
+                    _lscCarCaptured = false;   // re-capture the nice spot on the next fresh entry
 
                     Function.Call(Hash.SET_MAX_WANTED_LEVEL, 5);
 
@@ -9655,125 +11353,8 @@ namespace ExtendedLSC
                 lastInterior = interior;
             }
 
-            // Track whether the player has gone FAR from the shop since the last visit — that's what makes
-            // carmod_shop reset (respawn its mechanic + replay the animation). A quick hop-out-and-back stays
-            // close and does NOT reset, so it must NOT re-arm the auto-open (marker handles re-open).
-            if (lscWorldPos != Vector3.Zero && Game.Player.Character.Position.DistanceTo(lscWorldPos) > 120f)
-                lscWentFar = true;
-
-            // Detect service position
-            if (waitingForVehicleStop && isInLSC)
-            {
-                var ped = Game.Player.Character;
-                if (ped.IsInVehicle())
-                {
-                    var vehicle = ped.CurrentVehicle;
-
-                    // carmod_shop takes player control (control OFF) for the WHOLE drive-in animation + its menu.
-                    // RECORDED TIMING (Burton): control off at ~11.2s, the car is driven automatically at a steady
-                    // ~2.96 m/s for ~5s, then parks (speed->0) at ~16.2s — and ONLY THEN does the vanilla menu
-                    // appear. The car is moving (speed > 1) for the entire drive-in and only drops to ~0 at the
-                    // end, so "stopped while the cinematic is active" cleanly marks the animation finishing.
-                    //
-                    // So we must NOT touch carmod_shop until that settle point (touching it earlier kills the
-                    // animation — the old bug). At settle we swap the bay mechanic (halts carmod_shop's menu before
-                    // it can show) and open ours. For an already-visited shop with no drive-in, the car is already
-                    // stopped, so this fires immediately — instant open, as expected.
-                    // Settle = car stopped while inside the LSC interior. ONE timer, reset ONLY by MOVEMENT (not by
-                    // the control toggle), so it survives the control on->off transition cleanly.
-                    if (vehicle.Speed < 0.5f)
-                    {
-                        if (lscSettleSince == 0) lscSettleSince = Game.GameTime;
-                    }
-                    else lscSettleSince = 0;
-
-                    // Act on the VERY FIRST parked frame to beat the vanilla menu (it appears ~1 frame after the
-                    // car parks). The delay is near-zero — that's what kills the split-second vanilla-menu flash.
-                    //  - CINEMATIC (control OFF, e.g. Burton 39938 / Airport 93442): the drive-in animation just
-                    //    parked the car -> act THIS frame (0ms). The car moves the WHOLE drive-in (speed never
-                    //    dips < 0.5 until the end), so this only fires at the park and never preempts the animation.
-                    //  - NO cinematic (control ON, e.g. Grand Senora 9474): an animation ALWAYS grabs the car while
-                    //    it's still MOVING (control goes off before the car stops), so a stop with control STILL ON
-                    //    means no animation is coming -> safe to act with just a 2-frame confirm (~32ms) to ignore
-                    //    a momentary slow-roll dip.
-                    bool cinematic = !Function.Call<bool>(Hash.IS_PLAYER_CONTROL_ON, Game.Player);
-
-                    // DIRECT "vanilla menu just opened" signal: carmod_shop switches the vehicle radio to this
-                    // hidden station the instant it shows its menu (state 44, per decompiled carmod_shop.c line
-                    // 7209). Catching it = take over the EXACT frame the menu appears (minimal flash) and NEVER
-                    // before the drive-in (the menu only opens AFTER the animation finishes).
-                    bool vanillaMenuOpen = false;
-                    try { vanillaMenuOpen = Function.Call<string>(Hash.GET_PLAYER_RADIO_STATION_NAME) == "HIDDEN_RADIO_09_HIPHOP_OLD"; } catch { }
-
-                    // Cinematic park -> act immediately. Otherwise wait ~800ms of CONTINUOUS stop so a cinematic
-                    // (some shops grab a STOPPED car a beat after you park) gets its chance before we conclude
-                    // "no animation" — UNLESS the vanilla menu actually opens first, in which case take over then.
-                    long needed = cinematic ? 0 : 800;
-                    if (lscSettleSince != 0 && ((Game.GameTime - lscSettleSince) >= needed || vanillaMenuOpen))
-                    {
-                        // Remove the bay mechanic NOW so carmod_shop never gets to show its menu (no-op at shops
-                        // without one); open regardless so non-animated shops still auto-open.
-                        DeleteAndRespawnMechanic(vehicle.Position);
-                        lscSwapped = true;
-                        lscWentFar = false;   // start fresh; only a real far-trip re-arms next time
-                        // carmod_shop reacts to the missing mechanic over a few frames, and at a no-animation shop
-                        // its menu (state 44) can pop the instant the car stops. Keep deleting the mechanic every
-                        // frame for ~0.7s so the vanilla menu can't establish/linger while ELSC's menu covers it.
-                        lscSuppressUntil = Game.GameTime + 700;
-                        Log($"LSC parked ({(cinematic ? "animated" : "no-anim")}) -> instant takeover");
-                        waitingForVehicleStop = false;
-                        lscSettleSince = 0;
-                        customizeSpot = vehicle.Position;
-                        TryOpenMenu();
-                        Function.Call(Hash.SET_MAX_WANTED_LEVEL, 0);
-                        Function.Call(Hash.CLEAR_PLAYER_WANTED_LEVEL, Game.Player);
-                    }
-                }
-            }
-
-            // Suppression window: for a short time after takeover, keep deleting any bay mechanic carmod_shop
-            // (re)spawns each frame, so its menu can't establish or linger underneath ELSC's. DeleteAndRespawn is
-            // a no-op once the native mechanic is already gone, so this is cheap and flicker-free.
-            if (isInLSC && Game.GameTime < lscSuppressUntil)
-            {
-                try { DeleteAndRespawnMechanic(Game.Player.Character.Position); } catch { }
-            }
-
-            // We own the shop's help slot in and AROUND the LSC. With carmod_shop's mechanic gone it sits in a
-            // "shop closed" state and spams "Los Santos Customs is closed..." help — which it shows in its trigger
-            // zone, slightly outside the interior too. Remember the LSC world position while inside, and suppress
-            // the message anywhere near it. When parked inside, overwrite the slot with OUR re-open prompt.
+            // Remember the LSC world position while inside (used by leave-cleanup / nearby checks).
             if (isInLSC) lscWorldPos = Game.Player.Character.Position;
-            bool nearLsc = isInLSC || (lscWorldPos != Vector3.Zero && Game.Player.Character.Position.DistanceTo(lscWorldPos) < 60f);
-
-            if (nearLsc && !isMenuActive)
-            {
-                // Show a small marker at the customize spot the whole time we're in the bay, so the player knows
-                // where to drive to. Activation is manual: within 5m of it, press the button to open the menu.
-                bool atSpot = false;
-                if (isInLSC && customizeSpot != Vector3.Zero)
-                {
-                    Function.Call(Hash.DRAW_MARKER, 1,
-                        customizeSpot.X, customizeSpot.Y, customizeSpot.Z - 1.0f,
-                        0f, 0f, 0f, 0f, 0f, 0f, 1.6f, 1.6f, 0.6f,
-                        80, 160, 255, 110, false, false, 2, false, 0, 0, false);
-                    atSpot = Game.Player.Character.Position.DistanceTo(customizeSpot) < 5f;
-                }
-
-                if (atSpot)
-                {
-                    // Native help bubble renders the correct glyph per input device (E on KB, DPad on controller).
-                    Function.Call(Hash.BEGIN_TEXT_COMMAND_DISPLAY_HELP, "STRING");
-                    Function.Call(Hash.ADD_TEXT_COMPONENT_SUBSTRING_PLAYER_NAME, "Press ~INPUT_CONTEXT~ to customize your vehicle.");
-                    Function.Call(Hash.END_TEXT_COMMAND_DISPLAY_HELP, 0, false, false, -1);
-                    if (Game.IsControlJustPressed(GTA.Control.Context))
-                        TryOpenMenu();   // vanilla menu already halted; just reshow ours
-                }
-                else
-                {
-                    Function.Call(Hash.CLEAR_HELP, true);   // suppress carmod_shop's "shop closed" help (inside or nearby)
-                }
-            }
 
             if (isInLSC && isMenuActive)
             {
@@ -9785,124 +11366,26 @@ namespace ExtendedLSC
 
         #region Mechanic Management
 
-        /// <summary>Swap out carmod_shop's mechanic (the nearest bay ped, its Local_757.f_12). Removing the
-        /// script's expected ped cleanly halts its menu flow WITHOUT terminating the script — so control, camera,
-        /// the moddable state and re-entry all stay intact. We delete + recreate an identical clone in the SAME
-        /// tick (no visible gap, no model-load hitch since the model is already resident), then plant the clone so
-        /// it stands as scenery and never wanders.</summary>
-        /// <summary>Returns true if it actually swapped a native mechanic (so callers can stop retrying).</summary>
-        /// <summary>True if carmod_shop's NATIVE bay mechanic is present (a nearby ped that isn't us or our
-        /// clone). Non-destructive — used to detect a fresh shop setup so we know to (re)arm the auto-open. After
-        /// we take over we delete that mechanic, so this reads false until carmod_shop respawns one on a real
-        /// reset (first entry / far-return).</summary>
-        private bool IsNativeMechanicPresent(Vector3 position)
-        {
-            if (!ENABLE_MECHANIC_REPLACEMENT) return false;
-            foreach (var ped in World.GetNearbyPeds(position, 25f))
-            {
-                if (ped == null || !ped.Exists() || ped == Game.Player.Character) continue;
-                if (customMechanic != null && customMechanic.Exists() && ped == customMechanic) continue;
-                return true;
-            }
-            return false;
-        }
-
-        private bool DeleteAndRespawnMechanic(Vector3 position)
-        {
-            if (!ENABLE_MECHANIC_REPLACEMENT) return false;
-
-            // Find the nearest NATIVE mechanic to suppress (a bay ped that isn't already our clone). If there's
-            // none (we already swapped this session and carmod_shop hasn't respawned one), do NOTHING — its menu
-            // is already halted and deleting our clone would leave the bay empty.
-            Ped target = null;
-            foreach (var ped in World.GetNearbyPeds(position, 25f))
-            {
-                if (ped == null || !ped.Exists() || ped == Game.Player.Character) continue;
-                if (customMechanic != null && customMechanic.Exists() && ped == customMechanic) continue;
-                target = ped; break;
-            }
-            if (target == null) return false;
-
-            Model model = target.Model;
-            Vector3 pos = target.Position;
-            float heading = target.Heading;
-            int[] drawables = new int[12];
-            int[] textures = new int[12];
-            for (int i = 0; i < 12; i++)
-            {
-                drawables[i] = Function.Call<int>(Hash.GET_PED_DRAWABLE_VARIATION, target, i);
-                textures[i] = Function.Call<int>(Hash.GET_PED_TEXTURE_VARIATION, target, i);
-            }
-
-            DeleteCustomMechanic();        // remove the previous clone; we're about to make a fresh one
-            target.Delete();               // same-tick swap: gone + recreated before this frame renders
-            model.Request(500);
-            if (model.IsLoaded)
-            {
-                Ped clone = World.CreatePed(model, pos, heading);
-                if (clone != null)
-                {
-                    for (int i = 0; i < 12; i++)
-                        Function.Call(Hash.SET_PED_COMPONENT_VARIATION, clone, i, drawables[i], textures[i], 0);
-                    clone.BlockPermanentEvents = true;
-                    Function.Call(Hash.SET_BLOCKING_OF_NON_TEMPORARY_EVENTS, clone, true);
-                    Function.Call(Hash.TASK_STAND_STILL, clone, -1);   // plant as scenery, never wanders
-                    customMechanic = clone;
-                    customMechanicPos = pos;
-                }
-                model.MarkAsNoLongerNeeded();
-            }
-            return true;
-        }
-
-        private void DeleteCustomMechanic()
-        {
-            if (customMechanic != null && customMechanic.Exists())
-            {
-                Log("Deleting custom mechanic");
-                customMechanic.Delete();
-            }
-            customMechanic = null;
-            customMechanicPos = Vector3.Zero;
-        }
-
-        private void CheckMechanicCleanup()
-        {
-            if (customMechanic == null || !customMechanic.Exists()) return;
-            if (isInLSC) return;
-
-            Ped[] nearbyPeds = World.GetNearbyPeds(customMechanicPos, 3f);
-            foreach (var ped in nearbyPeds)
-            {
-                if (ped == Game.Player.Character) continue;
-                if (ped == customMechanic) continue;
-
-                float playerDistance = Game.Player.Character.Position.DistanceTo(customMechanicPos);
-                Log($"New mechanic spawned at distance {playerDistance:F1}m - deleting custom mechanic");
-                DeleteCustomMechanic();
-                return;
-            }
-        }
-
-        private void UpdateMechanicBehavior()
-        {
-            if (customMechanic == null || !customMechanic.Exists()) return;
-
-            Vector3 playerPos = Game.Player.Character.Position;
-            Vector3 mechPos = customMechanic.Position;
-            Vector3 direction = playerPos - mechPos;
-            float heading = (float)(Math.Atan2(direction.Y, direction.X) * (180.0 / Math.PI)) - 90f;
-            customMechanic.Heading = heading;
-        }
-
+        /// <summary>Play a short mechanic voice line on a mod purchase. With the mechanic-swap removed, the real
+        /// carmod_shop bay mechanic is still present — find the nearest ped to the vehicle and speak from it.</summary>
         private void MechanicSpeak()
         {
-            if (customMechanic == null || !customMechanic.Exists()) return;
-
-            string[] speeches = { "GENERIC_THANKS", "GENERIC_BYE", "CHAT_STATE", "CHAT_RESP" };
-            string speech = speeches[new Random().Next(speeches.Length)];
-
-            Function.Call(Hash.PLAY_PED_AMBIENT_SPEECH_NATIVE, customMechanic, speech, "SPEECH_PARAMS_FORCE_NORMAL");
+            try
+            {
+                Vector3 pos = (currentVehicle != null && currentVehicle.Exists()) ? currentVehicle.Position : Game.Player.Character.Position;
+                Ped mech = null; float best = 15f;
+                foreach (var ped in World.GetNearbyPeds(pos, 15f))
+                {
+                    if (ped == null || !ped.Exists() || ped == Game.Player.Character) continue;
+                    float d = ped.Position.DistanceTo(pos);
+                    if (d < best) { best = d; mech = ped; }
+                }
+                if (mech == null) return;
+                string[] speeches = { "GENERIC_THANKS", "GENERIC_BYE", "CHAT_STATE", "CHAT_RESP" };
+                string speech = speeches[new Random().Next(speeches.Length)];
+                Function.Call(Hash.PLAY_PED_AMBIENT_SPEECH_NATIVE, mech, speech, "SPEECH_PARAMS_FORCE_NORMAL");
+            }
+            catch { }
         }
 
         #endregion
@@ -10004,11 +11487,153 @@ namespace ExtendedLSC
             }
         }
 
+        /// <summary>Y cycles the camera: Basic (gameplay/menu cam) -> Walk-Around (orbit) -> First-Person -> Basic.</summary>
+        private void CycleCamera()
+        {
+            if (isWalkAroundActive) { ExitWalkAround(); EnterFirstPerson(); }
+            else if (isFirstPersonActive) { ExitFirstPerson(); }   // -> back to Basic
+            else { EnterWalkAround(); }
+            cameraModeCooldown = 12;   // short debounce so the next Y press isn't eaten
+        }
+
+        /// <summary>Driver eye position for the first-person cam (driver-seat bone + eye height, slightly forward).</summary>
+        private Vector3 FirstPersonEyePos()
+        {
+            var veh = currentVehicle;
+            int bone = Function.Call<int>(Hash.GET_ENTITY_BONE_INDEX_BY_NAME, veh, "seat_dside_f");
+            Vector3 seat = bone != -1
+                ? Function.Call<Vector3>(Hash.GET_WORLD_POSITION_OF_ENTITY_BONE, veh, bone)
+                : veh.Position;
+            return seat + veh.UpVector * 0.62f + veh.ForwardVector * 0.08f;
+        }
+
+        private void EnterFirstPerson()
+        {
+            try
+            {
+                if (currentVehicle == null || !currentVehicle.Exists()) return;
+                isFirstPersonActive = true;
+                _fpYaw = 0f; _fpPitch = 0f;
+                Vector3 eye = FirstPersonEyePos();
+                firstPersonCam = World.CreateCamera(eye, new Vector3(0f, 0f, currentVehicle.Heading), 60f);
+                firstPersonCam.IsActive = true;
+                World.RenderingCamera = firstPersonCam;
+                ShowNotification("~b~First-Person~w~\nLook around | Y - Next camera");
+                Log("Entered first-person camera mode");
+            }
+            catch (Exception ex) { Log($"ERROR EnterFirstPerson: {ex.Message}"); ExitFirstPerson(); }
+        }
+
+        private void ExitFirstPerson()
+        {
+            try
+            {
+                World.RenderingCamera = null;
+                if (firstPersonCam != null && firstPersonCam.Exists()) firstPersonCam.Delete();
+            }
+            catch { }
+            firstPersonCam = null;
+            isFirstPersonActive = false;
+            cameraModeCooldown = 12;
+        }
+
+        /// <summary>First-person look: right stick / mouse aims; the eye stays at the driver seat.</summary>
+        private void UpdateFirstPerson()
+        {
+            if (currentVehicle == null || !currentVehicle.Exists() || firstPersonCam == null || !firstPersonCam.Exists())
+            {
+                ExitFirstPerson();
+                return;
+            }
+
+            float lookH = Function.Call<float>(Hash.GET_DISABLED_CONTROL_NORMAL, 0, (int)GTA.Control.LookLeftRight);
+            float lookV = Function.Call<float>(Hash.GET_DISABLED_CONTROL_NORMAL, 0, (int)GTA.Control.LookUpDown);
+            _fpYaw -= lookH * FP_LOOK_SENS;
+            _fpPitch -= lookV * FP_LOOK_SENS;
+            _fpPitch = Math.Max(-80f, Math.Min(80f, _fpPitch));
+            if (_fpYaw > 180f) _fpYaw -= 360f; else if (_fpYaw < -180f) _fpYaw += 360f;
+
+            firstPersonCam.Position = FirstPersonEyePos();
+            firstPersonCam.Rotation = new Vector3(_fpPitch, 0f, currentVehicle.Heading + _fpYaw);
+        }
+
+        /// <summary>
+        /// Re-asserts the held steering angle on the inspected car every frame so its wheels don't snap back to
+        /// center (the game zeroes a parked/driverless car's steering each frame). Runs in AND out of the menu so the
+        /// angle survives the player leaving the car parked in free roam. Releases the hold once the car is actually
+        /// driven (speed up, or the player steers while seated) so normal steering resumes.
+        /// </summary>
+        private void UpdateSteeringHold()
+        {
+            if (_steerHoldHandle == 0) return;
+            try
+            {
+                var v = (Vehicle)Entity.FromHandle(_steerHoldHandle);
+                if (v == null || !v.Exists())
+                {
+                    _steerHoldHandle = 0; _heldSteerDeg = 0f; return;
+                }
+
+                // Driven away → let go (the global SteeringFix patch then preserves the natural angle).
+                if (v.Speed > 1.2f) { _steerHoldHandle = 0; _heldSteerDeg = 0f; return; }
+
+                // Player seated and actively steering OUTSIDE the menu → hand control back.
+                if (!isMenuActive)
+                {
+                    var drv = v.Driver;
+                    if (drv != null && drv.Exists() && drv == Game.Player.Character)
+                    {
+                        float steerIn = Function.Call<float>(Hash.GET_CONTROL_NORMAL, 0, (int)GTA.Control.VehicleMoveLeftRight);
+                        if (Math.Abs(steerIn) > 0.1f) { _steerHoldHandle = 0; _heldSteerDeg = 0f; return; }
+                    }
+                }
+
+                v.SteeringAngle = _heldSteerDeg;
+            }
+            catch { _steerHoldHandle = 0; }
+        }
+
+        /// <summary>
+        /// D-pad / arrow Left+Right turns the given vehicle's front wheels for inspection (held by UpdateSteeringHold
+        /// + the global SteeringFix patch so they don't snap back). Reads the controls as DISABLED so it works whether
+        /// they're disabled-for-the-menu (walk-around) or live (normal menu). Shared by walk-around and the menu.
+        /// </summary>
+        private void HandleInspectSteering(Vehicle veh)
+        {
+            if (!ModSettings.KeepSteeringAngle || veh == null || !veh.Exists()) return;
+
+            bool sLeft  = Function.Call<bool>(Hash.IS_DISABLED_CONTROL_PRESSED, 0, (int)GTA.Control.FrontendLeft);
+            bool sRight = Function.Call<bool>(Hash.IS_DISABLED_CONTROL_PRESSED, 0, (int)GTA.Control.FrontendRight);
+            if (sLeft == sRight) return;   // none, or both — do nothing
+
+            // Seed from the wheels' real angle the first time we grab THIS car, so there's no jump.
+            if (_steerHoldHandle != veh.Handle)
+            {
+                float cur = 0f;
+                try { cur = veh.SteeringAngle; } catch { }
+                _heldSteerDeg = Math.Max(-STEER_HOLD_MAX_DEG, Math.Min(STEER_HOLD_MAX_DEG, cur));
+            }
+            // Right turns the wheels right, Left turns them left (GTA's SteeringAngle is +left/-right, so negate).
+            _heldSteerDeg += (sRight ? -1f : 1f) * 1.6f;   // ~1.6 deg/frame
+            _heldSteerDeg = Math.Max(-STEER_HOLD_MAX_DEG, Math.Min(STEER_HOLD_MAX_DEG, _heldSteerDeg));
+            _steerHoldHandle = veh.Handle;
+            try { veh.SteeringAngle = _heldSteerDeg; } catch { }   // immediate visual feedback
+        }
+
+        /// <summary>
+        /// True if the menu item already uses Left/Right (list / slider). On those, Left/Right adjusts the item, so
+        /// the inspect-steering control stands down to avoid fighting it.
+        /// </summary>
+        private static bool ItemUsesLeftRight(LemonUI.Menus.NativeItem item)
+        {
+            if (item == null) return false;
+            string n = item.GetType().Name;
+            return n.IndexOf("List", StringComparison.OrdinalIgnoreCase) >= 0
+                || n.IndexOf("Slider", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
         private void UpdateWalkAround()
         {
-            // Context hint bar for the walk-around camera (cycle view / move / look / door / exit).
-            DrawHintBar(null, true);
-
             if (walkAroundVehicle == null || !walkAroundVehicle.Exists())
             {
                 ExitWalkAround();
@@ -10020,6 +11645,11 @@ namespace ExtendedLSC
                 ExitWalkAround();
                 return;
             }
+
+            // Walk-around button-hint bar (Cycle View / Move / Look / Open Door / Exit) drawn on OUR OWN
+            // instanced instructional-buttons scaleform at GFX order 7 — see DrawWalkAroundHints().
+            // Hidden while the idle cinematic fades (its scaleform would draw over the fake-fade overlay).
+            if (_idlePhase == 0) DrawWalkAroundHints();
 
             // DISABLE vehicle controls (but NOT accelerate - allow revving)
             Game.DisableControlThisFrame(GTA.Control.VehicleExit);
@@ -10033,15 +11663,17 @@ namespace ExtendedLSC
             Game.DisableControlThisFrame(GTA.Control.VehicleLookBehind);
             Game.DisableControlThisFrame(GTA.Control.FrontendX);   // reserved for open/close door (below)
 
-            // Walk-around exit button (default Y) — read disabled control
-            bool yPressed = Function.Call<bool>(Hash.IS_DISABLED_CONTROL_JUST_PRESSED, 0, ModSettings.WalkAroundButton);
+            // Rev conflict fix: on keyboard W is BOTH our forward key AND VehicleAccelerate (rev). Suppress the rev
+            // while W moves, and put keyboard revving on its own key (R) by forcing the throttle. Keys.W/R only ever
+            // register on keyboard, so the controller's RT (= VehicleAccelerate) keeps revving normally.
+            bool kbRev = Game.IsKeyPressed(Keys.R);
+            if (Game.IsKeyPressed(Keys.W) && !kbRev)
+                Game.DisableControlThisFrame(GTA.Control.VehicleAccelerate);
+            if (kbRev)
+                Function.Call(Hash.SET_CONTROL_VALUE_NEXT_FRAME, 0, (int)GTA.Control.VehicleAccelerate, 1.0f);
 
-            if (yPressed)
-            {
-                Log("Y pressed - exiting camera mode");
-                ExitWalkAround();
-                return;
-            }
+            // NOTE: the Y button (cycle camera) is handled centrally in OnTick (CycleCamera) for all modes; from
+            // walk-around it advances to first-person. Don't read it here too or it would double-fire.
 
             // Walk around - movement relative to camera-to-car direction
             float moveSpeed = 0.04f; // Walking pace speed
@@ -10099,15 +11731,27 @@ namespace ExtendedLSC
                 else ShowNotification("~w~No openable doors here.");
             }
 
-            // Left stick input (read disabled VEHICLE controls) - MOVEMENT
+            // D-pad Left/Right turns the front wheels so you can inspect them. The angle is held by UpdateSteeringHold
+            // (and the global SteeringFix patch) so it doesn't snap back when you leave the car. Controls are disabled
+            // for the menu this frame (see OnTick) so they don't double-change a highlighted list item.
+            HandleInspectSteering(walkAroundVehicle);
+
+            // MOVEMENT — left stick (controller) OR WASD (keyboard). Read additively + clamp so either works.
             float inputForward = -Function.Call<float>(Hash.GET_DISABLED_CONTROL_NORMAL, 0, (int)GTA.Control.VehicleMoveUpDown);
             float inputRight = Function.Call<float>(Hash.GET_DISABLED_CONTROL_NORMAL, 0, (int)GTA.Control.VehicleMoveLeftRight);
+            if (Game.IsKeyPressed(Keys.W)) inputForward += 1f;
+            if (Game.IsKeyPressed(Keys.S)) inputForward -= 1f;
+            if (Game.IsKeyPressed(Keys.D)) inputRight += 1f;
+            if (Game.IsKeyPressed(Keys.A)) inputRight -= 1f;
+            inputForward = Math.Max(-1f, Math.Min(1f, inputForward));
+            inputRight = Math.Max(-1f, Math.Min(1f, inputRight));
 
-            // Right stick input
+            // LOOK — right stick (controller) or mouse movement (keyboard). In walk-around there's no active cursor,
+            // so the game maps the mouse straight to LookLeftRight/UpDown = free-look. No click needed.
             float lookInputH = Function.Call<float>(Hash.GET_DISABLED_CONTROL_NORMAL, 0, (int)GTA.Control.LookLeftRight);
             float lookInputV = Function.Call<float>(Hash.GET_DISABLED_CONTROL_NORMAL, 0, (int)GTA.Control.LookUpDown);
 
-            // If any stick is moved, exit preset mode and return to free roam
+            // If any stick / mouse input moved, exit preset mode and return to free roam
             bool stickMoved = Math.Abs(inputForward) > 0.2f || Math.Abs(inputRight) > 0.2f ||
                               Math.Abs(lookInputH) > 0.2f || Math.Abs(lookInputV) > 0.2f;
 
@@ -10205,24 +11849,16 @@ namespace ExtendedLSC
             walkAroundCam.Position = smoothCamPos;
             walkAroundCam.PointAt(smoothLookAt);
 
-            // Show help text based on mode
-            if (isInPresetMode && currentPresetIndex >= 0 && currentPresetIndex < availablePresets.Count)
+            // Button helpers. The bottom hint bar (drawn above, with glyphs) is the primary helper in BOTH cases.
+            // OUTSIDE an LSC there's no carmod_shop, so we can also show the native help bubble (mode + preset name)
+            // for the original look. INSIDE an LSC that bubble would beep (carmod_shop owns the slot) and our drawn
+            // text would overlap the menu — so we skip the top helper there and rely on the bottom hint bar.
+            bool preset = isInPresetMode && currentPresetIndex >= 0 && currentPresetIndex < availablePresets.Count;
+            if (!isInLSC && ModSettings.ShowHints)
             {
-                string presetName = availablePresets[currentPresetIndex].Name;
-                int presetNum = currentPresetIndex + 1;
-                int totalPresets = availablePresets.Count;
-                GTA.UI.Screen.ShowHelpTextThisFrame($"~b~{presetName}~w~ ({presetNum}/{totalPresets})\nLB/RB - Cycle | Stick - Free Roam");
-            }
-            else
-            {
-                GTA.UI.Screen.ShowHelpTextThisFrame($"~w~Free Roam~w~\nLB/RB - Part Views ({availablePresets.Count}) | X - Doors | Y - Exit");
-            }
-
-            // Display RPM when revving
-            float rpm = walkAroundVehicle.CurrentRPM;
-            if (rpm > 0.3f)
-            {
-                GTA.UI.Screen.ShowSubtitle($"RPM: {rpm:F2}", 1);
+                ShowSilentHelp(preset
+                    ? $"~b~{availablePresets[currentPresetIndex].Name}~w~ ({currentPresetIndex + 1}/{availablePresets.Count})\nLB/RB - Cycle | Stick - Free Roam"
+                    : $"~w~Free Roam~w~\nLB/RB - Part Views ({availablePresets.Count}) | X - Doors | Y - Exit");
             }
 
         }
@@ -10337,17 +11973,227 @@ namespace ExtendedLSC
                     if (door.IsOpen)
                     {
                         Function.Call(Hash.SET_VEHICLE_DOOR_SHUT, walkAroundVehicle, doorIndex, false);
-                        ShowNotification($"~w~Closed {doorName}");
+                        if (ModSettings.ShowHints) ShowNotification($"~w~Closed {doorName}");
                     }
                     else
                     {
                         Function.Call(Hash.SET_VEHICLE_DOOR_OPEN, walkAroundVehicle, doorIndex, false, false);
-                        ShowNotification($"~w~Opened {doorName}");
+                        if (ModSettings.ShowHints) ShowNotification($"~w~Opened {doorName}");
                     }
                 }
             }
             catch { }
         }
+
+        #region Idle showcase cinematic (attract mode)
+
+        /// <summary>Run the idle cinematic state machine each tick while the menu is up. Triggers after ~10s of no
+        /// input; fades to black, hides the HUD/menu, slowly orbits the car, fading on each side switch. Any input
+        /// snaps the camera back and unhides everything. Safe: it can never leave the screen black or the cam stuck.</summary>
+        private void UpdateIdleCinematic()
+        {
+            bool eligible = ModSettings.CustomCamera && ModSettings.IdleCinematic
+                && (isMenuActive || isWalkAroundActive) && _lscEjectPhase == 0   // also runs in walk-around mode
+                && currentVehicle != null && currentVehicle.Exists() && !IsTypingText;
+
+            if (!eligible)
+            {
+                if (_idlePhase != 0) StopIdleCinematic(true);
+                _lastInteractionTime = Game.GameTime;
+                return;
+            }
+
+            // Any menu/camera input wakes it: reset the idle timer and (if a cinematic is running) snap back.
+            if (IsMenuIdleInput())
+            {
+                _lastInteractionTime = Game.GameTime;
+                if (_idlePhase != 0) StopIdleCinematic(true);
+                return;
+            }
+
+            int now = Game.GameTime;
+            try
+            {
+                switch (_idlePhase)
+                {
+                    case 0:  // idle — wait for the trigger
+                        if (now - _lastInteractionTime > IDLE_DELAY_MS) BeginIdleCinematic();
+                        break;
+
+                    case 1:  // fading the menu to black before the first shot
+                        if (_idleScreenBlack)
+                        {
+                            SetupIdleShot(true);              // create + cut to the orbit cam while black
+                            StartIdleFade(0f, 900f);          // fade the overlay back out
+                            _idlePhase = 2; _idleSideStart = now;
+                        }
+                        break;
+
+                    case 2:  // playing — slow orbit; switch sides after the per-side time
+                        UpdateIdleShot();
+                        if (now - _idleSideStart > IDLE_PER_SIDE_MS)
+                        {
+                            StartIdleFade(255f, 450f);        // fade overlay to black for the switch
+                            _idlePhase = 3;
+                        }
+                        break;
+
+                    case 3:  // fading out before a switch — KEEP MOVING, then jump to a new side once fully black
+                        UpdateIdleShot();
+                        if (_idleScreenBlack)
+                        {
+                            SetupIdleShot(false);
+                            StartIdleFade(0f, 700f);
+                            _idlePhase = 2; _idleSideStart = now;
+                        }
+                        break;
+                }
+            }
+            catch (Exception ex) { Log($"[Idle] {ex.Message}"); StopIdleCinematic(true); }
+        }
+
+        private void BeginIdleCinematic()
+        {
+            _idlePrevRenderingCam = World.RenderingCamera;   // remember what to return to (null = gameplay)
+            StartIdleFade(255f, 500f);                       // fade the (fake) overlay to black to enter
+            _idlePhase = 1;
+        }
+
+        /// <summary>Aim the fake-fade overlay at a target opacity (0 clear / 255 black) over the given duration.</summary>
+        private void StartIdleFade(float target, float durationMs)
+        {
+            _idleFadeTarget = Math.Max(0f, Math.Min(255f, target));
+            _idleFadeRate = durationMs > 1f ? 255f / durationMs : 255f;
+        }
+
+        /// <summary>Advance the overlay alpha toward its target (time-based). Runs every frame, independent of the
+        /// cinematic state, so the overlay still finishes fading out after the cinematic stops.</summary>
+        private void UpdateIdleFade()
+        {
+            if (_idleFadeAlpha == _idleFadeTarget) return;
+            float step = _idleFadeRate * (Game.LastFrameTime * 1000f);
+            if (_idleFadeAlpha < _idleFadeTarget) _idleFadeAlpha = Math.Min(_idleFadeTarget, _idleFadeAlpha + step);
+            else _idleFadeAlpha = Math.Max(_idleFadeTarget, _idleFadeAlpha - step);
+        }
+
+        /// <summary>Draw the fake-fade black box. Oversized + centered so it fully covers ANY aspect ratio (incl.
+        /// ultrawide / triple-monitor) — the excess is clipped. Drawn last in OnTick so it sits on top of the menu.</summary>
+        private void DrawIdleFadeOverlay()
+        {
+            if (_idleFadeAlpha <= 0.5f) return;
+            int a = (int)Math.Max(0f, Math.Min(255f, _idleFadeAlpha));
+            Function.Call(Hash.DRAW_RECT, 0.5f, 0.5f, 1.5f, 1.5f, 0, 0, 0, a, 0);
+        }
+
+        /// <summary>Position the orbit camera for a side (created while the screen is black so the cut isn't seen).</summary>
+        private void SetupIdleShot(bool firstShot)
+        {
+            ComputeCarFraming();
+            if (firstShot) _idleSideBaseDeg = _idleRng.Next(0, 360);
+            else
+            {
+                float delta = 70f + _idleRng.Next(0, 220);            // jump to a clearly different side (wider spread)
+                if (_idleRng.Next(2) == 0) delta = -delta;
+                _idleSideBaseDeg = (((_idleSideBaseDeg + delta) % 360f) + 360f) % 360f;
+            }
+
+            // Pick a fresh shot STYLE each side so it mixes high/low/close/wide instead of repeating a few views.
+            float r() => (float)_idleRng.NextDouble();
+            switch (_idleRng.Next(0, 6))
+            {
+                case 0:  _idleShotHeight = 0.20f + r() * 0.30f;          _idleShotDistF = 0.95f + r() * 0.20f; _idleShotFov = 52f; break;  // low hero (looks up)
+                case 1:  _idleShotHeight = 0.45f + r() * 0.35f;          _idleShotDistF = 1.25f + r() * 0.30f; _idleShotFov = 55f; break;  // low + wide
+                case 2:  _idleShotHeight = cameraHeight * 0.9f;          _idleShotDistF = 1.05f + r() * 0.25f; _idleShotFov = 45f; break;  // eye-level
+                case 3:  _idleShotHeight = cameraHeight * 1.5f + 0.5f;   _idleShotDistF = 1.10f + r() * 0.30f; _idleShotFov = 42f; break;  // slightly high
+                case 4:  _idleShotHeight = cameraHeight * 2.4f + 1.0f;   _idleShotDistF = 1.00f + r() * 0.30f; _idleShotFov = 40f; break;  // high overhead (looks down)
+                default: _idleShotHeight = cameraHeight * 1.2f;          _idleShotDistF = 1.55f + r() * 0.45f; _idleShotFov = 36f; break;  // pulled back, tele
+            }
+            _idleSlideSign = _idleRng.Next(2) == 0 ? 1 : -1;            // drift left or right this side
+
+            Vector3 pos = IdleCamPos(_idleSideBaseDeg);
+            if (_idleCam == null || !_idleCam.Exists())
+            {
+                _idleCam = World.CreateCamera(pos, Vector3.Zero, _idleShotFov);
+                _idleCam.IsActive = true;
+                Function.Call(Hash.RENDER_SCRIPT_CAMS, true, false, 0, true, false, 0);   // cut to the script cam
+            }
+            else { _idleCam.Position = pos; try { _idleCam.FieldOfView = _idleShotFov; } catch { } }
+            _idleCam.PointAt(_idleCenter);
+        }
+
+        private void UpdateIdleShot()
+        {
+            if (_idleCam == null || !_idleCam.Exists()) { StopIdleCinematic(true); return; }
+            // NOT capped at 1 — the slide keeps going through the fade-out so the camera never freezes; the actual
+            // jump to a new side happens only while the screen is fully black.
+            float t = (Game.GameTime - _idleSideStart) / (float)IDLE_PER_SIDE_MS;
+            _idleCam.Position = IdleCamPos(_idleSideBaseDeg + t * IDLE_SLIDE_DEG * _idleSlideSign);
+            _idleCam.PointAt(_idleCenter);
+        }
+
+        /// <summary>End the cinematic: restore the prior camera (cut), delete the orbit cam, fade back in if the
+        /// screen is black, and unhide everything next frame. Used on input AND when no longer eligible.</summary>
+        private void StopIdleCinematic(bool fadeInIfBlack)
+        {
+            try
+            {
+                if (_idlePrevRenderingCam != null && _idlePrevRenderingCam.Exists())
+                    World.RenderingCamera = _idlePrevRenderingCam;
+                else
+                    Function.Call(Hash.RENDER_SCRIPT_CAMS, false, false, 0, true, false, 0);   // back to gameplay cam
+            }
+            catch { }
+            try { if (_idleCam != null && _idleCam.Exists()) _idleCam.Delete(); } catch { }
+            _idleCam = null;
+            _idlePrevRenderingCam = null;
+            // Never leave the player on a black screen — fade the overlay out fast if it's up (snap clear otherwise).
+            if (fadeInIfBlack && _idleFadeAlpha > 0f) StartIdleFade(0f, 250f);
+            else { _idleFadeAlpha = 0f; _idleFadeTarget = 0f; }
+            _idlePhase = 0;
+            _lastInteractionTime = Game.GameTime;
+        }
+
+        private void ComputeCarFraming()
+        {
+            // Reuse the SAME per-vehicle extents as walk-around (vehicleHalfWidth/Length + cameraHeight) so the idle
+            // orbit sits right at the bounding box, not way out in a big circle.
+            CalculateVehicleCameraDistances(currentVehicle);
+            _idleCenter = currentVehicle.Position; _idleCenter.Z += 0.6f;   // look at the car centre (matches walk-around)
+        }
+
+        private Vector3 IdleCamPos(float deg)
+        {
+            // Orbit on the vehicle's bounding-box ellipse in its LOCAL frame (a touch outside), at the walk-around
+            // camera height — same framing the player gets when free-roaming the camera.
+            float rad = deg * (float)Math.PI / 180f;
+            Vector3 local = new Vector3((float)Math.Cos(rad) * vehicleHalfWidth * _idleShotDistF, (float)Math.Sin(rad) * vehicleHalfLength * _idleShotDistF, 0f);
+            Vector3 world = currentVehicle.GetOffsetPosition(local);
+            return new Vector3(world.X, world.Y, currentVehicle.Position.Z + _idleShotHeight);
+        }
+
+        /// <summary>Any menu navigation / button / stick movement this frame (read even while disabled). NOTE: no
+        /// mouse-cursor check — its reading fluctuates after DisableAllControls and was firing every frame, which
+        /// pinned the idle timer and stopped the cinematic re-triggering after the first run.</summary>
+        private bool IsMenuIdleInput()
+        {
+            var vm = GetVisibleMenu();
+            int sel = vm != null ? vm.SelectedIndex : -1;
+            bool selChanged = sel != _idlePrevSelIndex;
+            _idlePrevSelIndex = sel;
+            if (selChanged) return true;
+            foreach (var c in _idleInputCtrls)
+                if (Function.Call<bool>(Hash.IS_DISABLED_CONTROL_JUST_PRESSED, 0, (int)c)) return true;
+            // Left stick / d-pad (menu nav).
+            if (Math.Abs(Function.Call<float>(Hash.GET_DISABLED_CONTROL_NORMAL, 0, (int)GTA.Control.FrontendAxisX)) > 0.25f) return true;
+            if (Math.Abs(Function.Call<float>(Hash.GET_DISABLED_CONTROL_NORMAL, 0, (int)GTA.Control.FrontendAxisY)) > 0.25f) return true;
+            // Right stick / mouse (camera look) — swinging the camera must count as input too. These are momentary
+            // axis values (~0 at rest), so they don't fluctuate like the mouse-cursor position did.
+            if (Math.Abs(Function.Call<float>(Hash.GET_DISABLED_CONTROL_NORMAL, 0, (int)GTA.Control.LookLeftRight)) > 0.12f) return true;
+            if (Math.Abs(Function.Call<float>(Hash.GET_DISABLED_CONTROL_NORMAL, 0, (int)GTA.Control.LookUpDown)) > 0.12f) return true;
+            return false;
+        }
+
+        #endregion
 
         private Vector3 GetPresetCameraPosition(int presetIndex)
         {
@@ -10578,6 +12424,17 @@ namespace ExtendedLSC
         /// <summary>
         /// Draw debug text at a screen position (used for debug overlays that need to avoid subtitle conflicts)
         /// </summary>
+        /// <summary>Show the native help bubble WITHOUT a beep, via the raw natives (SHVDN's ShowHelpTextThisFrame
+        /// re-triggers the appear-sound every frame even with beep:false). Called per-frame, it persists and
+        /// overrides the game's own help bubble in the same slot — same look as before, no constant beep.</summary>
+        private void ShowSilentHelp(string text)
+        {
+            if (!ModSettings.ShowHints) return;   // INI: suppress ELSC's hint bubbles everywhere
+            Function.Call(Hash.BEGIN_TEXT_COMMAND_DISPLAY_HELP, "STRING");
+            Function.Call(Hash.ADD_TEXT_COMPONENT_SUBSTRING_PLAYER_NAME, text);
+            Function.Call(Hash.END_TEXT_COMMAND_DISPLAY_HELP, 0, false, false, -1);   // loop=false, BEEP=false, shape=none
+        }
+
         private void DrawDebugText(string text, float x, float y, int r = 255, int g = 255, int b = 255)
         {
             Function.Call(Hash.SET_TEXT_FONT, 0);
@@ -10832,6 +12689,7 @@ namespace ExtendedLSC
             // Backstop: every commit that flows through here is blocked while editing (paid OR free).
             if (EditBlockApply()) return false;
 
+            if (ModSettings.AllItemsFree) return true;   // INI: everything's free
             if (alreadyOwned || price <= 0) return true;
 
             if (!CanAfford(price))
@@ -11255,6 +13113,169 @@ namespace ExtendedLSC
             catch { return ""; }
         }
 
+        /// <summary>
+        /// Per-INSTANCE save key for a vehicle: "{DisplayName}|{PLATE}" (model + plate). This is what every
+        /// VehicleSaveData call keys off, so two cars of the same model with different plates keep SEPARATE
+        /// builds (a freshly-spawned stock car no longer inherits a modified car's saved build). Empty/missing
+        /// plate -> "NOPLATE". VehicleSaveData lowercases keys internally, so case here doesn't matter.
+        /// </summary>
+        private string VehicleKey(Vehicle v)
+        {
+            if (v == null || !v.Exists()) return "";
+            string plate;
+            try { plate = (Function.Call<string>(Hash.GET_VEHICLE_NUMBER_PLATE_TEXT, v) ?? "").Trim().ToUpperInvariant(); }
+            catch (Exception ex) { Log($"[VehicleKey] plate read failed: {ex.Message}"); plate = ""; }
+            if (string.IsNullOrEmpty(plate)) plate = "NOPLATE";
+            return v.DisplayName + "|" + plate;
+        }
+
+        /// <summary>An 8-char plate ("EL" + 6 random digits) not used by any spawned vehicle nor any active claim.</summary>
+        private string UniquePlate()
+        {
+            // Plates already in use by a live vehicle or claimed this session.
+            var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                foreach (var v in World.GetAllVehicles())
+                    if (v != null && v.Exists()) used.Add(GetPlateText(v).ToUpperInvariant());
+            }
+            catch (Exception ex) { Log($"[UniquePlate] enumerate failed: {ex.Message}"); }
+            foreach (var k in _plateClaims.Keys) used.Add(k);
+
+            for (int attempt = 0; attempt < 64; attempt++)
+            {
+                string p = "EL" + _plateRng.Next(0, 1000000).ToString("D6");   // 8 chars, valid plate text
+                if (!used.Contains(p)) return p;
+            }
+            // Extremely unlikely fallback (still 8 chars).
+            return "EL" + _plateRng.Next(0, 1000000).ToString("D6");
+        }
+
+        /// <summary>
+        /// Called once per newly-bound car (BEFORE ELSC reads/applies its saved build). If this car's plate is
+        /// empty, or collides with a DIFFERENT live vehicle that already claimed it this session, assign a fresh
+        /// unique plate so this instance gets its own per-instance key (and stays stock). Otherwise just record
+        /// the claim. The first-claimed (already-built) car keeps its plate + data; the duplicate is the one
+        /// re-plated. No data migration here — a fresh duplicate has no build to carry.
+        /// </summary>
+        private void EnsureUniquePlate(Vehicle v)
+        {
+            if (v == null || !v.Exists()) return;
+            try
+            {
+                string plate = GetPlateText(v).ToUpperInvariant();
+
+                bool collides = false;
+                if (string.IsNullOrEmpty(plate))
+                {
+                    collides = true;   // no plate at all -> give it a stable unique one
+                }
+                else if (_plateClaims.TryGetValue(plate, out int owner) && owner != v.Handle)
+                {
+                    // Another handle claimed this plate. Only a conflict if that car is still a live, different vehicle.
+                    bool ownerAlive = false;
+                    foreach (var other in World.GetAllVehicles())
+                        if (other != null && other.Exists() && other.Handle == owner) { ownerAlive = true; break; }
+                    if (ownerAlive)
+                        collides = true;
+                    else
+                        _plateClaims.Remove(plate);   // stale claim — free it
+                }
+
+                if (collides)
+                {
+                    string p = UniquePlate();
+                    Function.Call(Hash.SET_VEHICLE_NUMBER_PLATE_TEXT, v, p);
+                    // This is a fresh/duplicate instance — clear any window tint that bled over from the car it used
+                    // to share a plate with (the custom-glass manager applies saved colours by model+plate). A
+                    // genuinely fresh spawn has no tint; if the player wants one they set it via ELSC (saves anew).
+                    try { Function.Call(Hash.SET_VEHICLE_WINDOW_TINT, v, 0); } catch { }
+                    _plateClaims[p] = v.Handle;
+                    Log($"[Plate] Duplicate/empty plate on '{v.DisplayName}' -> assigned unique '{p}'");
+                }
+                else
+                {
+                    _plateClaims[plate] = v.Handle;
+                }
+            }
+            catch (Exception ex) { Log($"[Plate] EnsureUniquePlate failed: {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// Guard wrapper: detect a NEW car the player is driving and run EnsureUniquePlate exactly once per bind
+        /// (tracked by Handle), before any save-data read/apply this frame. Called from OnTick.
+        /// </summary>
+        private void BindPlateForCurrentVehicle()
+        {
+            try
+            {
+                var ped = Game.Player.Character;
+                if (ped == null || !ped.IsInVehicle()) { _lastPlateBoundHandle = 0; return; }
+                var v = ped.CurrentVehicle;
+                if (v == null || !v.Exists()) { _lastPlateBoundHandle = 0; return; }
+                if (v.Handle == _lastPlateBoundHandle) return;   // already handled this car
+                _lastPlateBoundHandle = v.Handle;
+                EnsureUniquePlate(v);
+            }
+            catch (Exception ex) { Log($"[Plate] BindPlateForCurrentVehicle failed: {ex.Message}"); }
+        }
+
+        private int _lastPlateSweep = 0;
+
+        /// <summary>Throttled world sweep: when two or more nearby cars share the SAME model AND plate (the classic
+        /// "all my Menyoo cars are plated MENYOO" case), give the extras a fresh unique plate so each owns its own
+        /// ELSC save instead of overwriting the first one's. Only same-model + same-(non-empty)-plate collisions are
+        /// touched, so ordinary traffic (unique plates) is never re-plated.</summary>
+        private void DedupeWorldPlates()
+        {
+            if (Game.GameTime - _lastPlateSweep < 1500) return;
+            _lastPlateSweep = Game.GameTime;
+            try
+            {
+                var ped = Game.Player.Character;
+                if (ped == null || !ped.Exists()) return;
+                int curHandle = (ped.IsInVehicle() && ped.CurrentVehicle != null && ped.CurrentVehicle.Exists())
+                    ? ped.CurrentVehicle.Handle : 0;
+
+                var seen = new HashSet<string>();
+                foreach (var v in World.GetNearbyVehicles(ped.Position, 120f))
+                {
+                    if (v == null || !v.Exists()) continue;
+                    string plate = GetPlateText(v).Trim().ToUpperInvariant();
+                    if (string.IsNullOrEmpty(plate)) continue;          // ignore blank-plate traffic
+                    string key = v.Model.Hash + "|" + plate;
+                    if (seen.Add(key)) continue;                        // first car with this model+plate -> keep it
+                    if (v.Handle == curHandle) continue;                // player's car is handled by BindPlate
+
+                    string p = UniquePlate();
+                    Function.Call(Hash.SET_VEHICLE_NUMBER_PLATE_TEXT, v, p);
+                    try { Function.Call(Hash.SET_VEHICLE_WINDOW_TINT, v, 0); } catch { }   // don't inherit shared-plate tint
+                    _plateClaims[p] = v.Handle;
+                    seen.Add(v.Model.Hash + "|" + p);
+                    Log($"[Plate] Dedupe duplicate '{plate}' on '{v.DisplayName}' -> '{p}'");
+                }
+            }
+            catch (Exception ex) { Log($"[Plate] DedupeWorldPlates error: {ex.Message}"); }
+        }
+
+        /// <summary>True if some OTHER live, spawned vehicle currently in the world already wears this plate text.</summary>
+        private bool PlateUsedBySpawnedVehicle(Vehicle self, string plateText)
+        {
+            string want = (plateText ?? "").Trim();
+            if (string.IsNullOrEmpty(want)) return false;
+            try
+            {
+                foreach (var v in World.GetAllVehicles())
+                {
+                    if (v == null || !v.Exists()) continue;
+                    if (self != null && v.Handle == self.Handle) continue;
+                    if (string.Equals(GetPlateText(v), want, StringComparison.OrdinalIgnoreCase)) return true;
+                }
+            }
+            catch (Exception ex) { Log($"[Plate] PlateUsedBySpawnedVehicle failed: {ex.Message}"); }
+            return false;
+        }
+
         /// <summary>Open the on-screen keyboard to type a custom plate (max 8 chars), prefilled with the current.</summary>
         private void StartEditPlate()
         {
@@ -11283,7 +13304,9 @@ namespace ExtendedLSC
                 // Same as current -> nothing to do.
                 if (string.Equals(text, plateBeforeEdit, StringComparison.OrdinalIgnoreCase)) return;
 
-                if (windowTint.PlateUsedBySavedVehicle(currentVehicle, text))
+                // Reject if the plate is already used by another SAVED vehicle (window-tint check) OR by another
+                // live SPAWNED vehicle currently in the world (so two cars can't share a plate -> identity collision).
+                if (windowTint.PlateUsedBySavedVehicle(currentVehicle, text) || PlateUsedBySpawnedVehicle(currentVehicle, text))
                 {
                     pendingPlateText = text;
                     ShowPlateConflict(text);
@@ -11300,12 +13323,36 @@ namespace ExtendedLSC
             }
         }
 
-        /// <summary>Set the plate text and migrate this car's saved window color so the tint follows the rename.</summary>
+        /// <summary>Set the plate text and migrate this car's ENTIRE saved build (and window color) so the whole
+        /// build follows the rename instead of being orphaned under the old plate key.</summary>
         private void ApplyCustomPlate(string text, string oldPlate)
         {
             if (currentVehicle == null || !currentVehicle.Exists()) return;
-            windowTint.MoveColorToPlate(currentVehicle.DisplayName, oldPlate, text);  // keep the tint on the renamed car
+
+            string model = currentVehicle.DisplayName;
+            // VehicleKey-style keys: empty plate -> "NOPLATE" so they line up with what VehicleKey() produces.
+            string oldUp = (oldPlate ?? "").Trim().ToUpperInvariant(); if (string.IsNullOrEmpty(oldUp)) oldUp = "NOPLATE";
+            string newUp = (text ?? "").Trim().ToUpperInvariant();     if (string.IsNullOrEmpty(newUp)) newUp = "NOPLATE";
+            string oldFullKey = model + "|" + oldUp;
+            string newFullKey = model + "|" + newUp;
+
+            windowTint.MoveColorToPlate(model, oldPlate, text);  // keep the tint on the renamed car
+            try { VehicleSaveData.MigrateVehicle(oldFullKey, newFullKey); }   // carry the WHOLE build to the new plate key
+            catch (Exception ex) { Log($"[Plate] MigrateVehicle failed: {ex.Message}"); }
+
             Function.Call(Hash.SET_VEHICLE_NUMBER_PLATE_TEXT, currentVehicle, text);
+
+            // Re-point the session plate-claim from the old plate to the new one so dedupe stays consistent.
+            try
+            {
+                if (!string.IsNullOrEmpty(oldUp) && _plateClaims.TryGetValue(oldUp, out int h) && h == currentVehicle.Handle)
+                    _plateClaims.Remove(oldUp);
+                _plateClaims[newUp] = currentVehicle.Handle;
+                _lastPlateBoundHandle = currentVehicle.Handle;   // we just set this car's plate — don't re-dedupe it
+            }
+            catch (Exception ex) { Log($"[Plate] claim re-point failed: {ex.Message}"); }
+
+            VehicleSaveData.Save();
             ShowNotification($"~g~Plate set to ~b~{text}");
             pendingPlateText = null;
             // Refresh the plate menu so the "Custom Plate Text" AltTitle shows the new value.
@@ -11352,6 +13399,8 @@ namespace ExtendedLSC
         /// </summary>
         private void CheckDescriptionEditInput()
         {
+            if (IsTypingText) return;   // never start an edit while the player is typing into another text box
+
             // X button = FrontendX or Duck (depends on context)
             bool xHeld = Function.Call<bool>(Hash.IS_DISABLED_CONTROL_PRESSED, 0, (int)GTA.Control.FrontendX) ||
                          Function.Call<bool>(Hash.IS_DISABLED_CONTROL_PRESSED, 0, (int)GTA.Control.Duck);
@@ -11360,6 +13409,17 @@ namespace ExtendedLSC
 
             // Don't process X input while keyboard is open (A=save, B=cancel handled by GTA)
             if (isEditingDescription) return;
+
+            // Some preview buttons share a physical button with the "hold X to edit description" gesture on
+            // controller: L3 (horn preview = FrontendLs/Duck) and X (NOS preview = NosButton/VehicleDuck). Skip
+            // the edit-description check while any of those preview buttons is held so previewing never edits.
+            if (Function.Call<bool>(Hash.IS_DISABLED_CONTROL_PRESSED, 0, ModSettings.HornPreviewButton) ||
+                Function.Call<bool>(Hash.IS_DISABLED_CONTROL_PRESSED, 0, (int)GTA.Control.FrontendLs) ||
+                Function.Call<bool>(Hash.IS_DISABLED_CONTROL_PRESSED, 0, ModSettings.NosButton))
+            {
+                lastLbHeldTime = DateTime.MinValue;   // reset the hold timer so it can't carry over
+                return;
+            }
 
             // Find the currently visible menu
             var visibleMenu = GetVisibleMenu();
@@ -11580,15 +13640,18 @@ namespace ExtendedLSC
             {
                 lastTransmissionVehicle = vehicle;
 
-                // Check if this vehicle has MT purchased - auto-enable if so
-                if (VehicleSaveData.IsManualTransmissionOwned(vehicle.DisplayName))
+                // Auto-enable MT only when it's the EQUIPPED transmission. MT and the vanilla transmission levels
+                // are mutually exclusive: owning MT but equipping a vanilla race transmission means MT is owned-but-
+                // not-equipped, and must stay OFF (checking "owned" here forced MT on over the race box on reload).
+                if (VehicleSaveData.IsManualTransmissionOwned(VehicleKey(vehicle))
+                    && VehicleSaveData.IsManualTransmissionEquipped(VehicleKey(vehicle)))
                 {
                     elscTransmission.SetVehicle(vehicle);
                     elscTransmission.Enable();
                 }
                 else if (elscTransmission.IsEnabled)
                 {
-                    // Vehicle doesn't have MT - disable
+                    // MT not the equipped transmission on this car - disable
                     elscTransmission.Disable();
                 }
             }
@@ -11604,7 +13667,10 @@ namespace ExtendedLSC
             // Update transmission state
             if (elscTransmission.IsEnabled)
             {
-                elscTransmission.NosInstalled = ModSettings.NosOwnedTiers != 0;   // own any nitrous tier (global)
+                // Per-vehicle nitrous: installed (can spray) only when this car has a tier equipped.
+                int nosTier = VehicleSaveData.GetNosEquippedTier(VehicleKey(vehicle));
+                elscTransmission.NosInstalled = nosTier >= 0;
+                if (nosTier >= 0) elscTransmission.ActiveFxIndex = nosTier;
                 // Apply live-tunable MT feel settings (cheap; lets INI edits take effect on reload).
                 elscTransmission.RumbleEnabled = ModSettings.MtRumble;
                 elscTransmission.ExhaustPops = ModSettings.MtExhaustPops;
@@ -11614,6 +13680,18 @@ namespace ExtendedLSC
                 elscTransmission.NosRefillPerSec = ModSettings.MtNosRefillPerSec;
                 elscTransmission.PerfectShiftNosBump = ModSettings.MtNosPerfectBump;
                 elscTransmission.Update();
+            }
+            else
+            {
+                // Automatic transmission: nitrous still works. Drive the standalone NOS path (no MT pipeline).
+                int nosTier = VehicleSaveData.GetNosEquippedTier(VehicleKey(vehicle));
+                elscTransmission.NosInstalled = nosTier >= 0;
+                if (nosTier >= 0)
+                {
+                    elscTransmission.ActiveFxIndex = nosTier;
+                    elscTransmission.NosRefillPerSec = ModSettings.MtNosRefillPerSec;
+                    elscTransmission.UpdateNosAutomatic(vehicle);
+                }
             }
 
             // Restrict to melee (no drive-by shooting) while moving with MT. Also frees the weapon/aim controls
@@ -11634,11 +13712,27 @@ namespace ExtendedLSC
         /// state) and draw the active speedometer skin. Called every tick while driving (and for preview while
         /// the Speedometer menu is open).
         /// </summary>
+        private int _speedoSyncedHandle = 0;
+
+        /// <summary>Per-car speedometer: load THIS vehicle's saved style into the live display (Speedo.Active), so
+        /// the gauge only appears on cars it's equipped on instead of globally. Look/colours stay global.</summary>
+        private void SyncSpeedoToCar(Vehicle v)
+        {
+            if (v == null || !v.Exists()) return;
+            _speedoSyncedHandle = v.Handle;
+            try { Speedo.Active = (SpeedoStyle)VehicleSaveData.GetSpeedoStyle(VehicleKey(v)); }
+            catch { Speedo.Active = SpeedoStyle.Off; }
+        }
+
         private void DrawSpeedometer(Vehicle vehicle)
         {
             if (Speedo.Previewing) return;   // white-screen design preview owns the HUD this frame
-            if (Speedo.Active == SpeedoStyle.Off && Speedo.Preview == null) return;
             if (vehicle == null || !vehicle.Exists()) return;
+            // When the player changes vehicles, load that car's per-car speedo style into the live display.
+            if (_speedoSyncedHandle != vehicle.Handle) SyncSpeedoToCar(vehicle);
+            // Hide while the player isn't in control: LSC drive-in animations / cutscenes render in a way that
+            // ghosts the digits (the old number lingers), and the gauge shouldn't show during those anyway.
+            if (_lscEjectPhase > 0 || !Function.Call<bool>(Hash.IS_PLAYER_CONTROL_ON, Game.Player)) return;
 
             var f = new SpeedoFrame { SpeedMph = vehicle.Speed * 2.23694f };
             bool mt = elscTransmission != null && elscTransmission.IsEnabled;
@@ -11649,6 +13743,9 @@ namespace ExtendedLSC
                 f.Redline = elscTransmission.IsInRedline();
                 f.HasNos = elscTransmission.NosInstalled;
                 f.Nos01 = elscTransmission.NosLevel;
+                f.HasShiftPoints = true;   // mark the perfect-shift window on the RPM bar
+                f.PerfectMin01 = elscTransmission.PerfectShiftMin;
+                f.PerfectMax01 = elscTransmission.PerfectShiftMax;
             }
             else
             {
@@ -11657,10 +13754,21 @@ namespace ExtendedLSC
                 float fwd = Vector3.Dot(vehicle.Velocity, vehicle.ForwardVector);
                 f.GearText = fwd < -0.5f ? "R" : (g <= 0 ? "N" : g.ToString());
                 f.Redline = vehicle.CurrentRPM >= 0.95f;
+                // Nitrous works on the automatic box too — show its bottle meter here as well.
+                if (elscTransmission != null) { f.HasNos = elscTransmission.NosInstalled; f.Nos01 = elscTransmission.NosLevel; }
             }
             // Turbo: shown when the turbo mod is fitted; boost approximated from revs (no memory read).
             f.HasTurbo = Function.Call<bool>(Hash.IS_TOGGLE_MOD_ON, vehicle, 18);
             f.Turbo01 = f.Rpm01;
+
+            // The simple gear/RPM (+NOS) gauge always shows once MT or Nitrous is on this vehicle — even if the
+            // player left the speedometer Off (e.g. a legacy save, or NOS equipped before the auto-enable) — so
+            // MT always shows gear/shift point and NOS always shows the bottle meter.
+            if (Speedo.Active == SpeedoStyle.Off && Speedo.Preview == null)
+            {
+                if (mt || f.HasNos) Speedo.DrawSimpleForced(f);
+                return;
+            }
             Speedo.Draw(f);
         }
 
@@ -11707,7 +13815,7 @@ namespace ExtendedLSC
                         bool loaded = _stanceMgrInit && stanceManager.LoadInto(vehicle, wheelFitment);
                         if (!loaded)
                         {
-                            string vehName = vehicle.DisplayName;
+                            string vehName = VehicleKey(vehicle);
                             if (VehicleSaveData.IsWheelFitmentOwned(vehName))
                             {
                                 var saved = VehicleSaveData.GetFitmentData(vehName);
@@ -11732,6 +13840,9 @@ namespace ExtendedLSC
                     // game's default preview shows. But on our own "Custom Suspension and Camber" item, DON'T
                     // suspend — show our saved stance instead.
                     wheelFitment.SuspendRideHeight = isPreviewingMod && previewModIndex == 15 && !_hoveringCustomSuspension;
+                    // Only judge stance stability WHILE STANCING (menu open). Driving around outside the menu
+                    // still re-asserts the geometry, but no longer runs the bounce/auto-recovery monitor.
+                    wheelFitment.MonitorEnabled = isMenuActive;
                     wheelFitment.Update();
                     // Auto-recovery: if the live stability monitor reverted an unstable setup, warn + persist.
                     string instWarn = wheelFitment.ConsumeInstability();
@@ -11874,29 +13985,30 @@ namespace ExtendedLSC
         /// </summary>
         private void FinishMTBinding()
         {
-            // Enable manual transmission
-            elscTransmission.SetVehicle(currentVehicle);
-            elscTransmission.Enable();
-
-            // Save to vehicle data so it persists across script reloads
-            if (currentVehicle != null && currentVehicle.Exists())
-            {
-                VehicleSaveData.SetManualTransmissionOwned(currentVehicle.DisplayName, true);
-                VehicleSaveData.Save();
-            }
-
-            // Update the menu item in place
-            if (mtBindingItem != null)
-            {
-                mtBindingItem.AltTitle = ""; // Empty - sprite shows instead
-                mtBindingItem.Description = $"Shift Up: {ModSettings.ShiftUpKey} | Shift Down: {ModSettings.ShiftDownKey} | Select to disable";
-                itemOwnershipStatus[mtBindingItem] = STATUS_INSTALLED;
-            }
-
             mtBindingState = 0;
             mtBindingItem = null;
 
-            ShowNotification("~g~Manual Transmission installed!");
+            if (currentVehicle != null && currentVehicle.Exists())
+            {
+                string vn = VehicleKey(currentVehicle);
+                VehicleSaveData.SetManualTransmissionOwned(vn, true);
+                bool wasEquipped = VehicleSaveData.IsManualTransmissionEquipped(vn);
+                if (!wasEquipped)
+                {
+                    // First-time buy: equip it now (removes vanilla transmission, enables, flags, rebuilds).
+                    EquipManualTransmission();
+                }
+                else
+                {
+                    // Editing keys on an already-equipped MT: just re-assert + refresh the menu labels.
+                    elscTransmission.SetVehicle(currentVehicle);
+                    elscTransmission.Enable();
+                    VehicleSaveData.Save();
+                    ShowNotification($"~g~Shift keys set — Up: {ModSettings.ShiftUpKey}, Down: {ModSettings.ShiftDownKey}");
+                    CaptureMenuPosition();
+                    RebuildMenusForVehicle();
+                }
+            }
         }
 
         /// <summary>

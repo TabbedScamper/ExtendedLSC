@@ -23,13 +23,16 @@ namespace ExtendedLSC
         public float Turbo01;     // 0..1 boost (approx)
         public bool HasNos;       // NOS installed (manual transmission)
         public float Nos01;       // 0..1 NOS charge
+        public bool HasShiftPoints; // MT active -> mark the perfect-shift window on the RPM bar
+        public float PerfectMin01;  // 0..1 start of the perfect-shift band
+        public float PerfectMax01;  // 0..1 end of the perfect-shift band
     }
 
     /// <summary>
     /// ELSC speedometer selector. Three styles, all drawn by ELSC from its own telemetry:
     ///  - Off    : hidden.
     ///  - Simple : a clean speed/gear/RPM-bar HUD (free).
-    ///  - NFSU2  : the Underground-2-style gauge using the owner's redrawn skin art (no external mod / no song).
+    ///  - FASTandSPEEDY : an arcade-racer street gauge using the owner's own redrawn skin art (original assets).
     /// </summary>
     public static class Speedo
     {
@@ -39,7 +42,23 @@ namespace ExtendedLSC
         public static bool Mph = true;
         public static float Scale = 1.0f;
         public static float OffX = 0f, OffY = 0f;
-        public static Color Accent = Color.FromArgb(255, 235, 60, 60);   // Simple HUD highlight
+        // Per-STYLE color palette — Simple and FASTandSPEEDY each keep their own colors.
+        public class Palette
+        {
+            public Color Accent = Color.FromArgb(255, 235, 60, 60);    // RPM bar / needle
+            public Color Speed = Color.White;                          // speed number
+            public Color Unit = Color.FromArgb(255, 220, 220, 220);    // MPH / KM·H label
+            public Color Gear = Color.White;                           // gear number
+            public Color Nos = Color.FromArgb(255, 40, 120, 255);      // NOS bar
+            public Color Redline = Color.FromArgb(255, 255, 51, 0);    // redline warning
+            public Color Circle1 = Color.FromArgb(255, 30, 34, 42);    // FASTandSPEEDY big dial fill
+            public Color Circle2 = Color.FromArgb(255, 30, 34, 42);    // FASTandSPEEDY small dial fill
+            public int Circle1Alpha = 205;                             // big dial colour brightness
+            public int Circle2Alpha = 205;                             // small dial colour brightness
+        }
+        public static readonly Palette PalSimple = new Palette();
+        public static readonly Palette PalNfsu = new Palette { Accent = Color.FromArgb(255, 80, 210, 255) };
+        public static Palette ColorsFor(SpeedoStyle s) => s == SpeedoStyle.Nfsu ? PalNfsu : PalSimple;
 
         public static readonly HashSet<SpeedoStyle> Owned = new HashSet<SpeedoStyle> { SpeedoStyle.Off, SpeedoStyle.Simple };
         public static bool IsFree(SpeedoStyle s) => s == SpeedoStyle.Off || s == SpeedoStyle.Simple;
@@ -54,9 +73,9 @@ namespace ExtendedLSC
         public static void Initialize(string speedoRoot)
         {
             _saveFile = Path.Combine(speedoRoot, "speedo.json");
-            _nfsuDir = Path.Combine(speedoRoot, "nfsu2");
+            _nfsuDir = Path.Combine(speedoRoot, "FASTandSPEEDY");
             LoadConfig();
-            Log?.Invoke($"[Speedo] active={Active} nfsu2={(Directory.Exists(_nfsuDir) ? "ok" : "MISSING")}");
+            Log?.Invoke($"[Speedo] active={Active} FASTandSPEEDY={(Directory.Exists(_nfsuDir) ? "ok" : "MISSING")}");
         }
 
         public static string StyleName(SpeedoStyle s)
@@ -65,7 +84,7 @@ namespace ExtendedLSC
             {
                 case SpeedoStyle.Off: return "Off";
                 case SpeedoStyle.Simple: return "Simple";
-                case SpeedoStyle.Nfsu: return "NFSU2";
+                case SpeedoStyle.Nfsu: return "FASTandSPEEDY";
                 default: return s.ToString();
             }
         }
@@ -80,13 +99,38 @@ namespace ExtendedLSC
 
         // ================================================================= persistence
         [Serializable]
+        private class PalBlob
+        {
+            public int Accent, Speed, Unit, Gear, Nos, Redline, Circle1, Circle2;
+            public int Circle1Alpha = 205, Circle2Alpha = 205;
+            public PalBlob() { }
+            public PalBlob(Palette p)
+            {
+                Accent = p.Accent.ToArgb(); Speed = p.Speed.ToArgb(); Unit = p.Unit.ToArgb(); Gear = p.Gear.ToArgb();
+                Nos = p.Nos.ToArgb(); Redline = p.Redline.ToArgb(); Circle1 = p.Circle1.ToArgb(); Circle2 = p.Circle2.ToArgb();
+                Circle1Alpha = p.Circle1Alpha; Circle2Alpha = p.Circle2Alpha;
+            }
+            public void Into(Palette p)
+            {
+                p.Accent = Color.FromArgb(Accent); p.Speed = Color.FromArgb(Speed); p.Unit = Color.FromArgb(Unit);
+                p.Gear = Color.FromArgb(Gear); p.Nos = Color.FromArgb(Nos); p.Redline = Color.FromArgb(Redline);
+                p.Circle1 = Color.FromArgb(Circle1); p.Circle2 = Color.FromArgb(Circle2);
+                p.Circle1Alpha = Circle1Alpha; p.Circle2Alpha = Circle2Alpha;
+            }
+        }
+
+        [Serializable]
         private class SaveBlob
         {
             public string Active = "Simple";
             public bool Mph = true;
             public float Scale = 1.0f;
             public float OffX = 0f, OffY = 0f;
-            public int AccentArgb = unchecked((int)0xFFEB3C3C);
+            public PalBlob Simple = null;   // null in old configs -> migrate from the legacy flat fields below
+            public PalBlob Nfsu = null;
+            // Legacy single-palette fields (read-only migration for configs saved before per-style colors).
+            public int AccentArgb = 0, SpeedArgb = 0, UnitArgb = 0, GearArgb = 0, NosArgb = 0, RedlineArgb = 0,
+                       Circle1Argb = 0, Circle2Argb = 0, Circle1Alpha = 205, Circle2Alpha = 205;
             public List<string> Owned = new List<string>();
         }
 
@@ -99,7 +143,20 @@ namespace ExtendedLSC
                 if (b == null) return;
                 if (Enum.TryParse(b.Active, out SpeedoStyle a)) Active = a;
                 Mph = b.Mph; Scale = b.Scale; OffX = b.OffX; OffY = b.OffY;
-                Accent = Color.FromArgb(b.AccentArgb);
+                if (b.Simple != null) b.Simple.Into(PalSimple);
+                if (b.Nfsu != null) b.Nfsu.Into(PalNfsu);
+                // Migrate a pre-per-style config (no nested palettes): copy the one saved palette into BOTH.
+                if (b.Simple == null && b.Nfsu == null && b.AccentArgb != 0)
+                {
+                    foreach (var p in new[] { PalSimple, PalNfsu })
+                    {
+                        p.Accent = Color.FromArgb(b.AccentArgb); p.Speed = Color.FromArgb(b.SpeedArgb);
+                        p.Unit = Color.FromArgb(b.UnitArgb); p.Gear = Color.FromArgb(b.GearArgb);
+                        p.Nos = Color.FromArgb(b.NosArgb); p.Redline = Color.FromArgb(b.RedlineArgb);
+                        p.Circle1 = Color.FromArgb(b.Circle1Argb); p.Circle2 = Color.FromArgb(b.Circle2Argb);
+                        p.Circle1Alpha = b.Circle1Alpha; p.Circle2Alpha = b.Circle2Alpha;
+                    }
+                }
                 foreach (var s in b.Owned) if (Enum.TryParse(s, out SpeedoStyle os)) Owned.Add(os);
             }
             catch (Exception ex) { Log?.Invoke($"[Speedo] load error: {ex.Message}"); }
@@ -113,12 +170,62 @@ namespace ExtendedLSC
                 var b = new SaveBlob
                 {
                     Active = Active.ToString(), Mph = Mph, Scale = Scale, OffX = OffX, OffY = OffY,
-                    AccentArgb = Accent.ToArgb(), Owned = new List<string>()
+                    Simple = new PalBlob(PalSimple), Nfsu = new PalBlob(PalNfsu),
+                    Owned = new List<string>()
                 };
                 foreach (var s in Owned) b.Owned.Add(s.ToString());
                 File.WriteAllText(_saveFile, Newtonsoft.Json.JsonConvert.SerializeObject(b, Newtonsoft.Json.Formatting.Indented));
             }
             catch (Exception ex) { Log?.Invoke($"[Speedo] save error: {ex.Message}"); }
+        }
+
+        /// <summary>Serialize the current speedo config (active style, units, per-style colours, scale/offset) to a
+        /// JSON string so a Vehicle Package can carry the speedometer look.</summary>
+        public static string ExportConfig()
+        {
+            try
+            {
+                var b = new SaveBlob
+                {
+                    Active = Active.ToString(), Mph = Mph, Scale = Scale, OffX = OffX, OffY = OffY,
+                    Simple = new PalBlob(PalSimple), Nfsu = new PalBlob(PalNfsu), Owned = new List<string>()
+                };
+                foreach (var s in Owned) b.Owned.Add(s.ToString());
+                return Newtonsoft.Json.JsonConvert.SerializeObject(b);
+            }
+            catch (Exception ex) { Log?.Invoke($"[Speedo] export error: {ex.Message}"); return null; }
+        }
+
+        /// <summary>Apply a config exported by ExportConfig (from a package). Applies colours/units/scale always;
+        /// the active style only if the player OWNS it (a package never unlocks a paid gauge for free). Persists.</summary>
+        public static void ImportConfig(string json, bool persist = true)
+        {
+            if (string.IsNullOrEmpty(json)) return;
+            try
+            {
+                var b = Newtonsoft.Json.JsonConvert.DeserializeObject<SaveBlob>(json);
+                if (b == null) return;
+                Mph = b.Mph; Scale = b.Scale; OffX = b.OffX; OffY = b.OffY;
+                if (b.Simple != null) b.Simple.Into(PalSimple);
+                if (b.Nfsu != null) b.Nfsu.Into(PalNfsu);
+                if (Enum.TryParse(b.Active, out SpeedoStyle a) && IsOwned(a)) Active = a;
+                if (persist) SaveConfig();   // in-memory only (persist=false) for a live hover preview
+            }
+            catch (Exception ex) { Log?.Invoke($"[Speedo] import error: {ex.Message}"); }
+        }
+
+        /// <summary>The active style parsed from an exported config (for setting Speedo.Preview during a package
+        /// hover), or null if Off/unparseable.</summary>
+        public static SpeedoStyle? ActiveStyleOf(string json)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(json)) return null;
+                var b = Newtonsoft.Json.JsonConvert.DeserializeObject<SaveBlob>(json);
+                if (b != null && Enum.TryParse(b.Active, out SpeedoStyle a) && a != SpeedoStyle.Off) return a;
+            }
+            catch { }
+            return null;
         }
 
         // ================================================================= dispatch
@@ -154,7 +261,8 @@ namespace ExtendedLSC
                 Function.Call(Hash.DRAW_RECT, 0.5f, 0.5f, 1.0f, 1.0f, 45, 48, 55, 255);
                 var saved = Preview; Preview = style;
                 Draw(new SpeedoFrame { SpeedMph = speed, Rpm01 = rpm, GearText = gear, Redline = rpm >= 0.93f,
-                                       HasTurbo = true, Turbo01 = rpm, HasNos = true, Nos01 = 0.66f });
+                                       HasTurbo = true, Turbo01 = rpm, HasNos = true, Nos01 = 0.66f,
+                                       HasShiftPoints = true, PerfectMin01 = 0.90f, PerfectMax01 = 0.98f });
                 Preview = saved;
                 return true;
             }
@@ -165,22 +273,63 @@ namespace ExtendedLSC
         private static string Unit => Mph ? "MPH" : "KM/H";
 
         // ================================================================= SIMPLE
-        private static void DrawSimple(SpeedoFrame f)
+        /// <summary>Public entry so the MT system can force the Simple gauge on even when the
+        /// speedometer style is Off (the gear/RPM bar should always show once MT is owned).</summary>
+        public static void DrawSimpleForced(SpeedoFrame f)
         {
-            float ax = 0.86f + OffX, ay = 0.92f + OffY;
-            float sc = Scale;
-            float barW = 0.12f * sc, barH = 0.012f * sc;
-            Rect(ax, ay, barW, barH, Color.FromArgb(150, 0, 0, 0));
-            float fill = barW * Math.Max(0f, Math.Min(1f, f.Rpm01));
-            Color barC = f.Redline ? Accent : (f.Rpm01 > 0.85f ? Color.FromArgb(255, 100, 255, 100) : Color.White);
-            Rect(ax - barW / 2 + fill / 2, ay, fill, barH * 0.8f, barC);
-            Text($"{DispSpeed(f.SpeedMph):0}", ax - 0.03f, ay - 0.085f * sc, 0.7f * sc, Color.White, 7, true);
-            Text(Unit, ax - 0.03f, ay - 0.018f * sc, 0.30f * sc, Color.FromArgb(200, 220, 220, 220), 4, true);
-            Color gc = f.GearText == "N" ? Color.Yellow : (f.Redline ? Accent : Color.White);
-            Text(f.GearText, ax + 0.05f, ay - 0.075f * sc, 0.8f * sc, gc, 4, true);
+            try { DrawSimple(f); } catch (Exception ex) { Log?.Invoke($"[Speedo] simple(forced) error: {ex.Message}"); }
         }
 
-        // ================================================================= NFSU2 (owner's redrawn skin)
+        private static void DrawSimple(SpeedoFrame f)
+        {
+            var P = PalSimple;   // the Simple gauge keeps its own colors (separate from FASTandSPEEDY)
+            float ax = 0.86f + OffX, ay = 0.92f + OffY;   // ay = RPM bar centre line (the anchor)
+            float sc = Scale;
+            float barW = 0.12f * sc, barH = 0.012f * sc;
+
+            // --- RPM bar (the white "gauge") on the anchor line ---
+            Rect(ax, ay, barW, barH, Color.FromArgb(150, 0, 0, 0));
+            // Redline zone: the top ~14% of the bar tinted with the redline colour (always visible, so it's
+            // colorable and you can see where the redline is even below revs).
+            float rlFrac = 0.86f, rlW = barW * (1f - rlFrac);
+            Rect(ax - barW / 2 + barW * (rlFrac + (1f - rlFrac) / 2f), ay, rlW, barH,
+                 Color.FromArgb(150, P.Redline.R, P.Redline.G, P.Redline.B));
+            float fill = barW * Math.Max(0f, Math.Min(1f, f.Rpm01));
+            Color barC = f.Redline ? P.Redline : P.Accent;
+            Rect(ax - barW / 2 + fill / 2, ay, fill, barH * 0.8f, barC);
+
+            // --- Perfect-shift markers: green lines bracketing the sweet-spot band on the bar (MT only) ---
+            if (f.HasShiftPoints)
+            {
+                Color mark = Color.FromArgb(255, 120, 255, 120);
+                float lineW = 0.0016f * sc, lineH = barH * 1.6f;
+                float lo = Math.Max(0f, Math.Min(1f, f.PerfectMin01));
+                float hi = Math.Max(0f, Math.Min(1f, f.PerfectMax01));
+                Rect(ax - barW / 2 + barW * lo, ay, lineW, lineH, mark);
+                Rect(ax - barW / 2 + barW * hi, ay, lineW, lineH, mark);
+            }
+
+            // --- NOS gauge: a thin blue bar tucked directly under the RPM bar (only with NOS) ---
+            if (f.HasNos)
+            {
+                float nosH = barH * 0.6f;
+                float nosY = ay + barH / 2f + nosH / 2f + 0.002f * sc;   // stacked against the bottom of the RPM bar
+                Rect(ax, nosY, barW, nosH, Color.FromArgb(150, 0, 0, 0));
+                float nf = barW * Math.Max(0f, Math.Min(1f, f.Nos01));
+                Rect(ax - barW / 2 + nf / 2, nosY, nf, nosH * 0.8f, P.Nos);
+            }
+
+            // --- Speed number + unit, stacked ABOVE the bar as a tight "120 / MPH" pair (bar sits under them) ---
+            Text($"{DispSpeed(f.SpeedMph):0}", ax - 0.03f, ay - 0.066f * sc, 0.7f * sc, P.Speed, 7, true);
+            Text(Unit, ax - 0.03f, ay - 0.028f * sc, 0.28f * sc, P.Unit, 4, true);
+
+            // --- Gear, to the right (aligned with the speed number), with a "GEAR" label like MPH ---
+            Color gc = f.GearText == "N" ? Color.Yellow : (f.Redline ? P.Redline : P.Gear);
+            Text(f.GearText, ax + 0.05f, ay - 0.070f * sc, 0.8f * sc, gc, 4, true);
+            Text("GEAR", ax + 0.05f, ay - 0.028f * sc, 0.28f * sc, P.Unit, 4, true);
+        }
+
+        // ================================================================= FASTandSPEEDY (owner's redrawn skin)
         // Replicates the Speedometer-v0.6.1 layout: every sprite drawn at native_size*scale, positioned at
         // anchor + INIoffset*scale; main needle rot = rpm*230deg. Fed by ELSC telemetry (no external mod/song).
         private const float NA_X = 971f, NA_Y = 460f;   // anchor (1280x720 base), owner-placed default — tune via Off X/Y
@@ -206,9 +355,18 @@ namespace ExtendedLSC
             float scale = NA_S * Scale;
             float ax = NA_X + OffX * 1280f;
             float ay = NA_Y + OffY * 720f;
+            _sprUsed.Clear();            // start fresh: hand out pooled sprites from index 0 again this frame
+            var P = PalNfsu;             // FASTandSPEEDY keeps its own colors (separate from Simple)
             Color white = Color.White;
-            Color red = Color.FromArgb(255, 255, 51, 0);
+            Color acc = P.Accent;        // needle
+            Color red = P.Redline;       // redline arc
             Color decor = Color.FromArgb(185, 255, 255, 255);
+            // The near-black dial art can't be tinted bright, so we overlay a white-fill mask of each circle in
+            // the chosen colour. The slider = how brightly that colour shows (its alpha over the dark dial).
+            // main_bg_fill has a transparent HOLE punched over the readout, so the numbers (which GTA renders
+            // BELOW script sprites) show on the dark dial instead of being tinted by the glass — full brightness.
+            Color c1 = Color.FromArgb(P.Circle1Alpha, P.Circle1.R, P.Circle1.G, P.Circle1.B);
+            Color c2 = Color.FromArgb(P.Circle2Alpha, P.Circle2.R, P.Circle2.G, P.Circle2.B);
 
             // NOS bar across the top (when installed) — bars light up with the charge.
             if (f.HasNos)
@@ -222,7 +380,7 @@ namespace ExtendedLSC
                     if (alpha <= 0 || !File.Exists(bars[i])) continue;
                     new CustomSprite(bars[i], new SizeF(34f * scale, 512f * scale),
                         new PointF(ax + (217f + 34f * i) * scale, ay + -98f * scale),
-                        Color.FromArgb(alpha, 0, 51, 153), 0f, false).Draw();
+                        Color.FromArgb(alpha, P.Nos.R, P.Nos.G, P.Nos.B), 0f, false).Draw();
                 }
             }
 
@@ -230,56 +388,88 @@ namespace ExtendedLSC
             if (f.HasTurbo)
             {
                 float tRot = Math.Max(0f, Math.Min(1f, f.Turbo01)) * 90f + 132f;
-                S("turbo_bg_00.png", 512f, 512f, 80f, 354f, white, 0f, ax, ay, scale);
+                // Turbo bg/turbo were cropped 512->272 (old content origin (8,8)/(22,22)->(0,0)/(14,14)); offsets
+                // shifted by (old origin - new origin) so the dial lands at the exact same screen position.
+                S("turbo_bg_00.png", 272f, 272f, 88f, 362f, white, 0f, ax, ay, scale);     // dark dial base
+                S("turbo_bg_fill.png", 272f, 272f, 88f, 362f, c2, 0f, ax, ay, scale);      // bright colour overlay
                 S("turbomax.png", 128f, 128f, 221f, 343f, red, 0f, ax, ay, scale);
                 S("turbomax.png", 128f, 128f, 106f, 530f, red, 173f, ax, ay, scale);
-                S("turbo_00.png", 512f, 512f, 79f, 352f, white, 0f, ax, ay, scale);
+                S("turbo_00.png", 272f, 272f, 87f, 360f, white, 0f, ax, ay, scale);
                 S("decorsmall.png", 512f, 256f, 142f, 439f, decor, 0f, ax, ay, scale);
-                S("arrow_turbo_00.png", 64f, 256f, 185f, 374f, white, tRot, ax, ay, scale);
+                S("arrow_turbo_00.png", 64f, 256f, 185f, 374f, acc, tRot, ax, ay, scale);
             }
 
-            // Main dial layers + RPM needle.
-            S("main_bg_00.png", 1024f, 1024f, 318f, 86f, white, 0f, ax, ay, scale);
+            // Main dial layers + RPM needle. main_bg cropped 1024->544 (content origin (4,4)->(0,0)) -> offset +4.
+            S("main_bg_00.png", 544f, 544f, 322f, 90f, white, 0f, ax, ay, scale);       // dark dial base
+            S("main_bg_fill.png", 544f, 544f, 322f, 90f, c1, 0f, ax, ay, scale);        // bright colour overlay
             S("main_redline_9000.png", 512f, 128f, 280f, 100f, red, 0f, ax, ay, scale);
             S("main_00.png", 512f, 512f, 330f, 107f, white, 0f, ax, ay, scale);
-            S("arrow_main_00.png", 64f, 512f, 560f, 114f, white, rpm * 230f, ax, ay, scale);
+            S("arrow_main_00.png", 64f, 512f, 560f, 114f, acc, rpm * 230f, ax, ay, scale);
 
-            // Gear (u2_d_{R/N/#}).
-            string g = f.GearText == "R" ? "u2_d_R" : f.GearText == "N" ? "u2_d_N" : "u2_d_" + f.GearText;
-            SizeF gd = Dims("digits/" + g + ".png");
-            S("digits/" + g + ".png", gd.Width * 1.2f, 57.6f, 721f, 296f, Color.FromArgb(255, 51, 255, 51), 0f, ax, ay, scale);
-
-            // Speed digits, right-aligned to END at SpeedInfo_x (790). Fixed glyph advance (52; 54 for '7').
-            int spd = (int)Math.Floor(DispSpeed(f.SpeedMph));
-            string txt = spd.ToString();
-            float Adv(char c) => c == '7' ? 54f : 52f;
-            float total = 0f; foreach (char c in txt) total += Adv(c);
-            float x = 790f - total;
-            foreach (char c in txt)
-            {
-                S("digits/speed/n" + c + ".png", Adv(c), 78f, x, 388f, white, 0f, ax, ay, scale);
-                x += Adv(c);
-            }
-
-            // Unit (MPH / KM/H) at SpeedTitle (680,504).
-            if (Mph) { S("digits/speed/M.png", 35f, 33.6f, 693.65f, 504f, white, 0f, ax, ay, scale, true);
-                       S("digits/speed/P.png", 26.6f, 33.6f, 728.1f, 504f, white, 0f, ax, ay, scale, true);
-                       S("digits/speed/H.png", 28f, 33.6f, 758f, 504f, white, 0f, ax, ay, scale, true); }
-            else     { S("digits/speed/K.png", 29.4f, 33.6f, 680f, 504f, white, 0f, ax, ay, scale, true);
-                       S("digits/speed/M.png", 35f, 33.6f, 709.9f, 504f, white, 0f, ax, ay, scale, true);
-                       S("digits/speed/H.png", 28f, 33.6f, 758f, 504f, white, 0f, ax, ay, scale, true); }
-
-            // Shift light at redline.
+            // Shift light at redline (before the readout).
             if (f.Redline) S("SHIFTUP.png", 42f, 42f, 665f, 311f, white, 0f, ax, ay, scale);
+
+            // ---- READOUT: NATIVE TEXT (image digits ghost; text never does). The glass fill has a crisp hole
+            // punched over this window so the text shows on the dark dial untinted. Colorable: Speed/Gear/Units.
+            int spd = (int)Math.Floor(DispSpeed(f.SpeedMph));
+            NfsuTextRight(spd.ToString(), (ax + 790f * scale) / 1280f, (ay + 372f * scale) / 720f, 0.92f * Scale, P.Speed);
+            NfsuTextCentre(f.GearText,     (ax + 749f * scale) / 1280f, (ay + 274f * scale) / 720f, 0.78f * Scale, P.Gear);
+            NfsuTextCentre(Unit,           (ax + 726f * scale) / 1280f, (ay + 500f * scale) / 720f, 0.42f * Scale, P.Unit);
         }
 
+        private static void NfsuTextCentre(string s, float cx, float cy, float scl, Color c)
+        {
+            Function.Call(Hash.SET_TEXT_FONT, 4);
+            Function.Call(Hash.SET_TEXT_SCALE, scl, scl);
+            Function.Call(Hash.SET_TEXT_COLOUR, c.R, c.G, c.B, c.A);
+            Function.Call(Hash.SET_TEXT_CENTRE, true);
+            Function.Call(Hash.SET_TEXT_OUTLINE);
+            Function.Call(Hash.BEGIN_TEXT_COMMAND_DISPLAY_TEXT, "STRING");
+            Function.Call(Hash.ADD_TEXT_COMPONENT_SUBSTRING_PLAYER_NAME, s);
+            Function.Call(Hash.END_TEXT_COMMAND_DISPLAY_TEXT, cx, cy, 0);
+        }
+        private static void NfsuTextRight(string s, float rx, float ty, float scl, Color c)
+        {
+            Function.Call(Hash.SET_TEXT_FONT, 4);
+            Function.Call(Hash.SET_TEXT_SCALE, scl, scl);
+            Function.Call(Hash.SET_TEXT_COLOUR, c.R, c.G, c.B, c.A);
+            Function.Call(Hash.SET_TEXT_RIGHT_JUSTIFY, true);
+            Function.Call(Hash.SET_TEXT_WRAP, 0f, rx);
+            Function.Call(Hash.SET_TEXT_OUTLINE);
+            Function.Call(Hash.BEGIN_TEXT_COMMAND_DISPLAY_TEXT, "STRING");
+            Function.Call(Hash.ADD_TEXT_COMPONENT_SUBSTRING_PLAYER_NAME, s);
+            Function.Call(Hash.END_TEXT_COMMAND_DISPLAY_TEXT, 0f, ty, 0);
+        }
+
+        // CustomSprite has no Dispose, so a fresh one each frame leaks a game runtime texture (pool fills ->
+        // stale-texture ghost). But ONE shared instance per file collapses repeated digits ("88" draws the same
+        // n8 twice — if Draw() is deferred both land at the last position). Solution: a POOL per file. Each call
+        // takes the next free instance for that file (creating it once), so same-file-multiple-draws each get
+        // their own instance AND every texture is created exactly once. _sprUsed is reset each DrawNfsu frame.
+        private static readonly Dictionary<string, List<CustomSprite>> _sprPool = new Dictionary<string, List<CustomSprite>>();
+        private static readonly Dictionary<string, int> _sprUsed = new Dictionary<string, int>();
         private static void S(string file, float nw, float nh, float ix, float iy, Color tint, float rot,
                               float ax, float ay, float scale, bool centered = false)
         {
             string fp = Path.Combine(_nfsuDir, file);
             if (!File.Exists(fp)) return;
-            new CustomSprite(fp, new SizeF(nw * scale, nh * scale),
-                new PointF(ax + ix * scale, ay + iy * scale), tint, rot, centered).Draw();
+            var size = new SizeF(nw * scale, nh * scale);
+            var pos = new PointF(ax + ix * scale, ay + iy * scale);
+            if (!_sprPool.TryGetValue(fp, out var list)) { list = new List<CustomSprite>(); _sprPool[fp] = list; }
+            int used = _sprUsed.TryGetValue(fp, out var u) ? u : 0;
+            CustomSprite spr;
+            if (used < list.Count)
+            {
+                spr = list[used];
+                spr.Size = size; spr.Position = pos; spr.Color = tint; spr.Rotation = rot;
+            }
+            else
+            {
+                spr = new CustomSprite(fp, size, pos, tint, rot, centered);
+                list.Add(spr);
+            }
+            _sprUsed[fp] = used + 1;
+            spr.Draw();
         }
 
         /// <summary>Native pixel dimensions of a PNG (cached) via the IHDR header.</summary>

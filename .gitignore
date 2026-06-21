@@ -24,3 +24,13 @@ GameDataBackup/
 
 # DLC build intermediates (the packaged dlc_elsc/ IS committed)
 DLC/_build/
+
+# Editor / process temp files
+*.tmp.*
+
+# Python tooling caches + dyno run outputs
+__pycache__/
+tools/dyno/results/
+
+# Speedo skin local backups
+speedo/*_backup/

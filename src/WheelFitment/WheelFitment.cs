@@ -80,6 +80,10 @@ namespace ExtendedLSC.WheelFitment
         private float[] _safe = null;                          // last KNOWN-STABLE [fc,rc,ft,rt,fh,rh,vs,vw]
         public bool InstabilityTripped { get; private set; }
         public string InstabilityMsg { get; private set; }
+        // Only watch for unstable stances WHILE STANCING (the menu is open). The geometry re-assert still runs
+        // every frame to hold the stance while driving, but the bounce/auto-recovery monitor stays off the rest
+        // of the time — no point judging stability when the player can't see or change anything.
+        public bool MonitorEnabled { get; set; } = false;
 
         // NATURAL-BASELINE cache, keyed by model:wheelType:frontWheelModIndex. Each wheel has its own
         // natural visual size + offsets, so we capture the FIRST time we ever see a given wheel in its
@@ -282,7 +286,21 @@ namespace ExtendedLSC.WheelFitment
             if (_vehicle == null || !_vehicle.Exists()) return;
             LoadBaselines();   // pull any disk-persisted clean baselines first (cheap, runs once per session)
             string key = ResolveWheelKey();
-            if (key == null || key == _currentBaselineKey) return;   // unchanged -> nothing to do
+            if (key == null) return;
+            if (key == _currentBaselineKey)
+            {
+                // RECOVERY: a rim's visual gfx streams a few frames AFTER the wheel mod is applied, so a baseline
+                // captured the instant the wheel changed can read StreamGfx==0 and lock size/width as "no aftermarket
+                // wheels" — and that false is even persisted to disk (line ~358). The heal path can't undo it (it
+                // bails on !_hasVisualWheels). So while we're locked but aftermarket wheels ARE on, re-check
+                // (throttled) and, once the visual gfx is available, drop the stale record and re-capture below.
+                if (_hasVisualWheels || Game.GameTime - _visualRecheckAt < 250) return;
+                _visualRecheckAt = Game.GameTime;
+                bool customRimsNow = false;
+                try { customRimsNow = Function.Call<int>(Hash.GET_VEHICLE_MOD, _vehicle, 23) != -1; } catch { }
+                if (!customRimsNow || !WheelMemory.HasVisualWheels(_vehicle)) return;   // gfx still not ready
+                _stockByKey.Remove(key);   // discard the stale "no visual" baseline (re-captured + re-saved as true)
+            }
             _currentBaselineKey = key;
 
             try
@@ -465,6 +483,7 @@ namespace ExtendedLSC.WheelFitment
         // re-capture the cached baseline from it. This auto-corrects any baseline that was recorded polluted
         // (the cause of reload-corrupted stances) — the player just needs to be at stock for a moment.
         private int _lastHealAt = 0;
+        private int _visualRecheckAt = 0;   // throttle for the "rim gfx streamed in late" size/width-unlock recovery
         private void HealBaselineIfStock()
         {
             try
@@ -541,9 +560,11 @@ namespace ExtendedLSC.WheelFitment
             if (Game.GameTime < _reassertUntil)
             {
                 // Capture the SOLVER's wheel-Z BEFORE ApplyGeometry re-pins it — its oscillation is the buzz.
-                float solverWheelZ = WheelMemory.GetWheelZ(_vehicle, 0);
+                // Only read it / run the stability monitor while actually stancing (menu open); otherwise just
+                // re-assert the geometry so the stance holds while driving, with zero monitor cost.
+                float solverWheelZ = MonitorEnabled ? WheelMemory.GetWheelZ(_vehicle, 0) : 0f;
                 ApplyGeometry();
-                MonitorStability(solverWheelZ);
+                if (MonitorEnabled) MonitorStability(solverWheelZ);
             }
         }
 

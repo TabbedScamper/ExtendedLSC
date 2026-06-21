@@ -112,6 +112,7 @@ namespace ExtendedLSC.ManualTransmission
         private int _autorunUntil = 0;
         private int _runStartTime = 0;
         private string _autorunMode = "auto";
+        private int _dynoGearDelta = 0;   // autorun.txt 3rd field: extra gears to apply at launch (tests the +gears fix)
         private System.Text.StringBuilder _csv = null;
         // Runway-end safety: if scripts/ExtendedLSC/runway_end.txt exists ("x;y;z"), a run ends and
         // brakes hard once the car gets within this range of it (no more desert excursions).
@@ -138,6 +139,10 @@ namespace ExtendedLSC.ManualTransmission
         public float ShiftKickForcePerfect { get; set; } = 30f;    // tunable (INI)
         private const float ShiftKickPowerBase = 0.25f;
         private const float ShiftKickPowerPerfect = 0.45f;
+        // The kick is scaled by how much this shift actually drops the revs, relative to a stock ~28% drop, so a
+        // close-ratio shift (tight stock box, or a car whose powerband barely moves) gets a proportionally gentler
+        // nudge instead of a full lunge — no more "substantial kickback that forces an immediate re-shift".
+        private const float ReferenceShiftDrop = 0.28f;   // stock 5-gear geometric step (1 - 0.90/3.33^(1/4))
         // Shift feedback: controller rumble + exhaust pop + downshift over-rev guard (all tunable).
         public bool RumbleEnabled { get; set; } = true;
         public bool ExhaustPops { get; set; } = true;
@@ -264,17 +269,51 @@ namespace ExtendedLSC.ManualTransmission
         // feel meaty and consistent (the NFS feel). 1st and top stay stock, so launch + top speed are unchanged.
         private const float NfsGearFirst = 3.3333f;
         private const float NfsGearTop = 0.90f;
-        public void ApplyNfsGearing(Vehicle v)
+        private float[] _appliedRatios = null;   // verbatim cache of the last ratios written (for the periodic re-assert)
+        /// <param name="stockGears">The car's ORIGINAL drive-gear count. The geometric step is anchored to it so
+        /// the stock gears keep their 3.33->0.90 spacing/top speed, and any ADDED gears (current count &gt; stock)
+        /// EXTEND the range downward at the SAME per-shift step (constant RPM drop) instead of re-compressing every
+        /// gear into a fixed range. 0 = anchor to the current count (legacy behavior, no extension).</param>
+        public void ApplyNfsGearing(Vehicle v, int stockGears = 0)
         {
             if (v == null || !v.Exists()) return;
-            int n = VehicleMemory.GetTopGear(v);   // drive gear count
+            int n = VehicleMemory.GetTopGear(v);   // current total drive-gear count (may be stock + tuned)
             if (n < 2 || n > 10) return;
+            int baseN = (stockGears >= 2 && stockGears <= 10) ? stockGears : n;
+            float step = (float)Math.Pow(NfsGearTop / NfsGearFirst, 1.0 / (baseN - 1));  // constant per-shift ratio step
+            var cache = new float[n + 2];                                             // slot index = gear g + 1
+            for (int i = 0; i < cache.Length; i++) cache[i] = float.NaN;
             for (int g = 1; g <= n; g++)
             {
-                float t = (g - 1) / (float)(n - 1);                                   // 0..1 across the gears
-                float ratio = NfsGearFirst * (float)Math.Pow(NfsGearTop / NfsGearFirst, t);
+                float ratio = NfsGearFirst * (float)Math.Pow(step, g - 1);            // g==baseN -> 0.90; g>baseN -> taller
                 VehicleMemory.SetGearRatio(v, g + 1, ratio);                          // array index 2 = 1st gear
+                cache[g + 1] = ratio;
             }
+            _appliedRatios = cache;   // remember EXACTLY what we wrote so the periodic re-assert restores it verbatim
+        }
+
+        /// <summary>Re-write the exact ratios last applied by ApplyNfsGearing. The periodic re-assert must use THIS,
+        /// not ApplyNfsGearing — recomputing without the stock count would re-compress an extended-range tune and,
+        /// because changing a live gear's ratio shifts the RPM-per-speed instantly, slam the tach mid-drive (feels
+        /// like a phantom auto-upshift the gear indicator never shows). Writing the same values is a no-op = no jump.</summary>
+        private void ReassertRatios()
+        {
+            if (_appliedRatios == null || _vehicle == null || !_vehicle.Exists()) return;
+            for (int slot = 2; slot < _appliedRatios.Length; slot++)
+            {
+                float r = _appliedRatios[slot];
+                if (!float.IsNaN(r)) VehicleMemory.SetGearRatio(_vehicle, slot, r);
+            }
+        }
+
+        /// <summary>Re-read the live top-gear count and re-space the ratios. Call AFTER changing the live top gear
+        /// (e.g. Vehicle Tuning "+N gears") so MT knows the new count and the new gear gets a real ratio. Pass the
+        /// car's stock gear count so added gears extend the range (constant shift spacing) instead of compressing.</summary>
+        public void RefreshGears(int stockGears = 0)
+        {
+            if (_vehicle == null || !_vehicle.Exists()) return;
+            _cachedTopGear = VehicleMemory.GetTopGear(_vehicle);
+            ApplyNfsGearing(_vehicle, stockGears);
         }
 
         /// <summary>
@@ -337,9 +376,9 @@ namespace ExtendedLSC.ManualTransmission
         {
             //                name                 dict             effect                           rX rY  rZ   scl    loop  drain   power  shove color  buff
             // drain scaled so the LONGEST variant (NOS 3) lasts 5s on a full bottle; others kept proportional.
-            new ExhaustFx("NOS 1: Muzzle Flash",  "scr_carsteal4", "scr_carsteal5_car_muzzle_flash", 0f, 0f, -90f, 1.5f, false, 0.85f,  1.18f, 9.0f, false, "Launch kick - huge instant push, burns out fast (~1.2s)"),
-            new ExhaustFx("NOS 2: Backfire",      "core",          "veh_backfire",                   0f, 0f,  0f,  1.3f, false, 0.46f,  1.60f, 1.5f, false, "Acceleration - strong sustained pull, low kick (~2.2s)"),
-            new ExhaustFx("NOS 3: Nitrous Flame", "veh_xs_vehicle_mods", "veh_nitrous",              0f, 0f,  0f,  1.3f, true,  0.20f,  1.35f, 3.5f, false, "Endurance - moderate boost that lasts longest (~5s)"),
+            new ExhaustFx("NOS 1: Muzzle Flash",  "scr_carsteal4", "scr_carsteal5_car_muzzle_flash", 0f, 0f, -90f, 1.5f, false, 0.85f,  1.18f, 9.0f, false, "Launch kick - huge instant push, burns out fast (1.2s)"),
+            new ExhaustFx("NOS 2: Backfire",      "core",          "veh_backfire",                   0f, 0f,  0f,  1.3f, false, 0.46f,  1.60f, 1.5f, false, "Acceleration - strong sustained pull, low kick (2.2s)"),
+            new ExhaustFx("NOS 3: Nitrous Flame", "veh_xs_vehicle_mods", "veh_nitrous",              0f, 0f,  0f,  1.3f, true,  0.20f,  1.35f, 3.5f, false, "Endurance - moderate boost that lasts longest (5s)"),
             // NOS 4 (custom-colour tier) + the colour picker are deferred to a future update — they need a
             // tint-respecting flame asset (veh_nitrous is baked blue; veh_backfire doesn't tint reliably).
         };
@@ -506,20 +545,32 @@ namespace ExtendedLSC.ManualTransmission
             VehicleMemory.SetCurrentGear(_vehicle, _targetGear);
             VehicleMemory.SetNextGear(_vehicle, _targetGear);
 
-            // NFS-style shift kick: a forward lunge (+ small power bump) on the new gear, bigger on a perfect shift.
-            _shiftKickForce = LastShiftPerfect ? ShiftKickForcePerfect : ShiftKickForceBase;
-            _shiftKickPower = LastShiftPerfect ? ShiftKickPowerPerfect : ShiftKickPowerBase;
-            _shiftKickUntil = Game.GameTime + ShiftKickMs;
+            // Only kick/pop while the car is actually MOVING — shifting from a dead stop must not launch the car
+            // forward or crackle. (The lunge is an impulse force; at a standstill it just shoves the car.)
+            float shiftSpeed = 0f;
+            try { shiftSpeed = _vehicle.Speed; } catch { }
+            bool movingAtShift = shiftSpeed > 1.0f;   // ~2.2 mph — clearly in motion, not still/creeping
 
-            // Feedback: controller rumble (bigger on a perfect shift) + an exhaust backfire pop.
+            // Ratio drop for THIS shift — drives both the rev-match snap and the kick strength.
+            float rOld = VehicleMemory.GetGearRatio(_vehicle, _targetGear - 1);
+            float rNew = VehicleMemory.GetGearRatio(_vehicle, _targetGear);
+            float kickScale = 1f;
+            if (rOld > 0.01f && rNew > 0.01f && rNew < rOld)
+                kickScale = Math.Min(1f, Math.Max(0.3f, ((rOld - rNew) / rOld) / ReferenceShiftDrop));
+
+            // NFS-style shift kick: a forward lunge (+ small power bump), scaled to the rev drop so close-ratio
+            // shifts don't punt you straight back to redline. Bigger on a perfect shift.
+            _shiftKickForce = (LastShiftPerfect ? ShiftKickForcePerfect : ShiftKickForceBase) * kickScale;
+            _shiftKickPower = (LastShiftPerfect ? ShiftKickPowerPerfect : ShiftKickPowerBase) * kickScale;
+            _shiftKickUntil = movingAtShift ? Game.GameTime + ShiftKickMs : 0;
+
+            // Feedback: controller rumble (bigger on a perfect shift) + an exhaust backfire pop (in motion only).
             Rumble(LastShiftPerfect ? 200 : 110, LastShiftPerfect ? 230 : 150);
-            if (ExhaustPops && !NosActive) _shiftPopUntil = Game.GameTime + ShiftPopMs;
+            if (ExhaustPops && !NosActive && movingAtShift) _shiftPopUntil = Game.GameTime + ShiftPopMs;
 
             // REV-MATCH SNAP: with the clutch dips patched out, the game only LERPS the rpm toward the
             // new gear's value (~0.8s glide that parks the tach at the top of every gear). Snap it from
             // the real ratios instead — instant dual-clutch-style drop to the correct revs.
-            float rOld = VehicleMemory.GetGearRatio(_vehicle, _targetGear - 1);
-            float rNew = VehicleMemory.GetGearRatio(_vehicle, _targetGear);
             if (rOld > 0.01f && rNew > 0.01f && rNew < rOld)
             {
                 float snapped = Math.Max(0.2f, rpmAtShift * (rNew / rOld));
@@ -737,8 +788,18 @@ namespace ExtendedLSC.ManualTransmission
             if (!_inReverse && !_inNeutral)
             {
                 var relVel = Function.Call<GTA.Math.Vector3>(Hash.GET_ENTITY_SPEED_VECTOR, _vehicle.Handle, true);
-                if (relVel.Y < -0.08f)   // moving backward in a forward gear -> snap the reverse out
-                    Function.Call(Hash.SET_VEHICLE_FORWARD_SPEED, _vehicle.Handle, 0f);
+                // ONLY fight the game's brake-induced auto-reverse, which only happens at a near-standstill:
+                // SLOW backward creep, braking, on all wheels, on the ground. A real backward SLIDE (rolling
+                // down a hill, etc.) is left alone — zeroing its momentum freezes the car, which is the bug.
+                if (relVel.Y < -0.08f && relVel.Y > -1.5f)   // slow backward creep only (auto-reverse range)
+                {
+                    float brakeHeld = Function.Call<float>(Hash.GET_CONTROL_NORMAL, 0, INPUT_VEH_BRAKE);
+                    bool grounded = true, inAir = false;
+                    try { grounded = Function.Call<bool>(Hash.IS_VEHICLE_ON_ALL_WHEELS, _vehicle); } catch { }
+                    try { inAir = Function.Call<bool>(Hash.IS_ENTITY_IN_AIR, _vehicle); } catch { }
+                    if (brakeHeld > 0.5f && grounded && !inAir)
+                        Function.Call(Hash.SET_VEHICLE_FORWARD_SPEED, _vehicle.Handle, 0f);
+                }
             }
 
             // === ENGINE FEEL (every frame) ===
@@ -746,7 +807,7 @@ namespace ExtendedLSC.ManualTransmission
             if (_updateCounter % 60 == 0)
             {
                 _cachedTopGear = VehicleMemory.GetTopGear(_vehicle);
-                ApplyNfsGearing(_vehicle);   // re-assert the gearing template (cheap) in case the game reset it
+                ReassertRatios();   // restore the EXACT applied ratios (never recompute — that re-compresses + slams RPM)
             }
             int now = Game.GameTime;
 
@@ -861,12 +922,21 @@ namespace ExtendedLSC.ManualTransmission
                 ExhaustFx tier = FxCatalog[(ActiveFxIndex >= 0 && ActiveFxIndex < FxCatalog.Length) ? ActiveFxIndex : 0];
                 NosLevel = Math.Max(0f, NosLevel - tier.Drain * dt);
                 mult *= tier.Power;
+                // OVERBOOST: punch THROUGH the rev limiter and the top-gear speed cap while spraying. Clearing
+                // the limiter cut keeps the engine making power (so line 889 won't zero it) and restoring the
+                // throttle lets RPM climb past the gear's ceiling — so boost keeps pulling instead of bouncing
+                // off the limiter / parking at the normal top speed.
+                _limiterCut = false;
+                VehicleMemory.SetThrottle(_vehicle, throttlePedal);
                 float dvN = tier.Shove * dt;
                 Function.Call(Hash.APPLY_FORCE_TO_ENTITY, _vehicle.Handle, 1,
                     0f, dvN, 0f, 0f, 0f, 0f, 0, true, true, true, false, true);
                 EmitExhaustFlames(_vehicle, NosFlameColor, ActiveFxIndex);   // selected catalog effect
-                // Boost whoosh + screen blur + its own flame — ALWAYS on while spraying, regardless of effect.
-                Function.Call((Hash)SET_VEHICLE_BOOST_ACTIVE_HASH, _vehicle.Handle, true);
+                // Boost whoosh + screen blur — fire ONCE on the spray's rising edge. Re-asserting it every frame
+                // retriggers the whoosh into a loud continuous roar; one pulse per spray is the quieter "turned down"
+                // version. NosBoostFx (INI) can disable it entirely.
+                if (NosBoostFx && !_nosWasActive)
+                    Function.Call((Hash)SET_VEHICLE_BOOST_ACTIVE_HASH, _vehicle.Handle, true);
             }
             else
             {
@@ -889,10 +959,16 @@ namespace ExtendedLSC.ManualTransmission
             HandleAutorun(now);
 
             // === AUTO-DOWNSHIFT AT STOP (every 30 frames) ===
+            // Only when GENUINELY PARKED ON THE GROUND. Forcing 1st gear while airborne or sliding (wheels off
+            // the road) slams the gearbox into a low ratio and freezes the car mid-air / mid-slide — so require
+            // the car to be on all wheels and not in the air, not just "slow".
             if (_updateCounter % 30 == 0 && _targetGear > 1)
             {
                 float speed = _vehicle.Speed;
-                if (speed < 0.5f)
+                bool grounded = true, inAir = false;
+                try { grounded = Function.Call<bool>(Hash.IS_VEHICLE_ON_ALL_WHEELS, _vehicle); } catch { }
+                try { inAir = Function.Call<bool>(Hash.IS_ENTITY_IN_AIR, _vehicle); } catch { }
+                if (speed < 0.5f && grounded && !inAir)
                 {
                     _targetGear = 1;
                     VehicleMemory.SetCurrentGear(_vehicle, _targetGear);
@@ -903,6 +979,49 @@ namespace ExtendedLSC.ManualTransmission
 
             // Reset counter to prevent overflow
             if (_updateCounter > 10000) _updateCounter = 0;
+        }
+
+        // NOS on an AUTOMATIC transmission. The MT path runs nitrous inside Update()'s torque pipeline; when MT is
+        // OFF the game's auto box drives, so Main calls THIS standalone path every tick instead — so nitrous works
+        // on the stock automatic too. Same controls/feel (spray button held + on the gas + moving), minus the MT-only
+        // overboost-through-the-rev-limiter trick. Boost is applied via SET_VEHICLE_CHEAT_POWER_INCREASE (re-asserted
+        // only while spraying, cleared on release) plus a forward shove.
+        private bool _nosWasActiveAuto = false;
+        public void UpdateNosAutomatic(Vehicle v)
+        {
+            if (v == null || !v.Exists()) { _nosWasActiveAuto = false; return; }
+            float dt = Game.LastFrameTime;
+            float throttlePedal = Function.Call<float>(Hash.GET_CONTROL_NORMAL, 0, INPUT_VEH_ACCELERATE);
+            float speedNow = v.Speed;
+            bool nosBtn = NosInstalled &&
+                          (Function.Call<bool>(Hash.IS_CONTROL_PRESSED, 0, ModSettings.NosButton) || Game.IsKeyPressed(ModSettings.NosKey));
+            NosActive = nosBtn && NosLevel > 0.02f && throttlePedal > 0.45f && speedNow > 1.5f;
+            if (NosActive)
+            {
+                Function.Call(Hash.DISABLE_CONTROL_ACTION, 0, 76, true);   // X = NOS on controller; suppress handbrake
+                ExhaustFx tier = FxCatalog[(ActiveFxIndex >= 0 && ActiveFxIndex < FxCatalog.Length) ? ActiveFxIndex : 0];
+                NosLevel = Math.Max(0f, NosLevel - tier.Drain * dt);
+                Function.Call((Hash)SET_VEHICLE_CHEAT_POWER_INCREASE_HASH, v.Handle, tier.Power);
+                float dvN = tier.Shove * dt;
+                Function.Call(Hash.APPLY_FORCE_TO_ENTITY, v.Handle, 1,
+                    0f, dvN, 0f, 0f, 0f, 0f, 0, true, true, true, false, true);
+                EmitExhaustFlames(v, NosFlameColor, ActiveFxIndex);
+                // Whoosh once on the rising edge (see MT path) instead of a sustained roar; NosBoostFx can disable it.
+                if (NosBoostFx && !_nosWasActiveAuto)
+                    Function.Call((Hash)SET_VEHICLE_BOOST_ACTIVE_HASH, v.Handle, true);
+            }
+            else
+            {
+                if (_nosWasActiveAuto)
+                {
+                    StopExhaustFlames();
+                    Function.Call((Hash)SET_VEHICLE_BOOST_ACTIVE_HASH, v.Handle, false);
+                    Function.Call((Hash)SET_VEHICLE_CHEAT_POWER_INCREASE_HASH, v.Handle, 1.0f);   // clear the boost
+                }
+                if (!nosBtn && NosLevel < 1f)
+                    NosLevel = Math.Min(1f, NosLevel + NosRefillPerSec * dt);
+            }
+            _nosWasActiveAuto = NosActive;
         }
 
         /// <summary>
@@ -962,6 +1081,26 @@ namespace ExtendedLSC.ManualTransmission
             }
         }
 
+        // Dyno hook: apply the autorun.txt gear delta the SAME way ApplyTuning's "+# gears" does —
+        // write the live per-instance top gear, then RefreshGears() to re-cache + re-space the ratios so
+        // the newly added gear gets a real ratio. This is the exact code path the in-game tune uses, so a
+        // runway dyno with gearDelta!=0 verifies the fix end-to-end.
+        private void ApplyDynoGears()
+        {
+            try
+            {
+                if (_dynoGearDelta == 0 || _vehicle == null || !_vehicle.Exists()) return;
+                int stock = VehicleMemory.GetTopGear(_vehicle);
+                int target = stock + _dynoGearDelta;
+                if (target < 1) target = 1;
+                if (target > 8) target = 8;
+                VehicleMemory.SetTopGear(_vehicle, target);
+                RefreshGears(stock);   // anchor spacing to the stock count -> added gears extend the range
+                Log?.Invoke($"[ELSC MT] AUTORUN gear delta {_dynoGearDelta}: {stock} -> {target} gears");
+            }
+            catch (Exception ex) { Log?.Invoke($"[ELSC MT] ApplyDynoGears error: {ex.Message}"); }
+        }
+
         private void HandleAutorun(int now)
         {
             try
@@ -987,8 +1126,9 @@ namespace ExtendedLSC.ManualTransmission
                         _runStartTime = now;
                         _csv = new System.Text.StringBuilder("ms,speed,rpm,gear,throttle,mult\n");
                         _dynoShiftRpm = 0.83f + (float)_dynoRng.NextDouble() * 0.14f;   // varied 1st->2nd point
+                        ApplyDynoGears();   // exercise the +gears fix at the identical launch point
                         DumpRatios();
-                        Log?.Invoke($"[ELSC MT] AUTORUN launch: {_stageSecs}s mode={_autorunMode}");
+                        Log?.Invoke($"[ELSC MT] AUTORUN launch: {_stageSecs}s mode={_autorunMode} gearDelta={_dynoGearDelta}");
                     }
                     return;
                 }
@@ -1003,6 +1143,8 @@ namespace ExtendedLSC.ManualTransmission
                     int secs = 8;
                     int.TryParse(parts[0], out secs);
                     _autorunMode = parts.Length > 1 ? parts[1].Trim() : "auto";
+                    _dynoGearDelta = 0;
+                    if (parts.Length > 2) int.TryParse(parts[2].Trim(), out _dynoGearDelta);
                     _stageSecs = Math.Max(1, secs);
 
                     // Load the runway start + end markers (once) for teleport-to-start and proximity auto-stop.
@@ -1061,7 +1203,9 @@ namespace ExtendedLSC.ManualTransmission
                     _runStartTime = now;
                     _csv = new System.Text.StringBuilder("ms,speed,rpm,gear,throttle,mult\n");
                     Function.Call(Hash.SET_VEHICLE_HANDBRAKE, _vehicle.Handle, false);
-                    Log?.Invoke($"[ELSC MT] AUTORUN start (no teleport): {secs}s mode={_autorunMode}");
+                    ApplyDynoGears();
+                    DumpRatios();
+                    Log?.Invoke($"[ELSC MT] AUTORUN start (no teleport): {secs}s mode={_autorunMode} gearDelta={_dynoGearDelta}");
                     return;
                 }
 

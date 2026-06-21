@@ -86,7 +86,15 @@ namespace ExtendedLSC.WindowTint
                     var ped = Game.Player.Character;
                     if (ped != null && ped.Exists())
                         foreach (var v in World.GetNearbyVehicles(ped.Position, 80f))
+                        {
+                            if (v == null || !v.Exists()) continue;
+                            // Skip cars whose model+plate is shared by ANOTHER live car (ambiguous identity — e.g. two
+                            // Menyoo spawns both plated "menyoo"). Applying a saved colour by plate would BLEED it onto
+                            // the duplicate (a fresh stock spawn inheriting the modified car's tint). The driven car is
+                            // always asserted above; per-car dedupe makes plates unique once a car is entered.
+                            if (PlateSharedByAnotherCar(v, v.DisplayName, PlateText(v))) continue;
                             AssertCar(v);
+                        }
                 }
             }
             catch { _disabled = true; }
@@ -252,6 +260,11 @@ namespace ExtendedLSC.WindowTint
 
         public int CurrentColor(Vehicle vehicle)
             => vehicle == null ? 0 : VehicleSaveData.GetCustomWindowColor(KeyFor(vehicle));
+
+        /// <summary>The last custom color chosen for this car (survives un-equip). Uses the SAME key as the
+        /// active color so callers don't have to reconstruct KeyFor (DisplayName + plate).</summary>
+        public int LastColor(Vehicle vehicle)
+            => vehicle == null ? 0 : VehicleSaveData.GetLastCustomWindowColor(KeyFor(vehicle));
 
         // ---- persistent slot assignment: each car keeps ONE slot for life; adding/removing others never
         //      reshuffles it. Stored in save data so it's stable across sessions too. ----

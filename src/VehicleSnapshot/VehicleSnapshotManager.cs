@@ -93,11 +93,29 @@ namespace ExtendedLSC.VehicleSnapshot
                 var ped = Game.Player.Character;
                 if (ped == null || !ped.Exists()) return;
 
-                foreach (var v in World.GetNearbyVehicles(ped.Position, 80f))
+                var nearby = World.GetNearbyVehicles(ped.Position, 80f);
+
+                // Count how many live cars share each identity. We must NOT apply a saved snapshot to an AMBIGUOUS
+                // duplicate (e.g. several Menyoo cars all plated "MENYOO") — that overwrites them all with one car's
+                // look. Skipped duplicates are left un-restored so they apply correctly once the plate dedup makes
+                // them unique.
+                var keyCount = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                foreach (var v in nearby)
+                {
+                    if (v == null || !v.Exists()) continue;
+                    string k = Key(v);
+                    if (k == null) continue;
+                    keyCount[k] = keyCount.TryGetValue(k, out int c) ? c + 1 : 1;
+                }
+
+                foreach (var v in nearby)
                 {
                     if (v == null || !v.Exists() || _restored.Contains(v.Handle)) continue;
                     string key = Key(v);
-                    if (key != null && _snaps.TryGetValue(key, out var snap))
+                    if (key == null) continue;
+                    if (keyCount.TryGetValue(key, out int cnt) && cnt > 1) continue;   // ambiguous duplicate -> skip
+
+                    if (_snaps.TryGetValue(key, out var snap))
                     {
                         snap.Apply(v);
                         Log?.Invoke($"[Snapshot] restored {key}");
