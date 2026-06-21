@@ -92,7 +92,7 @@ namespace ExtendedLSC.WindowTint
                             // spawner-spawned cars sharing one placeholder plate). Applying a saved colour by plate would BLEED it onto
                             // the duplicate (a fresh stock spawn inheriting the modified car's tint). The driven car is
                             // always asserted above; per-car dedupe makes plates unique once a car is entered.
-                            if (PlateSharedByAnotherCar(v, v.DisplayName, PlateText(v))) continue;
+                            if (PlateSharedByAnotherCar(v, VehNameCache.Of(v), PlateText(v))) continue;
                             AssertCar(v);
                         }
                 }
@@ -108,7 +108,7 @@ namespace ExtendedLSC.WindowTint
         {
             string plate = "";
             try { plate = (Function.Call<string>(Hash.GET_VEHICLE_NUMBER_PLATE_TEXT, v) ?? "").Trim(); } catch { }
-            return v.DisplayName + "|" + plate;
+            return VehNameCache.Of(v) + "|" + plate;
         }
 
         /// <summary>Ensure a vehicle that has a saved custom color is on its slot, with the slot holding it.</summary>
@@ -168,7 +168,7 @@ namespace ExtendedLSC.WindowTint
         {
             try
             {
-                string model = vehicle.DisplayName;
+                string model = VehNameCache.Of(vehicle);
                 string plate = PlateText(vehicle);
                 if (!PlateSharedByAnotherCar(vehicle, model, plate)) return;
 
@@ -192,7 +192,7 @@ namespace ExtendedLSC.WindowTint
             foreach (var v in World.GetAllVehicles())
             {
                 if (v == null || !v.Exists() || v.Handle == self.Handle) continue;
-                if (v.DisplayName == model && string.Equals(PlateText(v), plate, StringComparison.OrdinalIgnoreCase))
+                if (VehNameCache.Of(v) == model && string.Equals(PlateText(v), plate, StringComparison.OrdinalIgnoreCase))
                     return true;
             }
             return false;

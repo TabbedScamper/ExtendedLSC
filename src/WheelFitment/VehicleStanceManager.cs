@@ -55,6 +55,7 @@ namespace ExtendedLSC.WheelFitment
         private readonly Dictionary<int, WheelFitment> _active = new Dictionary<int, WheelFitment>(); // handle -> fitment
         private readonly Dictionary<int, int> _activeId = new Dictionary<int, int>();                  // handle -> stance id
         private readonly List<StanceRecord> _records = new List<StanceRecord>();
+        private readonly List<int> _activeScratch = new List<int>();   // reused each frame to iterate _active without allocating
         private int _nextId = 1;
         private int _lastScan = -100000;
         private bool _decorReady = false;
@@ -100,7 +101,11 @@ namespace ExtendedLSC.WheelFitment
                 if (_active.Count > 0)
                 {
                     Vector3 ppos = Game.Player.Character.Position;
-                    foreach (int handle in _active.Keys.ToList())
+                    // Snapshot the keys into a REUSED list (no per-frame allocation) so Detach() can mutate _active
+                    // while we iterate.
+                    _activeScratch.Clear();
+                    foreach (int k in _active.Keys) _activeScratch.Add(k);
+                    foreach (int handle in _activeScratch)
                     {
                         var fit = _active[handle];
                         Vehicle v = fit?.Vehicle;

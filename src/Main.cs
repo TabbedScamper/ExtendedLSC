@@ -3473,8 +3473,28 @@ namespace ExtendedLSC
 
         #region Core Loop
 
+        // Per-frame cache of the player's current vehicle. Several OnTick consumers (nos preview, window tint,
+        // snapshot) each re-fetched Game.Player.Character?.CurrentVehicle — every one is a PLAYER_PED_ID +
+        // GET_VEHICLE_PED_IS_IN native pair. Resolve it ONCE per frame and reuse.
+        private Vehicle _pfVeh;
+        private bool _pfVehResolved;
+        private Vehicle PlayerVehicle()
+        {
+            if (!_pfVehResolved)
+            {
+                var ped = Game.Player.Character;
+                _pfVeh = (ped != null && ped.Exists()) ? ped.CurrentVehicle : null;   // null when on foot (same as ?.CurrentVehicle)
+                _pfVehResolved = true;
+            }
+            return _pfVeh;
+        }
+
         private void OnTick(object sender, EventArgs e)
         {
+            // Invalidate the per-frame caches once at the top of the frame (model cache + current-vehicle cache).
+            VehNameCache.NewFrame();
+            _pfVehResolved = false;
+
             // Publish live menu state so the bridge (Claude) can read which menu/item is focused
             // in real time and navigate reliably instead of blind key-counting. Throttled internally.
             DumpMenuState();
@@ -3536,7 +3556,7 @@ namespace ExtendedLSC
             {
                 try
                 {
-                    var pv = Game.Player.Character?.CurrentVehicle;
+                    var pv = PlayerVehicle();
                     bool held = Game.IsKeyPressed(ModSettings.NosKey)
                              || Function.Call<bool>(Hash.IS_CONTROL_PRESSED, 0, ModSettings.NosButton)
                              || Function.Call<bool>(Hash.IS_DISABLED_CONTROL_PRESSED, 0, ModSettings.NosButton)
@@ -3574,7 +3594,7 @@ namespace ExtendedLSC
             DedupeWorldPlates();
 
             // Custom window color: advance the one-time table scan, and re-assert the driven car's color.
-            try { windowTint.Tick(Game.Player.Character?.CurrentVehicle); } catch { }
+            try { windowTint.Tick(PlayerVehicle()); } catch { }
 
             // Full vehicle snapshot: restore saved cars (sweep), and capture the current car when the player
             // finishes customizing (the whole ELSC menu tree just closed).
@@ -3584,7 +3604,7 @@ namespace ExtendedLSC
                 bool elscOpen = menuPool.AreAnyVisible;
                 if (_snapMenuWasOpen && !elscOpen)
                 {
-                    var cv = Game.Player.Character?.CurrentVehicle;
+                    var cv = PlayerVehicle();
                     if (cv != null && cv.Exists()) vehicleSnapshots.CaptureCurrent(cv);
                 }
                 _snapMenuWasOpen = elscOpen;

@@ -39,7 +39,7 @@ namespace ExtendedLSC.VehicleSnapshot
             if (v == null || !v.Exists()) return null;
             string plate = "";
             try { plate = (Function.Call<string>(Hash.GET_VEHICLE_NUMBER_PLATE_TEXT, v) ?? "").Trim(); } catch { }
-            return (v.DisplayName + "|" + plate).ToLowerInvariant();
+            return (VehNameCache.Of(v) + "|" + plate).ToLowerInvariant();
         }
 
         private void Load()

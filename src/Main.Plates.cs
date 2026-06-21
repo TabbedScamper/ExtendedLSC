@@ -41,7 +41,7 @@ namespace ExtendedLSC
             try { plate = (Function.Call<string>(Hash.GET_VEHICLE_NUMBER_PLATE_TEXT, v) ?? "").Trim().ToUpperInvariant(); }
             catch (Exception ex) { Log($"[VehicleKey] plate read failed: {ex.Message}"); plate = ""; }
             if (string.IsNullOrEmpty(plate)) plate = "NOPLATE";
-            return v.DisplayName + "|" + plate;
+            return VehNameCache.Of(v) + "|" + plate;
         }
 
         /// <summary>An 8-char plate ("EL" + 6 random digits) not used by any spawned vehicle nor any active claim.</summary>
@@ -249,7 +249,7 @@ namespace ExtendedLSC
         {
             if (currentVehicle == null || !currentVehicle.Exists()) return;
 
-            string model = currentVehicle.DisplayName;
+            string model = VehNameCache.Of(currentVehicle);
             // VehicleKey-style keys: empty plate -> "NOPLATE" so they line up with what VehicleKey() produces.
             string oldUp = (oldPlate ?? "").Trim().ToUpperInvariant(); if (string.IsNullOrEmpty(oldUp)) oldUp = "NOPLATE";
             string newUp = (text ?? "").Trim().ToUpperInvariant();     if (string.IsNullOrEmpty(newUp)) newUp = "NOPLATE";

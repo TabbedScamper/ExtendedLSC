@@ -69,12 +69,49 @@ categories for engines, handlebars, brakes, and more. It's the proof of what ELS
 See **[INSTALL.md](INSTALL.md)** for full steps. Quick version:
 
 1. Install **ScriptHookV** + **ScriptHookVDotNet 3** (.NET Framework 4.8).
-2. Copy into your GTA V `scripts\` folder:
-   - `ExtendedLSC.dll`, `LemonUI.SHVDN3.dll`, `Newtonsoft.Json.dll` (from `bin/Release/net48/`).
-3. Launch story mode, get in a vehicle, press **F5**.
+2. Copy into your GTA V `scripts\` folder — **if you don't have a `scripts` folder, create one** next to
+   `GTA5.exe` (same folder as `ScriptHookV.dll`):
+   - `ExtendedLSC.dll`, `LemonUI.SHVDN3.dll`, `Newtonsoft.Json.dll`, `NAudio.dll` (from `bin/Release/net48/`).
+3. Launch story mode, get in a vehicle, press **F5** (or the menu opens automatically at a Los Santos Customs).
+
+### ✅ Tested / required versions
+
+ELSC was built and verified on:
+
+| Component | Version |
+|---|---|
+| **GTA V (Legacy)** | build **1.0.3788.0** (v3788) |
+| **ScriptHookV** | the build for **v3788** (Apr 2026) |
+| **ScriptHookVDotNet 3** | **NIGHTLY `v3.7.0.167`** (API 3.7.0) — ⚠️ the stable **3.6.0** release was *not* enough; use the nightly |
+
+> Get the SHVDN nightly from the [ScriptHookVDotNet releases/nightly page](https://github.com/scripthookvdotnet/scripthookvdotnet/releases).
+> If ELSC doesn't load, a too-old SHVDN is the most common cause.
 
 > **Antivirus note:** like all SHVDN memory-editing mods, ELSC may trip a false-positive. It is
 > single-player only and makes **no network connections**. See [SECURITY.md](SECURITY.md).
+
+---
+
+## 📝 Changelog
+
+### v1.1 — Performance pass
+Focused on cutting ExtendedLSC's per-frame overhead (helps most on lower-end CPUs). These are pure
+script-side optimizations — they work identically on **Legacy and Enhanced** (no edition-specific code changed):
+
+- **Removed redundant per-frame work** building the mod's internal per-vehicle save-tags (plates, window
+  tint, snapshots):
+  - the vehicle **display-name** lookup (the heaviest) is now resolved **once and cached** — eliminated
+    from the per-frame path;
+  - the vehicle **model** lookup is cached per frame (**~70% fewer** of those calls).
+- **Removed a per-frame memory allocation** in the stance system (a garbage-collection / micro-stutter source).
+- **The player's current vehicle is resolved once per frame** instead of several times.
+- Net: ~10 fewer engine calls per frame in typical play.
+
+> If you still hit frame drops on 1.1, please report it — there's a small read-only capture tool that can
+> measure exactly what's happening on your machine so the cause can be pinned down precisely.
+
+### v1.0
+Initial release.
 
 ---
 
