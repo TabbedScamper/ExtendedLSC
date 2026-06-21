@@ -1,10 +1,10 @@
-# VStancer.asi Complete Analysis
+# Wheel Fitment — Memory Analysis (historical RE notes)
 
-## How VStancer Works (Reverse Engineered)
+## How a pattern-scanning fitment ASI Works (Reverse Engineered)
 
 ### 1. Core Architecture
 
-VStancer is a **native C++ ASI plugin** that:
+the reference fitment mod is a **native C++ ASI plugin** that:
 - Loads via ScriptHookV's ASI loader
 - Uses `getScriptHandleBaseAddress()` to get vehicle memory addresses
 - Pattern scans game memory to find offsets dynamically
@@ -23,7 +23,7 @@ getGameVersion              // Detect game version for compatibility
 
 ### 3. Pattern Scanning
 
-VStancer finds memory offsets by searching for byte patterns:
+the reference fitment mod finds memory offsets by searching for byte patterns:
 
 **Wheels Pointer Offset:**
 ```
@@ -49,7 +49,7 @@ Pattern: F3 44 0F 10 ?? ?? ?? 00 00
 Mask:    xx????xx
 ```
 
-### 4. What VStancer Modifies
+### 4. What the reference fitment mod Modifies
 
 **Suspension Properties (per wheel):**
 - FrontCamber / RearCamber - wheel tilt angle
@@ -70,7 +70,7 @@ Mask:    xx????xx
 
 ### 5. Memory Write Technique
 
-VStancer uses **SSE float instructions** to write values:
+the reference fitment mod uses **SSE float instructions** to write values:
 - `MOVSS` (F3 0F 11) - Store single-precision float
 - `MOVSS` (F3 0F 10) - Load single-precision float
 
@@ -97,7 +97,7 @@ FrontRimRadius = 0.224500
 
 ### 7. Why .NET/SHVDN Can't Do This
 
-| VStancer (C++) | SHVDN (.NET) |
+| the reference fitment mod (C++) | SHVDN (.NET) |
 |----------------|--------------|
 | Direct pointer arithmetic | Marshal.ReadInt32 (slow, unsafe) |
 | Native SSE instructions | No SSE access |
@@ -156,7 +156,7 @@ float* suspComp = (float*)(wheel0 + suspensionOffset);
 
 ### 10. Decompilation Findings (Ghidra Analysis)
 
-From analyzing the decompiled VStancer.asi (500 functions, 36,000+ lines):
+From analyzing the decompiled the fitment ASI (500 functions, 36,000+ lines):
 
 **Native Function Calls Identified:**
 - `0x1d132d614dd86811` - Entity/Player related
@@ -169,7 +169,7 @@ From analyzing the decompiled VStancer.asi (500 functions, 36,000+ lines):
 - `0xfe99b66d079cf6bc` - DISABLE_CONTROL_ACTION
 
 **Version Detection:**
-VStancer contains version strings for compatibility:
+the reference fitment mod contains version strings for compatibility:
 - v1_0_335_2, v1_0_350_2, v1_0_372_2, v1_0_393_2
 - v1_0_463_1, v1_0_505_2, v1_0_573_1, v1_0_617_1
 - v1_0_678_1, v1_0_757_2, v1_0_791_2, v1_0_877_1
@@ -211,30 +211,30 @@ Identifiers = 1_0,1_1,1_2   ; Per-mod overrides
 
 Since .NET cannot safely access wheel memory, here are viable integration approaches:
 
-#### Option A: VStancer INI Integration (Recommended)
-1. Detect if VStancer.asi is installed
-2. Read/write VStancer's INI config files
-3. Let VStancer apply the actual modifications
-4. Pros: No crashes, works with existing VStancer
-5. Cons: Requires VStancer installed
+#### Option A: the reference fitment mod INI Integration (Recommended)
+1. Detect if the fitment ASI is installed
+2. Read/write the reference fitment mod's INI config files
+3. Let the reference fitment mod apply the actual modifications
+4. Pros: No crashes, works with existing the reference fitment mod
+5. Cons: Requires the reference fitment mod installed
 
 ```csharp
-// Example: Write VStancer config
+// Example: Write the reference fitment mod config
 string configPath = Path.Combine(
-    "scripts", "VStancer", "Configs",
+    "scripts", "the reference fitment mod", "Configs",
     $"{vehicleModel}.ini");
 
 var ini = new IniFile(configPath);
 ini.Write("Suspension", "FrontCamber", camberValue.ToString());
 ini.Write("Suspension", "FrontTrackWidth", trackWidth.ToString());
-// VStancer will pick up changes on next interval (5000ms default)
+// the reference fitment mod will pick up changes on next interval (5000ms default)
 ```
 
 #### Option B: Native C++ ASI Companion
 1. Create a small C++ ASI that exposes wheel modification functions
 2. SHVDN calls the ASI via shared memory or named pipe
 3. ASI does the actual memory writes safely
-4. Pros: Full control, no VStancer dependency
+4. Pros: Full control, no the reference fitment mod dependency
 5. Cons: Requires C++ development
 
 #### Option C: Handling Data Only (Limited)
@@ -247,20 +247,20 @@ vehicle.HandlingData.CamberStiffness = value;
 
 ### 12. Conclusion
 
-VStancer works because:
+the reference fitment mod works because:
 1. Native C++ has unrestricted memory access
 2. Pattern scanning finds correct offsets for any game version
 3. Direct float writes via SSE are fast and reliable
 4. ScriptHookV provides the bridge to game internals
 
-**For ExtendedLSC, the recommended approach is Option A (VStancer INI Integration):**
+**For ExtendedLSC, the recommended approach is Option A (the reference fitment mod INI Integration):**
 - No crashes
 - Leverages existing, well-tested code
-- Users likely already have VStancer installed
+- Users likely already have the reference fitment mod installed
 - Full feature compatibility
 
 The wheel fitment code in ExtendedLSC should be refactored to:
-1. Check if VStancer is installed
-2. If yes: Read/write VStancer INI files for the current vehicle
-3. If no: Display message that VStancer is required for wheel fitment
+1. Check if the reference fitment mod is installed
+2. If yes: Read/write the reference fitment mod INI files for the current vehicle
+3. If no: Display message that the reference fitment mod is required for wheel fitment
 4. Remove all direct memory access code

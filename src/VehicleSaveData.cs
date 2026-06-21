@@ -77,7 +77,7 @@ namespace ExtendedLSC
             // Display name of the package last applied to this car (null = none) — drives the "equipped" marker.
             public string EquippedPackage { get; set; } = null;
 
-            // Speedometer is PER-CAR: which style is equipped on THIS vehicle (0 = Off, 1 = Simple, 2 = Nfsu).
+            // Speedometer is PER-CAR: which style is equipped on THIS vehicle (0 = Off, 1 = Simple, 2 = Arcade).
             // The look/colours/units are global (Speedo config); only the on/off + style is per-car.
             public int SpeedoStyle { get; set; } = 0;
         }
@@ -281,7 +281,7 @@ namespace ExtendedLSC
             _isDirty = true;
         }
 
-        /// <summary>Speedometer style equipped on THIS vehicle (0 = Off, 1 = Simple, 2 = Nfsu).</summary>
+        /// <summary>Speedometer style equipped on THIS vehicle (0 = Off, 1 = Simple, 2 = Arcade).</summary>
         public static int GetSpeedoStyle(string vehicleName)
         {
             if (_saveData == null) Load();

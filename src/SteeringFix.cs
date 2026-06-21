@@ -1,18 +1,19 @@
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using ExtendedLSC.WheelFitment;
 
 namespace ExtendedLSC
 {
     /// <summary>
-    /// Disables GTA V's native steering auto-center so a parked / just-exited vehicle keeps its front wheels
-    /// turned instead of snapping back to center (the "tires rotate back when leaving the vehicle" bug). This is
-    /// a global EXE NOP patch on the two Legacy auto-center stores — the same technique used by Nochala's
-    /// "Proper Steering Fix" .asi (https://www.gta5-mods.com/scripts/proper-steering-fix).
-    ///
-    /// Legacy (b3xxx) signatures only. Fails gracefully (logs + returns false) if the signatures don't match the
-    /// running build — in that case ELSC's per-frame <c>SteeringAngle</c> re-assert still holds the wheels of the
-    /// car the player configured in the menu, just not every other vehicle globally.
+    /// Disables GTA V's native steering auto-center so a parked / just-exited vehicle keeps its front wheels turned
+    /// instead of snapping back to center. Global EXE NOP patch on the auto-center store instructions (located by
+    /// byte-signature scan), restored on unload. Works on BOTH editions — the signatures differ:
+    ///   Legacy (b3788): two stores (mov [rbx+disp32],r15d / mov [rdx+disp32],eax).
+    ///   Enhanced (b1013+): two `mov dword [rsi+0x9DC], 0` stores (the steering field zeroed = centered), located via
+    ///     "moving" + "stationary" auto-center locator patterns and NOP'd at a fixed offset from each.
+    /// (Enhanced patterns/offsets from the open-source Nochala/Proper-Steering-Fix, verified live on b1013.)
+    /// Fails gracefully if signatures don't match — the per-frame SteeringAngle re-assert still holds the player's car.
     /// </summary>
     public static class SteeringFix
     {
@@ -27,18 +28,27 @@ namespace ExtendedLSC
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool VirtualProtect(IntPtr addr, UIntPtr size, uint flNewProtect, out uint old);
 
-        // Legacy auto-center stores (from Proper Steering Fix). Each store writes the recentered steering value;
-        // NOP-ing them leaves the wheels at their last angle. Bytes NOP'd = the store instruction length.
+        // Legacy (b3788) auto-center store instructions — NOP the whole store.
         private const string LEG_SIG_1 = "44 89 BB ?? ?? ?? ?? 8B 0D"; // mov [rbx+disp32], r15d  -> NOP 7 bytes
         private const string LEG_SIG_2 = "89 82 ?? ?? ?? ?? 38 81";     // mov [rdx+disp32], eax   -> NOP 6 bytes
 
-        private static IntPtr _site1, _site2;
-        private static byte[] _orig1, _orig2;
+        // Enhanced (b1013+) locator patterns. The actual `mov dword [rsi+0x9DC], 0` store (10 bytes) sits at a fixed
+        // offset from each locator: MOVING -> hit-10, STATIONARY -> hit+24. NOP 10 bytes at each.
+        private const string ENH_SIG_MOVING     = "31 C0 80 B9 ?? ?? ?? ?? ?? 0F 94 C0 48 8D 15 ?? ?? ?? ?? F3 0F 10 04 82";
+        private const string ENH_SIG_STATIONARY = "83 F8 ?? 0F 84 ?? ?? ?? ?? 8B 87 ?? ?? ?? ?? 83 E0 ?? 0F 85";
 
-        /// <summary>Scan + NOP the auto-center stores. Idempotent. Returns true if the patch is in place.</summary>
+        // Each applied patch: where we NOP'd + the original bytes (for restore).
+        private static readonly List<(IntPtr site, byte[] orig)> _patches = new List<(IntPtr, byte[])>();
+
+        /// <summary>Scan + NOP the auto-center stores for the running edition. Idempotent. True if the patch is in place.</summary>
         public static bool Apply()
         {
             if (Applied) return true;
+            if (!GamePlatform.SteeringFixSupported)
+            {
+                Log?.Invoke($"[SteeringFix] {GamePlatform.EditionName}: auto-center patch unsupported — skipped (per-car re-assert still on)");
+                return false;
+            }
             try
             {
                 if (!PatternScanner.Initialize())
@@ -47,18 +57,21 @@ namespace ExtendedLSC
                     return false;
                 }
 
-                _site1 = PatternScanner.FindPattern(LEG_SIG_1);
-                _site2 = PatternScanner.FindPattern(LEG_SIG_2);
-                if (_site1 == IntPtr.Zero || _site2 == IntPtr.Zero)
+                bool ok = GamePlatform.IsEnhanced
+                    ? FindAndNop(ENH_SIG_MOVING, -10, 10, "Enhanced moving") &&
+                      FindAndNop(ENH_SIG_STATIONARY, +24, 10, "Enhanced stationary")
+                    : FindAndNop(LEG_SIG_1, 0, 7, "Legacy #1") &&
+                      FindAndNop(LEG_SIG_2, 0, 6, "Legacy #2");
+
+                if (!ok)
                 {
-                    Log?.Invoke($"[SteeringFix] Legacy steering signatures not found (s1=0x{_site1.ToInt64():X} s2=0x{_site2.ToInt64():X}) — global auto-center fix skipped (per-car re-assert still active)");
+                    Restore();   // undo any partial patch so we never leave the EXE half-patched
+                    Log?.Invoke($"[SteeringFix] {GamePlatform.EditionName} signatures not found — global auto-center fix skipped (per-car re-assert still active)");
                     return false;
                 }
 
-                _orig1 = Nop(_site1, 7);
-                _orig2 = Nop(_site2, 6);
                 Applied = true;
-                Log?.Invoke($"[SteeringFix] steering auto-center patched @ 0x{_site1.ToInt64():X} (7) + 0x{_site2.ToInt64():X} (6)");
+                Log?.Invoke($"[SteeringFix] steering auto-center patched ({GamePlatform.EditionName}, {_patches.Count} sites)");
                 return true;
             }
             catch (Exception ex)
@@ -68,28 +81,32 @@ namespace ExtendedLSC
             }
         }
 
+        /// <summary>Find a signature, then NOP <paramref name="nopCount"/> bytes at (hit + offset). Returns false if not found.</summary>
+        private static bool FindAndNop(string signature, int offsetFromHit, int nopCount, string label)
+        {
+            IntPtr hit = PatternScanner.FindPattern(signature);
+            if (hit == IntPtr.Zero) { Log?.Invoke($"[SteeringFix] {label} pattern not found"); return false; }
+            IntPtr site = hit + offsetFromHit;
+            byte[] orig = new byte[nopCount];
+            ReadProcessMemory(GetCurrentProcess(), site, orig, nopCount, out _);
+            byte[] nops = new byte[nopCount];
+            for (int i = 0; i < nopCount; i++) nops[i] = 0x90;
+            Write(site, nops);
+            _patches.Add((site, orig));
+            return true;
+        }
+
         /// <summary>Restore the original bytes (called on script unload so we don't leave the EXE patched).</summary>
         public static void Restore()
         {
-            if (!Applied) return;
             try
             {
-                if (_orig1 != null) Write(_site1, _orig1);
-                if (_orig2 != null) Write(_site2, _orig2);
-                Log?.Invoke("[SteeringFix] steering auto-center restored");
+                foreach (var p in _patches)
+                    if (p.orig != null) Write(p.site, p.orig);
             }
             catch { }
+            _patches.Clear();
             Applied = false;
-        }
-
-        private static byte[] Nop(IntPtr site, int count)
-        {
-            byte[] orig = new byte[count];
-            ReadProcessMemory(GetCurrentProcess(), site, orig, count, out _);
-            byte[] nops = new byte[count];
-            for (int i = 0; i < count; i++) nops[i] = 0x90;
-            Write(site, nops);
-            return orig;
         }
 
         private static void Write(IntPtr site, byte[] bytes)

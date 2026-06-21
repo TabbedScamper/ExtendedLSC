@@ -65,7 +65,7 @@ namespace ExtendedLSC
 
         // Speedometer skins (bought once, global)
         public static readonly int SpeedoLeFixPrice = 4500;
-        public static readonly int SpeedoNfsuPrice = 6500;
+        public static readonly int SpeedoArcadePrice = 6500;
 
         // Service prices
         public static readonly int RepairPrice = 200;

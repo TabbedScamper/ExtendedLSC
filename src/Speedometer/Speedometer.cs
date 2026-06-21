@@ -10,7 +10,7 @@ using LemonUI.Elements;
 
 namespace ExtendedLSC
 {
-    public enum SpeedoStyle { Off, Simple, Nfsu }
+    public enum SpeedoStyle { Off, Simple, Arcade }
 
     /// <summary>Telemetry for the built-in HUDs (from MT when active, else natives).</summary>
     public struct SpeedoFrame
@@ -56,9 +56,22 @@ namespace ExtendedLSC
             public int Circle1Alpha = 205;                             // big dial colour brightness
             public int Circle2Alpha = 205;                             // small dial colour brightness
         }
-        public static readonly Palette PalSimple = new Palette();
-        public static readonly Palette PalNfsu = new Palette { Accent = Color.FromArgb(255, 80, 210, 255) };
-        public static Palette ColorsFor(SpeedoStyle s) => s == SpeedoStyle.Nfsu ? PalNfsu : PalSimple;
+        // Shipping default colours (owner-styled). A fresh install (no speedo.json) uses these.
+        public static readonly Palette PalSimple = new Palette
+        {
+            Accent = Color.FromArgb(-1), Speed = Color.FromArgb(-1), Unit = Color.FromArgb(-1), Gear = Color.FromArgb(-1),
+            Nos = Color.FromArgb(-14124801), Redline = Color.FromArgb(-1360836),
+            Circle1 = Color.FromArgb(-15461356), Circle2 = Color.FromArgb(-14802390),
+            Circle1Alpha = 205, Circle2Alpha = 205
+        };
+        public static readonly Palette PalArcade = new Palette
+        {
+            Accent = Color.FromArgb(-1), Speed = Color.FromArgb(-1), Unit = Color.FromArgb(-3618616), Gear = Color.FromArgb(-1),
+            Nos = Color.FromArgb(-14124801), Redline = Color.FromArgb(-1360836),
+            Circle1 = Color.FromArgb(-15461356), Circle2 = Color.FromArgb(-15461356),
+            Circle1Alpha = 204, Circle2Alpha = 205
+        };
+        public static Palette ColorsFor(SpeedoStyle s) => s == SpeedoStyle.Arcade ? PalArcade : PalSimple;
 
         public static readonly HashSet<SpeedoStyle> Owned = new HashSet<SpeedoStyle> { SpeedoStyle.Off, SpeedoStyle.Simple };
         public static bool IsFree(SpeedoStyle s) => s == SpeedoStyle.Off || s == SpeedoStyle.Simple;
@@ -84,7 +97,7 @@ namespace ExtendedLSC
             {
                 case SpeedoStyle.Off: return "Off";
                 case SpeedoStyle.Simple: return "Simple";
-                case SpeedoStyle.Nfsu: return "FASTandSPEEDY";
+                case SpeedoStyle.Arcade: return "FASTandSPEEDY";
                 default: return s.ToString();
             }
         }
@@ -127,7 +140,11 @@ namespace ExtendedLSC
             public float Scale = 1.0f;
             public float OffX = 0f, OffY = 0f;
             public PalBlob Simple = null;   // null in old configs -> migrate from the legacy flat fields below
-            public PalBlob Nfsu = null;
+            public PalBlob Arcade = null;
+            // Legacy alias: configs saved before the style was renamed stored the Arcade palette under "Nfsu".
+            // Read it into Arcade on load; never written back (getter returns null, ignored on serialize).
+            [Newtonsoft.Json.JsonProperty("Nfsu", NullValueHandling = Newtonsoft.Json.NullValueHandling.Ignore)]
+            public PalBlob LegacyArcade { get { return null; } set { if (value != null) Arcade = value; } }
             // Legacy single-palette fields (read-only migration for configs saved before per-style colors).
             public int AccentArgb = 0, SpeedArgb = 0, UnitArgb = 0, GearArgb = 0, NosArgb = 0, RedlineArgb = 0,
                        Circle1Argb = 0, Circle2Argb = 0, Circle1Alpha = 205, Circle2Alpha = 205;
@@ -141,14 +158,14 @@ namespace ExtendedLSC
                 if (_saveFile == null || !File.Exists(_saveFile)) return;
                 var b = Newtonsoft.Json.JsonConvert.DeserializeObject<SaveBlob>(File.ReadAllText(_saveFile));
                 if (b == null) return;
-                if (Enum.TryParse(b.Active, out SpeedoStyle a)) Active = a;
+                if (Enum.TryParse(NormStyle(b.Active), out SpeedoStyle a)) Active = a;
                 Mph = b.Mph; Scale = b.Scale; OffX = b.OffX; OffY = b.OffY;
                 if (b.Simple != null) b.Simple.Into(PalSimple);
-                if (b.Nfsu != null) b.Nfsu.Into(PalNfsu);
+                if (b.Arcade != null) b.Arcade.Into(PalArcade);
                 // Migrate a pre-per-style config (no nested palettes): copy the one saved palette into BOTH.
-                if (b.Simple == null && b.Nfsu == null && b.AccentArgb != 0)
+                if (b.Simple == null && b.Arcade == null && b.AccentArgb != 0)
                 {
-                    foreach (var p in new[] { PalSimple, PalNfsu })
+                    foreach (var p in new[] { PalSimple, PalArcade })
                     {
                         p.Accent = Color.FromArgb(b.AccentArgb); p.Speed = Color.FromArgb(b.SpeedArgb);
                         p.Unit = Color.FromArgb(b.UnitArgb); p.Gear = Color.FromArgb(b.GearArgb);
@@ -157,10 +174,15 @@ namespace ExtendedLSC
                         p.Circle1Alpha = b.Circle1Alpha; p.Circle2Alpha = b.Circle2Alpha;
                     }
                 }
-                foreach (var s in b.Owned) if (Enum.TryParse(s, out SpeedoStyle os)) Owned.Add(os);
+                foreach (var s in b.Owned) if (Enum.TryParse(NormStyle(s), out SpeedoStyle os)) Owned.Add(os);
             }
             catch (Exception ex) { Log?.Invoke($"[Speedo] load error: {ex.Message}"); }
         }
+
+        /// <summary>Map a style token from an older saved config onto the current enum name (the "Arcade" style was
+        /// previously stored under a different name). Pass-through for everything else.</summary>
+        private static string NormStyle(string s) =>
+            string.Equals(s, "Nfsu", StringComparison.OrdinalIgnoreCase) ? "Arcade" : s;
 
         public static void SaveConfig()
         {
@@ -170,7 +192,7 @@ namespace ExtendedLSC
                 var b = new SaveBlob
                 {
                     Active = Active.ToString(), Mph = Mph, Scale = Scale, OffX = OffX, OffY = OffY,
-                    Simple = new PalBlob(PalSimple), Nfsu = new PalBlob(PalNfsu),
+                    Simple = new PalBlob(PalSimple), Arcade = new PalBlob(PalArcade),
                     Owned = new List<string>()
                 };
                 foreach (var s in Owned) b.Owned.Add(s.ToString());
@@ -188,7 +210,7 @@ namespace ExtendedLSC
                 var b = new SaveBlob
                 {
                     Active = Active.ToString(), Mph = Mph, Scale = Scale, OffX = OffX, OffY = OffY,
-                    Simple = new PalBlob(PalSimple), Nfsu = new PalBlob(PalNfsu), Owned = new List<string>()
+                    Simple = new PalBlob(PalSimple), Arcade = new PalBlob(PalArcade), Owned = new List<string>()
                 };
                 foreach (var s in Owned) b.Owned.Add(s.ToString());
                 return Newtonsoft.Json.JsonConvert.SerializeObject(b);
@@ -207,8 +229,8 @@ namespace ExtendedLSC
                 if (b == null) return;
                 Mph = b.Mph; Scale = b.Scale; OffX = b.OffX; OffY = b.OffY;
                 if (b.Simple != null) b.Simple.Into(PalSimple);
-                if (b.Nfsu != null) b.Nfsu.Into(PalNfsu);
-                if (Enum.TryParse(b.Active, out SpeedoStyle a) && IsOwned(a)) Active = a;
+                if (b.Arcade != null) b.Arcade.Into(PalArcade);
+                if (Enum.TryParse(NormStyle(b.Active), out SpeedoStyle a) && IsOwned(a)) Active = a;
                 if (persist) SaveConfig();   // in-memory only (persist=false) for a live hover preview
             }
             catch (Exception ex) { Log?.Invoke($"[Speedo] import error: {ex.Message}"); }
@@ -222,7 +244,7 @@ namespace ExtendedLSC
             {
                 if (string.IsNullOrEmpty(json)) return null;
                 var b = Newtonsoft.Json.JsonConvert.DeserializeObject<SaveBlob>(json);
-                if (b != null && Enum.TryParse(b.Active, out SpeedoStyle a) && a != SpeedoStyle.Off) return a;
+                if (b != null && Enum.TryParse(NormStyle(b.Active), out SpeedoStyle a) && a != SpeedoStyle.Off) return a;
             }
             catch { }
             return null;
@@ -235,7 +257,7 @@ namespace ExtendedLSC
             try
             {
                 if (style == SpeedoStyle.Simple) DrawSimple(f);
-                else if (style == SpeedoStyle.Nfsu) DrawNfsu(f);
+                else if (style == SpeedoStyle.Arcade) DrawArcade(f);
             }
             catch (Exception ex) { Log?.Invoke($"[Speedo] draw error ({style}): {ex.Message}"); }
         }
@@ -249,7 +271,7 @@ namespace ExtendedLSC
                 Previewing = File.Exists(pf);
                 if (!Previewing) return false;
 
-                SpeedoStyle style = SpeedoStyle.Nfsu;
+                SpeedoStyle style = SpeedoStyle.Arcade;
                 float speed = 120f, rpm = 0.7f; string gear = "4";
                 var p = File.ReadAllText(pf).Trim().Split(';');
                 if (p.Length > 0 && Enum.TryParse(p[0], true, out SpeedoStyle ps)) style = ps;
@@ -285,7 +307,8 @@ namespace ExtendedLSC
             var P = PalSimple;   // the Simple gauge keeps its own colors (separate from FASTandSPEEDY)
             float ax = 0.86f + OffX, ay = 0.92f + OffY;   // ay = RPM bar centre line (the anchor)
             float sc = Scale;
-            float barW = 0.12f * sc, barH = 0.012f * sc;
+            float xc = XCorr();                            // ultrawide: compress X so the bar + readout aren't stretched
+            float barW = 0.12f * sc * xc, barH = 0.012f * sc;
 
             // --- RPM bar (the white "gauge") on the anchor line ---
             Rect(ax, ay, barW, barH, Color.FromArgb(150, 0, 0, 0));
@@ -302,7 +325,7 @@ namespace ExtendedLSC
             if (f.HasShiftPoints)
             {
                 Color mark = Color.FromArgb(255, 120, 255, 120);
-                float lineW = 0.0016f * sc, lineH = barH * 1.6f;
+                float lineW = 0.0016f * sc * xc, lineH = barH * 1.6f;
                 float lo = Math.Max(0f, Math.Min(1f, f.PerfectMin01));
                 float hi = Math.Max(0f, Math.Min(1f, f.PerfectMax01));
                 Rect(ax - barW / 2 + barW * lo, ay, lineW, lineH, mark);
@@ -320,13 +343,13 @@ namespace ExtendedLSC
             }
 
             // --- Speed number + unit, stacked ABOVE the bar as a tight "120 / MPH" pair (bar sits under them) ---
-            Text($"{DispSpeed(f.SpeedMph):0}", ax - 0.03f, ay - 0.066f * sc, 0.7f * sc, P.Speed, 7, true);
-            Text(Unit, ax - 0.03f, ay - 0.028f * sc, 0.28f * sc, P.Unit, 4, true);
+            Text($"{DispSpeed(f.SpeedMph):0}", ax - 0.03f * xc, ay - 0.066f * sc, 0.7f * sc, P.Speed, 7, true);
+            Text(Unit, ax - 0.03f * xc, ay - 0.028f * sc, 0.28f * sc, P.Unit, 4, true);
 
             // --- Gear, to the right (aligned with the speed number), with a "GEAR" label like MPH ---
             Color gc = f.GearText == "N" ? Color.Yellow : (f.Redline ? P.Redline : P.Gear);
-            Text(f.GearText, ax + 0.05f, ay - 0.070f * sc, 0.8f * sc, gc, 4, true);
-            Text("GEAR", ax + 0.05f, ay - 0.028f * sc, 0.28f * sc, P.Unit, 4, true);
+            Text(f.GearText, ax + 0.05f * xc, ay - 0.070f * sc, 0.8f * sc, gc, 4, true);
+            Text("GEAR", ax + 0.05f * xc, ay - 0.028f * sc, 0.28f * sc, P.Unit, 4, true);
         }
 
         // ================================================================= FASTandSPEEDY (owner's redrawn skin)
@@ -349,14 +372,15 @@ namespace ExtendedLSC
             return _nosBars;
         }
 
-        private static void DrawNfsu(SpeedoFrame f)
+        private static void DrawArcade(SpeedoFrame f)
         {
             float rpm = Math.Max(0f, Math.Min(1f, f.Rpm01));
             float scale = NA_S * Scale;
             float ax = NA_X + OffX * 1280f;
             float ay = NA_Y + OffY * 720f;
+            _xc = XCorr();               // horizontal compression so the dial isn't stretched on ultrawide
             _sprUsed.Clear();            // start fresh: hand out pooled sprites from index 0 again this frame
-            var P = PalNfsu;             // FASTandSPEEDY keeps its own colors (separate from Simple)
+            var P = PalArcade;             // FASTandSPEEDY keeps its own colors (separate from Simple)
             Color white = Color.White;
             Color acc = P.Accent;        // needle
             Color red = P.Redline;       // redline arc
@@ -377,10 +401,12 @@ namespace ExtendedLSC
                 for (int i = 0; i < n; i++)
                 {
                     int alpha = Math.Max(0, Math.Min(255, (int)(f.Nos01 * 255f * 3f) - i * n));
-                    if (alpha <= 0 || !File.Exists(bars[i])) continue;
-                    new CustomSprite(bars[i], new SizeF(34f * scale, 512f * scale),
-                        new PointF(ax + (217f + 34f * i) * scale, ay + -98f * scale),
-                        Color.FromArgb(alpha, P.Nos.R, P.Nos.G, P.Nos.B), 0f, false).Draw();
+                    if (alpha <= 0) continue;
+                    // Route through the per-file sprite POOL (S) instead of `new CustomSprite` each frame — a
+                    // file-based CustomSprite has no Dispose, so constructing one per bar per frame leaked a game
+                    // texture every frame (bars[i] is an absolute path; S's Path.Combine keeps it as-is).
+                    S(bars[i], 34f, 512f, 217f + 34f * i, -98f,
+                      Color.FromArgb(alpha, P.Nos.R, P.Nos.G, P.Nos.B), 0f, ax, ay, scale);
                 }
             }
 
@@ -412,12 +438,12 @@ namespace ExtendedLSC
             // ---- READOUT: NATIVE TEXT (image digits ghost; text never does). The glass fill has a crisp hole
             // punched over this window so the text shows on the dark dial untinted. Colorable: Speed/Gear/Units.
             int spd = (int)Math.Floor(DispSpeed(f.SpeedMph));
-            NfsuTextRight(spd.ToString(), (ax + 790f * scale) / 1280f, (ay + 372f * scale) / 720f, 0.92f * Scale, P.Speed);
-            NfsuTextCentre(f.GearText,     (ax + 749f * scale) / 1280f, (ay + 274f * scale) / 720f, 0.78f * Scale, P.Gear);
-            NfsuTextCentre(Unit,           (ax + 726f * scale) / 1280f, (ay + 500f * scale) / 720f, 0.42f * Scale, P.Unit);
+            ArcadeTextRight(spd.ToString(), (ax + 790f * scale * _xc) / 1280f, (ay + 372f * scale) / 720f, 0.92f * Scale, P.Speed);
+            ArcadeTextCentre(f.GearText,     (ax + 749f * scale * _xc) / 1280f, (ay + 274f * scale) / 720f, 0.78f * Scale, P.Gear);
+            ArcadeTextCentre(Unit,           (ax + 726f * scale * _xc) / 1280f, (ay + 500f * scale) / 720f, 0.42f * Scale, P.Unit);
         }
 
-        private static void NfsuTextCentre(string s, float cx, float cy, float scl, Color c)
+        private static void ArcadeTextCentre(string s, float cx, float cy, float scl, Color c)
         {
             Function.Call(Hash.SET_TEXT_FONT, 4);
             Function.Call(Hash.SET_TEXT_SCALE, scl, scl);
@@ -428,7 +454,7 @@ namespace ExtendedLSC
             Function.Call(Hash.ADD_TEXT_COMPONENT_SUBSTRING_PLAYER_NAME, s);
             Function.Call(Hash.END_TEXT_COMMAND_DISPLAY_TEXT, cx, cy, 0);
         }
-        private static void NfsuTextRight(string s, float rx, float ty, float scl, Color c)
+        private static void ArcadeTextRight(string s, float rx, float ty, float scl, Color c)
         {
             Function.Call(Hash.SET_TEXT_FONT, 4);
             Function.Call(Hash.SET_TEXT_SCALE, scl, scl);
@@ -445,16 +471,41 @@ namespace ExtendedLSC
         // stale-texture ghost). But ONE shared instance per file collapses repeated digits ("88" draws the same
         // n8 twice — if Draw() is deferred both land at the last position). Solution: a POOL per file. Each call
         // takes the next free instance for that file (creating it once), so same-file-multiple-draws each get
-        // their own instance AND every texture is created exactly once. _sprUsed is reset each DrawNfsu frame.
+        // their own instance AND every texture is created exactly once. _sprUsed is reset each DrawArcade frame.
         private static readonly Dictionary<string, List<CustomSprite>> _sprPool = new Dictionary<string, List<CustomSprite>>();
         private static readonly Dictionary<string, int> _sprUsed = new Dictionary<string, int>();
+
+        // ---- Ultrawide un-stretch -------------------------------------------------------------------------------
+        // GTA.UI.Screen reports a fixed 1280x720, so it can't give the real aspect; GET_SCREEN_ACTIVE_RESOLUTION can.
+        // The gauges are drawn in a 16:9 (1280x720) layout, and DRAW_SPRITE/RECT stretch X on wider screens, so we
+        // compress every X size + X-offset (about the gauge anchor) by baseAspect/realAspect — 1.0 at 16:9, smaller
+        // on ultrawide — which keeps the round dial round and the layout tight. (Cached; refreshed ~twice a second.)
+        private static float _xc = 1f;                 // current X-compression factor, set at the top of each Draw
+        private static float _xcCache = 1f; private static int _xcFrame = -9999;
+        private static float XCorr()
+        {
+            int fc = Game.FrameCount;
+            if (fc - _xcFrame < 120) return _xcCache;
+            _xcFrame = fc;
+            try
+            {
+                var ow = new OutputArgument(); var oh = new OutputArgument();
+                Function.Call(Hash.GET_ACTUAL_SCREEN_RESOLUTION, ow, oh);
+                int w = ow.GetResult<int>(), h = oh.GetResult<int>();
+                if (w > 0 && h > 0) _xcCache = (1280f / 720f) / ((float)w / h);
+            }
+            catch { }
+            return _xcCache;
+        }
+
         private static void S(string file, float nw, float nh, float ix, float iy, Color tint, float rot,
                               float ax, float ay, float scale, bool centered = false)
         {
             string fp = Path.Combine(_nfsuDir, file);
             if (!File.Exists(fp)) return;
-            var size = new SizeF(nw * scale, nh * scale);
-            var pos = new PointF(ax + ix * scale, ay + iy * scale);
+            // Compress width + horizontal offset about the anchor so the gauge keeps its aspect on ultrawide.
+            var size = new SizeF(nw * scale * _xc, nh * scale);
+            var pos = new PointF(ax + ix * scale * _xc, ay + iy * scale);
             if (!_sprPool.TryGetValue(fp, out var list)) { list = new List<CustomSprite>(); _sprPool[fp] = list; }
             int used = _sprUsed.TryGetValue(fp, out var u) ? u : 0;
             CustomSprite spr;

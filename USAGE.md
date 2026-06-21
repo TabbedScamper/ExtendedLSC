@@ -39,7 +39,7 @@ stability auto-recovery system.
 > patch shifts memory layout, fitment may need an update while the rest of the menu keeps working.
 
 ### 4. Manual transmission + NOS
-A clutch-based manual gearbox with an NFS-style shift "kick", geometric gearing, a real rev limiter, and a
+A clutch-based manual gearbox with an arcade-style shift "kick", geometric gearing, a real rev limiter, and a
 **NOS** nitrous mechanic (tiers). Enable/configure it in `settings.ini` `[Features]` (`ManualTransmission`,
 `Nos`, and the `Mt*` feel values). Shift / neutral / nitrous keys are all remappable in `[Controls]`.
 

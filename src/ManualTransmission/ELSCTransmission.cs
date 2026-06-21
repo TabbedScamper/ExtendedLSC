@@ -53,14 +53,14 @@ namespace ExtendedLSC.ManualTransmission
         // higher RPM — so downshifting visibly slows you down (decel jumps as RPM rises + gear drops).
         public float EngineBrakeStrength { get; set; } = 5.0f;  // m/s^2 at RPM 1.0 in 1st gear
 
-        // Perfect shift (NFS drag style): shifting up in the sweet spot is rewarded ONLY with a
-        // "GREAT SHIFT!" callout — no power boost (we want skill-feedback, not a Forza torque cheat).
+        // Perfect shift (drag-race style): shifting up in the sweet spot is rewarded ONLY with a
+        // "GREAT SHIFT!" callout — no power boost (we want skill-feedback, not a power cheat).
         public float PerfectShiftMin { get; set; } = 0.90f;
         public float PerfectShiftMax { get; set; } = 0.98f;
         private int _perfectFlashUntil = 0;                     // "GREAT SHIFT!" popup window
         public bool LastShiftPerfect { get; private set; } = false;
 
-        // ---- NOS / nitrous (arcade, NFS-style) ----
+        // ---- NOS / nitrous (arcade-style) ----
         public bool NosInstalled { get; set; } = false;        // purchased in LSC
         public float NosLevel { get; set; } = 1f;              // 0..1 bottle fill
         public bool NosActive { get; private set; } = false;
@@ -128,7 +128,7 @@ namespace ExtendedLSC.ManualTransmission
         private int _stageSecs = 8;          // run length to start once staging completes
         private int _autoBrakeUntil = 0;
         private float _lastTorqueMult = 1f;
-        // NFS-style upshift "kick": a brief power surge the moment a new gear engages, so every shift has a
+        // Arcade-style upshift "kick": a brief power surge the moment a new gear engages, so every shift has a
         // satisfying punch (stronger when timed at the sweet spot). Identical on every car = consistent feel.
         private int _shiftKickUntil = 0;
         private float _shiftKickForce = 0f;      // forward lunge (m/s^2) — the punch you FEEL, set per shift
@@ -156,7 +156,7 @@ namespace ExtendedLSC.ManualTransmission
         private readonly Random _dynoRng = new Random();
         private float _dynoShiftRpm = 0.92f;
         // Rev limiter (bounce): hold each gear AT its redline instead of mushing past the ratio ceiling. The
-        // engine "bounces" off the limiter (NFS feel) and the car stops gaining speed → a clear shift point.
+        // engine "bounces" off the limiter (arcade feel) and the car stops gaining speed → a clear shift point.
         // Non-latching: a TIME-based cut/on cycle (not RPM-based) so the forced on-phase keeps it from dying,
         // and the moment you upshift (RPM drops below the limit) it releases on its own.
         public float LimiterRpm { get; set; } = 0.985f;   // tunable (INI)
@@ -254,10 +254,10 @@ namespace ExtendedLSC.ManualTransmission
             // fights the pinned gear every physics step and torque dies (see VehicleMemory patches).
             VehicleMemory.ApplyShiftPatches();
 
-            // NFS gearing: re-space the gears so every upshift drops RPM by the same satisfying amount.
-            ApplyNfsGearing(_vehicle);
+            // Geometric gearing: re-space the gears so every upshift drops RPM by the same satisfying amount.
+            ApplyGeometricGearing(_vehicle);
 
-            // Natural exhaust crackle/pops on deceleration (off-throttle) — the NFS anti-lag sound.
+            // Natural exhaust crackle/pops on deceleration (off-throttle) — the anti-lag crackle.
             Function.Call((Hash)0x2BE4BC731D039D5A, true);   // ENABLE_VEHICLE_EXHAUST_POPS
 
             Log?.Invoke($"[ELSCTransmission] Enabled (Arcade Mode), gear: {_targetGear}, top gear: {_cachedTopGear}");
@@ -266,34 +266,34 @@ namespace ExtendedLSC.ManualTransmission
         // Stock GTA gear ratios bunch up at the top (4th->5th is only a ~15% RPM drop), so upper-gear upshifts
         // barely move the tach and the shift kick is wasted. Re-space every gear GEOMETRICALLY between the
         // universal 1st (3.33) and top (0.90) ratios → a constant ~RPM drop per shift on EVERY car, so shifts
-        // feel meaty and consistent (the NFS feel). 1st and top stay stock, so launch + top speed are unchanged.
-        private const float NfsGearFirst = 3.3333f;
-        private const float NfsGearTop = 0.90f;
+        // feel meaty and consistent (an even, arcade feel). 1st and top stay stock, so launch + top speed are unchanged.
+        private const float GeoGearFirst = 3.3333f;
+        private const float GeoGearTop = 0.90f;
         private float[] _appliedRatios = null;   // verbatim cache of the last ratios written (for the periodic re-assert)
         /// <param name="stockGears">The car's ORIGINAL drive-gear count. The geometric step is anchored to it so
         /// the stock gears keep their 3.33->0.90 spacing/top speed, and any ADDED gears (current count &gt; stock)
         /// EXTEND the range downward at the SAME per-shift step (constant RPM drop) instead of re-compressing every
         /// gear into a fixed range. 0 = anchor to the current count (legacy behavior, no extension).</param>
-        public void ApplyNfsGearing(Vehicle v, int stockGears = 0)
+        public void ApplyGeometricGearing(Vehicle v, int stockGears = 0)
         {
             if (v == null || !v.Exists()) return;
             int n = VehicleMemory.GetTopGear(v);   // current total drive-gear count (may be stock + tuned)
             if (n < 2 || n > 10) return;
             int baseN = (stockGears >= 2 && stockGears <= 10) ? stockGears : n;
-            float step = (float)Math.Pow(NfsGearTop / NfsGearFirst, 1.0 / (baseN - 1));  // constant per-shift ratio step
+            float step = (float)Math.Pow(GeoGearTop / GeoGearFirst, 1.0 / (baseN - 1));  // constant per-shift ratio step
             var cache = new float[n + 2];                                             // slot index = gear g + 1
             for (int i = 0; i < cache.Length; i++) cache[i] = float.NaN;
             for (int g = 1; g <= n; g++)
             {
-                float ratio = NfsGearFirst * (float)Math.Pow(step, g - 1);            // g==baseN -> 0.90; g>baseN -> taller
+                float ratio = GeoGearFirst * (float)Math.Pow(step, g - 1);            // g==baseN -> 0.90; g>baseN -> taller
                 VehicleMemory.SetGearRatio(v, g + 1, ratio);                          // array index 2 = 1st gear
                 cache[g + 1] = ratio;
             }
             _appliedRatios = cache;   // remember EXACTLY what we wrote so the periodic re-assert restores it verbatim
         }
 
-        /// <summary>Re-write the exact ratios last applied by ApplyNfsGearing. The periodic re-assert must use THIS,
-        /// not ApplyNfsGearing — recomputing without the stock count would re-compress an extended-range tune and,
+        /// <summary>Re-write the exact ratios last applied by ApplyGeometricGearing. The periodic re-assert must use THIS,
+        /// not ApplyGeometricGearing — recomputing without the stock count would re-compress an extended-range tune and,
         /// because changing a live gear's ratio shifts the RPM-per-speed instantly, slam the tach mid-drive (feels
         /// like a phantom auto-upshift the gear indicator never shows). Writing the same values is a no-op = no jump.</summary>
         private void ReassertRatios()
@@ -313,7 +313,7 @@ namespace ExtendedLSC.ManualTransmission
         {
             if (_vehicle == null || !_vehicle.Exists()) return;
             _cachedTopGear = VehicleMemory.GetTopGear(_vehicle);
-            ApplyNfsGearing(_vehicle, stockGears);
+            ApplyGeometricGearing(_vehicle, stockGears);
         }
 
         /// <summary>
@@ -558,7 +558,7 @@ namespace ExtendedLSC.ManualTransmission
             if (rOld > 0.01f && rNew > 0.01f && rNew < rOld)
                 kickScale = Math.Min(1f, Math.Max(0.3f, ((rOld - rNew) / rOld) / ReferenceShiftDrop));
 
-            // NFS-style shift kick: a forward lunge (+ small power bump), scaled to the rev drop so close-ratio
+            // Arcade-style shift kick: a forward lunge (+ small power bump), scaled to the rev drop so close-ratio
             // shifts don't punt you straight back to redline. Bigger on a perfect shift.
             _shiftKickForce = (LastShiftPerfect ? ShiftKickForcePerfect : ShiftKickForceBase) * kickScale;
             _shiftKickPower = (LastShiftPerfect ? ShiftKickPowerPerfect : ShiftKickPowerBase) * kickScale;
@@ -779,7 +779,7 @@ namespace ExtendedLSC.ManualTransmission
             // THROTTLE TAKEOVER: the game's auto-box logic still runs underneath the gear pin, and
             // whenever it disagrees with our gear it enters a perpetual mid-shift THROTTLE CUT
             // (measured: engine throttle forced to 0.00 in 3rd at full pedal -> car decays to a stop).
-            // Owning the throttle field every frame ends the fight for good (same approach as ikt's MT).
+            // Owning the throttle field every frame ends the fight for good (we own the field outright, so nothing else can override it).
             // (throttlePedal is computed below; the write happens after it's read.)
 
             // Block reverse while in a forward gear — you must shift to R to back up. The game reverses
@@ -867,7 +867,7 @@ namespace ExtendedLSC.ManualTransmission
                 txt.Draw();
             }
 
-            // 2) TORQUE PIPELINE (anti-bog assist + NFS upshift kick).
+            // 2) TORQUE PIPELINE (anti-bog assist + upshift kick).
             float mult = 1f;
             // Shift kick: a decaying forward LUNGE (impulse force) — the punch you feel — plus a small power
             // bump for the engine note. Delivering the punch as force (not raw engine power) means the wheels

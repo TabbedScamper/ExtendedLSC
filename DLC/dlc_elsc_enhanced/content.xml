@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CDataFileMgr__ContentsOfDataFileXml>
+	<disabledFiles />
+	<includedXmlFiles />
+	<dataFiles>
+		<Item>
+			<filename>dlc_elsc:/%PLATFORM%/levels/gta5/vehicles.rpf</filename>
+			<fileType>RPF_FILE</fileType>
+			<locked value="true"/>
+			<disabled value="true"/>
+			<persistent value="true"/>
+			<overlay value="true"/>
+		</Item>
+	</dataFiles>
+	<contentChangeSets>
+		<Item>
+			<changeSetName>CCS_ELSC_NG_INIT</changeSetName>
+			<filesToEnable>
+			</filesToEnable>
+		</Item>
+		<Item>
+			<changeSetName>CCS_ELSC_NG_STREAMING</changeSetName>
+			<filesToEnable>
+				<Item>dlc_elsc:/%PLATFORM%/levels/gta5/vehicles.rpf</Item>
+			</filesToEnable>
+		</Item>
+	</contentChangeSets>
+	<patchFiles />
+</CDataFileMgr__ContentsOfDataFileXml>

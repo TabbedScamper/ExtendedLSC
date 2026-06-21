@@ -1,9 +1,9 @@
-# VStancer.asi Reverse Engineering Notes
+# Wheel Fitment — Offset Notes (historical RE notes)
 
 ## Overview
-VStancer uses **pattern scanning** to find memory offsets dynamically, making it work across different game versions. This is why hardcoded offsets in our implementation keep failing.
+A pattern-scanning fitment ASI finds memory offsets dynamically, making it work across different game versions. This is why hardcoded offsets in our implementation keep failing.
 
-## Key Offsets VStancer Finds
+## Key Offsets such a mod Finds
 
 ### Vehicle Structure
 - **Wheels Pointer Offset** - Pointer to array of wheel pointers
@@ -59,7 +59,7 @@ VisualModIndex = 6
 
 ## Pattern Scanning Examples
 
-VStancer scans for byte patterns like:
+the reference fitment mod scans for byte patterns like:
 ```
 Wheels Pointer: 4C 8B ?? ?? ?? 00 00 48 8B 40 20 48 8B 80 B0 00 00 00
 Handling Offset: 88 90 ?? ?? ?? 00 0F B7 90 ?? 00 00 00
@@ -72,12 +72,12 @@ The `??` are wildcards that match any byte.
 
 1. **Hardcoded offsets** (0xB48, 0xB40) only work for specific game versions
 2. **No pattern scanning** - we guessed offsets instead of finding them dynamically
-3. **Wrong structure access** - we tried wheel struct positions, VStancer uses rendering offsets
+3. **Wrong structure access** - we tried wheel struct positions, the reference fitment mod uses rendering offsets
 
 ## Recommended Approach
 
 ### Option 1: Pattern Scanning (Complex but Robust)
-Implement pattern scanning like VStancer does:
+Implement pattern scanning like the reference fitment mod does:
 1. Scan game memory for known byte patterns
 2. Calculate offsets from pattern match locations
 3. Cache offsets for the session
@@ -88,10 +88,10 @@ Use SHVDN's HandlingData class which provides:
 - Known offsets: 0x034C (FrontCamber), 0x0350 (RearCamber)
 - This only affects physics, not visual wheel angle
 
-### Option 3: Hook into VStancer
-If VStancer.asi is present, read its config files and let it do the work.
+### Option 3: Hook into the reference fitment mod
+If the fitment ASI is present, read its config files and let it do the work.
 
 ## References
 - [GTAVManualTransmission Offsets.hpp](https://github.com/ikt32/GTAVManualTransmission/blob/master/Gears/Memory/Offsets.hpp)
-- [FiveM VStancer C# Source](https://github.com/carmineos/fivem-vstancer)
+- (external FiveM fitment reference)
 - [Ghidra](https://github.com/NationalSecurityAgency/ghidra/releases) - for further reverse engineering

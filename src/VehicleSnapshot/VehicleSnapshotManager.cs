@@ -19,6 +19,11 @@ namespace ExtendedLSC.VehicleSnapshot
     {
         public Action<string> Log;
 
+        /// <summary>Returns the vehicle that must NEVER be snapshot-restored over (the car the player is actively
+        /// driving). Its live state is the truth — re-applying a stale same-identity snapshot would overwrite it
+        /// (the "my driven car turned into the despawned car" bug with shared placeholder plates).</summary>
+        public Func<Vehicle> ExcludeVehicle;
+
         private Dictionary<string, VehicleSnapshot> _snaps = new Dictionary<string, VehicleSnapshot>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<int> _restored = new HashSet<int>();   // handles already restored this session
         private bool _loaded = false;
@@ -61,6 +66,21 @@ namespace ExtendedLSC.VehicleSnapshot
             catch (Exception ex) { Log?.Invoke($"[Snapshot] save failed: {ex.Message}"); }
         }
 
+        /// <summary>Remove saved snapshots whose identity plate equals <paramref name="plate"/> (case-insensitive).
+        /// Keys are "displayname|plate" lower-cased. Returns count removed.</summary>
+        public int PurgeByPlate(string plate)
+        {
+            if (string.IsNullOrEmpty(plate)) return 0;
+            Load();
+            string want = "|" + plate.Trim().ToLowerInvariant();
+            var kill = new List<string>();
+            foreach (var k in _snaps.Keys)
+                if (k.EndsWith(want, StringComparison.OrdinalIgnoreCase)) kill.Add(k);
+            foreach (var k in kill) _snaps.Remove(k);
+            if (kill.Count > 0) { Save(); Log?.Invoke($"[Snapshot] purged {kill.Count} snapshot(s) with plate '{plate}'"); }
+            return kill.Count;
+        }
+
         /// <summary>Capture + persist this car's full applied state (call when the player finishes customizing).</summary>
         public void CaptureCurrent(Vehicle v)
         {
@@ -93,10 +113,13 @@ namespace ExtendedLSC.VehicleSnapshot
                 var ped = Game.Player.Character;
                 if (ped == null || !ped.Exists()) return;
 
+                int excludedHandle = 0;
+                try { var ex = ExcludeVehicle?.Invoke(); if (ex != null && ex.Exists()) excludedHandle = ex.Handle; } catch { }
+
                 var nearby = World.GetNearbyVehicles(ped.Position, 80f);
 
                 // Count how many live cars share each identity. We must NOT apply a saved snapshot to an AMBIGUOUS
-                // duplicate (e.g. several Menyoo cars all plated "MENYOO") — that overwrites them all with one car's
+                // duplicate (e.g. several cars all sharing one placeholder plate) — that overwrites them all with one car's
                 // look. Skipped duplicates are left un-restored so they apply correctly once the plate dedup makes
                 // them unique.
                 var keyCount = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -111,6 +134,7 @@ namespace ExtendedLSC.VehicleSnapshot
                 foreach (var v in nearby)
                 {
                     if (v == null || !v.Exists() || _restored.Contains(v.Handle)) continue;
+                    if (v.Handle == excludedHandle) continue;                          // never overwrite the live driven car
                     string key = Key(v);
                     if (key == null) continue;
                     if (keyCount.TryGetValue(key, out int cnt) && cnt > 1) continue;   // ambiguous duplicate -> skip

@@ -115,6 +115,9 @@ namespace ExtendedLSC.WindowTint
         public static bool ScanStep()
         {
             if (_tableAddr != 0) return true;
+            // The carcols WindowColors table signature is verified present + identical on Enhanced; the expansion is
+            // build-agnostic. Gate on WindowColorSupported (on for both editions). Self-disables if expansion fails.
+            if (!GamePlatform.WindowColorSupported) { _scanDone = true; return false; }
             // Fast path: a previous expansion this game session left a state file. Script reloads reset our
             // statics but NOT game memory or its ASLR layout, so the saved addresses are still valid — adopt
             // them instantly instead of re-scanning (this is what makes reloads quick instead of "initializing").

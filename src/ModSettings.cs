@@ -25,16 +25,13 @@ namespace ExtendedLSC
         /// <summary>Custom camera system with part-focused presets and free roam</summary>
         public static bool CustomCamera { get; set; } = true;
 
-        /// <summary>Condensed paint menu with color wheel UI (not yet implemented)</summary>
-        public static bool CondensedPaintMenu { get; set; } = true;
-
-        /// <summary>Extended mod categories: engine swaps, extras toggle, etc. (not yet implemented)</summary>
+        /// <summary>Extended mod categories: engine swaps, extras toggle, additional mods.</summary>
         public static bool ExtendedCategories { get; set; } = true;
 
         /// <summary>Save/load vehicle mod presets (not yet implemented)</summary>
         public static bool VehiclePackages { get; set; } = true;
 
-        /// <summary>Live handling.meta editing with sliders (not yet implemented)</summary>
+        /// <summary>Vehicle Tuning: live handling editing — engine-swap tuning + handling sliders.</summary>
         public static bool VehicleTuning { get; set; } = true;
 
         /// <summary>Optional "Customize Radio": loop the player's OWN mp3/wav files (from scripts/ExtendedLSC/radio)
@@ -73,11 +70,11 @@ namespace ExtendedLSC
         public static float MtNosRefillPerSec { get; set; } = 0.015f; // passive NOS regen rate
         public static float MtNosPerfectBump { get; set; } = 0.06f;  // NOS added per great shift
 
-        /// <summary>Headlight and neon color/brightness customization (not yet implemented)</summary>
+        /// <summary>Headlight (xenon) and neon color customization.</summary>
         public static bool LightCustomization { get; set; } = true;
 
-        /// <summary>VStancer wheel fitment integration (not yet implemented)</summary>
-        public static bool VStancerIntegration { get; set; } = true;
+        /// <summary>Auto-apply each car's saved wheel stance/fitment to matching nearby vehicles on load.</summary>
+        public static bool AutoApplyStances { get; set; } = true;
 
         /// <summary>Wheel Fitment Pro Mode: per-axle camber/track/height sliders. Off = simple menu.</summary>
         public static bool WheelFitmentProMode { get; set; } = false;
@@ -219,10 +216,6 @@ namespace ExtendedLSC
                                 case "custom_camera":
                                     CustomCamera = ParseBool(value);
                                     break;
-                                case "condensedpaintmenu":
-                                case "condensed_paint_menu":
-                                    CondensedPaintMenu = ParseBool(value);
-                                    break;
                                 case "extendedcategories":
                                 case "extended_categories":
                                     ExtendedCategories = ParseBool(value);
@@ -292,10 +285,13 @@ namespace ExtendedLSC
                                 case "light_customization":
                                     LightCustomization = ParseBool(value);
                                     break;
+                                case "autoapplystances":
+                                case "auto_apply_stances":
+                                // legacy keys (renamed): keep reading old INIs so the toggle isn't lost on upgrade
                                 case "vstancerintegration":
                                 case "vstancer_integration":
                                 case "vstancer":
-                                    VStancerIntegration = ParseBool(value);
+                                    AutoApplyStances = ParseBool(value);
                                     break;
                                 case "wheelfitmentpromode":
                                 case "wheel_fitment_pro_mode":
@@ -458,7 +454,7 @@ namespace ExtendedLSC
             }
 
             // Log current settings
-            Log?.Invoke($"[ModSettings] Features: Camera={CustomCamera}, Paint={CondensedPaintMenu}, Extended={ExtendedCategories}");
+            Log?.Invoke($"[ModSettings] Features: Camera={CustomCamera}, Extended={ExtendedCategories}");
             Log?.Invoke($"[ModSettings] Developer: EditorMode={EditorMode}, Debug={DebugLogging}");
         }
 
@@ -501,11 +497,7 @@ namespace ExtendedLSC
                     writer.WriteLine($"CustomCamera = {BoolToString(CustomCamera)}");
                     writer.WriteLine();
 
-                    writer.WriteLine("; Condensed paint menu with color wheel UI");
-                    writer.WriteLine($"CondensedPaintMenu = {BoolToString(CondensedPaintMenu)}");
-                    writer.WriteLine();
-
-                    writer.WriteLine("; Extended categories: engine swaps, extras toggle, etc.");
+                    writer.WriteLine("; Extended categories: engine swaps, extras toggle, additional mods");
                     writer.WriteLine($"ExtendedCategories = {BoolToString(ExtendedCategories)}");
                     writer.WriteLine();
 
@@ -561,8 +553,8 @@ namespace ExtendedLSC
                     writer.WriteLine($"LightCustomization = {BoolToString(LightCustomization)}");
                     writer.WriteLine();
 
-                    writer.WriteLine("; VStancer wheel fitment integration");
-                    writer.WriteLine($"VStancerIntegration = {BoolToString(VStancerIntegration)}");
+                    writer.WriteLine("; Auto-apply each car's saved wheel stance to matching nearby vehicles on load");
+                    writer.WriteLine($"AutoApplyStances = {BoolToString(AutoApplyStances)}");
                     writer.WriteLine();
 
                     writer.WriteLine("; Wheel Fitment Pro Mode: per-axle camber/track/height sliders (off = simple menu)");

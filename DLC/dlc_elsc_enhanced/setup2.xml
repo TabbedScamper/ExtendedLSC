@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<SSetupData>
+  <deviceName>dlc_elsc</deviceName>
+  <datFile>content.xml</datFile>
+  <timeStamp>06/21/2026 00:00:00</timeStamp>
+  <nameHash>elsc</nameHash>
+  <contentChangeSets />
+  <contentChangeSetGroups>
+    <Item>
+      <NameHash>GROUP_EARLY_ON</NameHash>
+      <ContentChangeSets>
+        <Item>CCS_ELSC_NG_INIT</Item>
+      </ContentChangeSets>
+    </Item>
+    <Item>
+      <NameHash>GROUP_UPDATE_STREAMING</NameHash>
+      <ContentChangeSets>
+        <Item>CCS_ELSC_NG_STREAMING</Item>
+      </ContentChangeSets>
+    </Item>
+  </contentChangeSetGroups>
+  <startupScript />
+  <scriptCallstackSize value="0" />
+  <type>EXTRACONTENT_LEVEL_PACK</type>
+  <order value="200" />
+  <minorOrder value="0" />
+  <isLevelPack value="true" />
+  <dependencyPackHash />
+  <requiredVersion />
+  <subPackCount value="0" />
+</SSetupData>

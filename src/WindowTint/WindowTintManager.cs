@@ -89,7 +89,7 @@ namespace ExtendedLSC.WindowTint
                         {
                             if (v == null || !v.Exists()) continue;
                             // Skip cars whose model+plate is shared by ANOTHER live car (ambiguous identity — e.g. two
-                            // Menyoo spawns both plated "menyoo"). Applying a saved colour by plate would BLEED it onto
+                            // spawner-spawned cars sharing one placeholder plate). Applying a saved colour by plate would BLEED it onto
                             // the duplicate (a fresh stock spawn inheriting the modified car's tint). The driven car is
                             // always asserted above; per-car dedupe makes plates unique once a car is entered.
                             if (PlateSharedByAnotherCar(v, v.DisplayName, PlateText(v))) continue;

@@ -8,7 +8,7 @@ namespace ExtendedLSC.WheelFitment
     /// Direct memory access for wheel VISUAL size/width and COLLISION radii.
     ///
     /// Offsets reverse-engineered and verified live on GTA V Legacy build 3788,
-    /// cross-checked against VStancer's own resolved-offset log.
+    /// cross-checked against a known-good resolved-offset log.
     ///
     ///   Wheel array:     CVehicle + 0xC30  -> CWheel** array ; wheel count (byte) at +0xC38
     ///   Per-CWheel:      +0x110 tyre collider radius, +0x114 rim collider radius,
@@ -27,7 +27,10 @@ namespace ExtendedLSC.WheelFitment
         private const int OFF_WHEELS_PTR  = 0xC30;
         private const int OFF_WHEEL_COUNT = 0xC38;
         private const int OFF_DRAWHANDLER = 0x48;
-        private const int OFF_STREAMGFX   = 0x370;
+        // DrawHandler -> StreamRenderGfx pointer offset. This is the ONE struct offset that DIFFERS between editions
+        // (verified live): Legacy b3788 = 0x370, Enhanced b1013 = 0x4B0. Everything else (size@+0x08, width@+0xBA0,
+        // and all CVehicle/CWheel/CHandlingData fields) is identical across editions.
+        private static int OFF_STREAMGFX => GamePlatform.IsEnhanced ? 0x4B0 : 0x370;
         private const int OFF_HANDLING    = 0x960;   // CVehicle -> CHandlingData* (b3788)
         private const int OFF_SUSP_RAISE  = 0xD0;    // CHandlingData.fSuspensionRaise (visual body lift)
         // CVehicle "fake suspension lowering amount" (b3788) — the RENDER-ONLY visual ride height the game's
@@ -37,7 +40,7 @@ namespace ExtendedLSC.WheelFitment
         private const int OFF_FAKE_LOWER2 = 0x1A20;
         // ---- CWheel field offsets ----
         public const int OFF_CAMBER     = 0x008;   // raw camber
-        public const int OFF_CAMBER_INV = 0x010;   // inverse Y-rotation (VStancer convention)
+        public const int OFF_CAMBER_INV = 0x010;   // inverse Y-rotation (rendering convention)
         public const int OFF_X          = 0x030;   // track width / lateral offset (resets every frame)
         public const int OFF_Y          = 0x034;   // longitudinal offset (middle of the local position vec)
         public const int OFF_Z          = 0x038;   // wheel vertical offset (ride height)
@@ -139,7 +142,11 @@ namespace ExtendedLSC.WheelFitment
         }
 
         private static long Addr(Vehicle v)
-            => (v != null && v.Exists() && v.MemoryAddress != IntPtr.Zero) ? v.MemoryAddress.ToInt64() : 0;
+            // Single chokepoint for CVehicle/CWheel/CHandlingData struct access. These offsets are verified identical
+            // on Legacy + Enhanced, so this is enabled on both. (Render-only offsets — fake lowering, visual wheel
+            // size — are NOT verified on Enhanced and carry their own RenderMemorySupported guard below.)
+            => (GamePlatform.StructMemorySupported && v != null && v.Exists() && v.MemoryAddress != IntPtr.Zero)
+                ? v.MemoryAddress.ToInt64() : 0;
 
         // ====================================================================
         // Wheel pool
@@ -168,7 +175,7 @@ namespace ExtendedLSC.WheelFitment
         }
         public static bool HasHandling(Vehicle v) => HandlingPtr(v) != 0;
 
-        // CHandlingData float offsets (ikt HandlingInfo.h, b3788) used by the LSC stat bars + live tuning.
+        // CHandlingData float offsets (handling struct, b3788) used by the LSC stat bars + live tuning.
         // Verified empirically 2026-06-16 by cross-referencing a live car vs its extracted handling.meta.
         public const int HOFF_DRIVE_BIAS_FRONT = 0x48; // fDriveBiasFront      0=RWD .. 1=FWD (direct)
         public const int HOFF_DRIVE_FORCE = 0x60;    // fInitialDriveForce   -> Acceleration (direct)
@@ -270,11 +277,13 @@ namespace ExtendedLSC.WheelFitment
         /// body, -ve raises it; no physics/collision change. Per-vehicle. Writes both mirror copies.</summary>
         public static float GetFakeLowering(Vehicle v)
         {
+            if (!GamePlatform.RideHeightSupported) return 0f;   // verified on Legacy + Enhanced
             long a = Addr(v);
             return a == 0 ? 0f : ReadF32(a + OFF_FAKE_LOWER1);
         }
         public static bool SetFakeLowering(Vehicle v, float val)
         {
+            if (!GamePlatform.RideHeightSupported) return false;   // verified on Legacy + Enhanced
             long a = Addr(v); if (a == 0) return false;
             bool ok = WriteF32(a + OFF_FAKE_LOWER1, val);
             WriteF32(a + OFF_FAKE_LOWER2, val);
@@ -325,7 +334,7 @@ namespace ExtendedLSC.WheelFitment
         public static bool  SetWheelZ(Vehicle v, int wheel, float val) => SetWheelField(v, wheel, OFF_Z, val);
         public static float GetWheelCamber(Vehicle v, int wheel) => GetWheelField(v, wheel, OFF_CAMBER);
 
-        /// <summary>Set camber: raw value at 0x008, inverse Y-rotation at 0x010 (matches VStancer).</summary>
+        /// <summary>Set camber: raw value at 0x008, inverse Y-rotation at 0x010 (rendering convention).</summary>
         public static bool SetWheelCamber(Vehicle v, int wheel, float camber)
         {
             long a = Addr(v); if (a == 0) return false;
@@ -340,6 +349,7 @@ namespace ExtendedLSC.WheelFitment
         // ====================================================================
         private static long StreamGfx(long vehAddr)
         {
+            if (!GamePlatform.VisualWheelSupported) return 0;   // verified Legacy + Enhanced (per-edition OFF_STREAMGFX)
             long dh = ReadPtr(vehAddr + OFF_DRAWHANDLER);
             if (dh == 0) return 0;
             return ReadPtr(dh + OFF_STREAMGFX);
@@ -361,7 +371,7 @@ namespace ExtendedLSC.WheelFitment
         {
             long a = Addr(v); if (a == 0) return false;
             long s = StreamGfx(a); if (s == 0) return false;
-            // Write ONLY +0x08 — exactly what VStancer touches for "visual size". The paired field
+            // Write ONLY +0x08 — the render field that controls "visual size". The paired field
             // +0x0C is something else and writing it causes track/tread/sink artifacts.
             return WriteF32(s + OFF_VIS_SIZE, val);
         }
@@ -375,7 +385,7 @@ namespace ExtendedLSC.WheelFitment
         {
             long a = Addr(v); if (a == 0) return false;
             long s = StreamGfx(a); if (s == 0) return false;
-            // Write ONLY +0xBA0 — what VStancer touches for "visual width" (+0xBA4 is a different field).
+            // Write ONLY +0xBA0 — the render field that controls "visual width" (+0xBA4 is a different field).
             return WriteF32(s + OFF_VIS_WIDTH, val);
         }
     }

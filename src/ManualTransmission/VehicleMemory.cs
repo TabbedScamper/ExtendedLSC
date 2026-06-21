@@ -89,6 +89,12 @@ namespace ExtendedLSC.ManualTransmission
             if (_initialized) return;
             _initialized = true;
 
+            if (!GamePlatform.ManualTransmissionSupported)
+            {
+                Log?.Invoke($"[VehicleMemory] {GamePlatform.EditionName}: MT not supported — manual transmission disabled");
+                return;
+            }
+
             try
             {
                 Log?.Invoke("[VehicleMemory] Initializing...");
@@ -116,8 +122,20 @@ namespace ExtendedLSC.ManualTransmission
                 _moduleBase = modInfo.lpBaseOfDll;
                 _moduleSize = modInfo.SizeOfImage;
 
+                // Enhanced (b1013): the Legacy *code* patterns below don't match (instructions shifted), but the
+                // gearbox struct itself is identical — these offsets were verified live via data-RE (gear struct at
+                // CVehicle+0x880, RPM at +0x8C8). The clutch-drop EXE patch pattern still matches (handled separately).
+                if (GamePlatform.IsEnhanced)
+                {
+                    _nextGearOffset = 0x880; _currentGearOffset = 0x882; _topGearOffset = 0x886; _gearRatiosOffset = 0x888;
+                    _currentRPMOffset = 0x8C8; _clutchOffset = 0x8D4; _throttleOffset = 0x8D8;
+                    _available = true;
+                    Log?.Invoke("[VehicleMemory] Enhanced gearbox offsets set (verified): gear=0x880 rpm=0x8C8 clutch=0x8D4");
+                    return;
+                }
+
                 // Find gear offsets using pattern scanning
-                // Pattern for next/current gear offset (from ikt's code)
+                // Pattern for next/current gear offset
                 // "\x48\x8D\x8F\x00\x00\x00\x00\x4C\x8B\xC3\xF3\x0F\x11\x7C\x24" "xxx????xxxxxxxx"
                 IntPtr gearPatternAddr = FindPattern(modInfo.lpBaseOfDll, modInfo.SizeOfImage,
                     new byte[] { 0x48, 0x8D, 0x8F, 0x00, 0x00, 0x00, 0x00, 0x4C, 0x8B, 0xC3, 0xF3, 0x0F, 0x11, 0x7C, 0x24 },
@@ -221,7 +239,7 @@ namespace ExtendedLSC.ManualTransmission
         // torque). Six `mov dword [rbx+0x54], 0x3DCCCCCD` stores inside one state-machine function
         // (verified live on b3788: NOPing exactly these six turned a dying 3rd gear into a clean
         // 0-103mph pull). We NOP them while the manual box is active and restore on disable —
-        // the same approach ikt's Manual Transmission uses, with patterns re-derived for this build.
+        // the same field-ownership approach, with patterns re-derived for this build.
         private static IntPtr[] _shiftPatchSites = null;
         private static byte[][] _shiftPatchOrig = null;
         private static bool _shiftPatchesApplied = false;
@@ -431,7 +449,7 @@ namespace ExtendedLSC.ManualTransmission
         #region Write Functions
 
         /// <summary>Write a gear's ratio (index 0 = reverse-area, 2 = 1st, 3 = 2nd, ... top = N+1). Used by
-        /// the NFS gearing template to space gears for a consistent RPM drop per shift.</summary>
+        /// the geometric gearing template to space gears for a consistent RPM drop per shift.</summary>
         public static void SetGearRatio(Vehicle vehicle, int gear, float ratio)
         {
             if (!_available || _gearRatiosOffset == 0 || gear < 0 || gear > 10) return;
@@ -466,7 +484,7 @@ namespace ExtendedLSC.ManualTransmission
 
         /// <summary>Write the LIVE gearbox top-gear (drive gear) count (UINT8) on THIS vehicle instance — the
         /// field the game + MT actually read. (CHandlingData.nInitialDriveGears only applies on vehicle reload.)
-        /// Caller must also set a ratio for any newly-added gear (e.g. ELSCTransmission.ApplyNfsGearing).</summary>
+        /// Caller must also set a ratio for any newly-added gear (e.g. ELSCTransmission.ApplyGeometricGearing).</summary>
         public static void SetTopGear(Vehicle vehicle, int gears)
         {
             if (!_available || _topGearOffset == 0) return;

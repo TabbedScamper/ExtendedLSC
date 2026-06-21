@@ -23,7 +23,6 @@ namespace ExtendedLSC.WheelFitment
         public static Action<string> Log { get; set; }
 
         private Vehicle _vehicle;
-        private bool _nativeApiAvailable = false;
         private bool _initialized = false;
 
         // Natural per-wheel offsets for the current wheel: X = track origin, Z = height origin.
@@ -194,8 +193,6 @@ namespace ExtendedLSC.WheelFitment
 
         public bool IsInitialized => _vehicle != null && _vehicle.Exists() && _initialized;
 
-        public bool IsFullFitmentAvailable => _nativeApiAvailable;
-
         #endregion
 
         #region Initialization
@@ -211,9 +208,6 @@ namespace ExtendedLSC.WheelFitment
 
             _vehicle = vehicle;
             _initialized = false;
-
-            WheelFitmentNative.Log = Log;
-            _nativeApiAvailable = WheelFitmentNative.IsAvailable;
 
             // Sliders start at stock.
             _frontCamber = 0f;
@@ -496,6 +490,11 @@ namespace ExtendedLSC.WheelFitment
                     && Math.Abs(_frontHeight) < 1e-4f && Math.Abs(_rearHeight) < 1e-4f && Math.Abs(_rake) < 1e-4f
                     && Math.Abs(_frontCamber) < 1e-4f && Math.Abs(_rearCamber) < 1e-4f;
                 if (!visStock) return;   // can't trust the visual baseline while a size/width mult is applied
+                // CRITICAL: heal runs BEFORE ApplyRender each frame. On the frame the slider snaps back to stock the
+                // render is STILL showing last frame's scaled value (ApplyRender hasn't restored it yet) — capturing
+                // that as "natural" compounds the baseline every stock<->size toggle (the wheel drifts smaller/larger
+                // each cycle). Wait until ApplyRender has actually restored the render (these flags go false).
+                if (_visSizeApplied || _visWidthApplied) return;
                 if (Game.GameTime - _lastHealAt < 500) return;
                 _lastHealAt = Game.GameTime;
                 string key = ResolveWheelKey();

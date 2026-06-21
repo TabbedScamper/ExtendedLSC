@@ -44,7 +44,7 @@ custom **stat bars**, **ownership tracking**, clean category organization, and *
 (categories with nothing real in them simply don't show).
 
 ### 🏎️ 5. Deep vehicle systems
-- **Manual transmission** — clutch model, NFS-style shift "kick", geometric gearing, a real rev limiter,
+- **Manual transmission** — clutch model, arcade-style shift "kick", geometric gearing, a real rev limiter,
   and a **NOS** mechanic with tiers.
 - **Wheel fitment / stance** — live offset / camber / width, with a stability auto-recovery system.
 - **Walk-around camera** — part-focused presets + free roam to inspect your build.

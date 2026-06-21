@@ -6,7 +6,7 @@ namespace ExtendedLSC
     /// A purchasable engine swap. The SOUND comes from FORCE_VEHICLE_ENGINE_AUDIO (a GTA vehicle audio ref —
     /// just the model name), the POWER from Vehicle.EnginePowerMultiplier. Because GET_VEHICLE_ACCELERATION
     /// does NOT read the power multiplier, each swap also carries display-only stat bonuses (AccelBonus /
-    /// SpeedBonus) that ELSC folds into the LSC stat bars + Forza PI so the menu reflects what the player did.
+    /// SpeedBonus) that ELSC folds into the LSC stat bars + performance index (PI) so the menu reflects what the player did.
     /// </summary>
     public class EngineSwap
     {
@@ -29,7 +29,7 @@ namespace ExtendedLSC
 
     public static class EngineSwaps
     {
-        // Ordered weakest -> strongest. Audio names + power values are easy to retune after in-game feel tests.
+        // Ordered weakest -> strongest. Audio names   power values are easy to retune after in-game feel tests.
         public static readonly List<EngineSwap> All = new List<EngineSwap>
         {
             new EngineSwap("street_i4", "Tuned Turbo Inline-4", "sultan",   18f,   4000, 0.10f, 0.03f,

@@ -8,10 +8,22 @@
     <RootNamespace>ExtendedLSC</RootNamespace>
     <UseWindowsForms>true</UseWindowsForms>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Two builds share this codebase. "Release" = GTA V Legacy (b3788). "Release-Enhanced" defines the ENHANCED
+         symbol (GamePlatform.BuiltForEnhanced) for the Enhanced edition (VER_EN_1_0_1013+). Same ScriptHookVDotNet3
+         API on both editions; only the raw-memory offsets differ, selected via the ENHANCED compile symbol. -->
+    <Configurations>Debug;Release;Release-Enhanced</Configurations>
 
     <!-- Output directly to GTA V scripts folder for easy testing -->
     <!-- Uncomment and adjust path as needed: -->
     <!-- <OutputPath>C:\Program Files\Rockstar Games\Grand Theft Auto V\scripts\</OutputPath> -->
+  </PropertyGroup>
+
+  <!-- Enhanced build: define ENHANCED and output to a separate folder so the Legacy and Enhanced DLLs never
+       overwrite each other (both are named ExtendedLSC.dll). Build with: dotnet build -c Release-Enhanced -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release-Enhanced'">
+    <DefineConstants>$(DefineConstants);ENHANCED</DefineConstants>
+    <Optimize>true</Optimize>
+    <OutputPath>bin\Release-Enhanced\</OutputPath>
   </PropertyGroup>
 
   <ItemGroup>
@@ -41,13 +53,10 @@
     </None>
   </ItemGroup>
 
-  <!-- Exclude backup copies and the integrated (C++) mod source from the C# compile -->
+  <!-- Exclude local backup copies from the C# compile -->
   <ItemGroup>
     <Compile Remove="ExtendedLSC_backup_\**" />
-    <Compile Remove="ExtendedLSC-backup-2026-06-07\**" />
     <Compile Remove="ExtendedLSC-backup-*\**" />
-    <Compile Remove="integrated_mods\**" />
-    <Compile Remove="native\**" />
   </ItemGroup>
 
 </Project>

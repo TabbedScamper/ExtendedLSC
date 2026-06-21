@@ -34,3 +34,14 @@ tools/dyno/results/
 
 # Speedo skin local backups
 speedo/*_backup/
+*_orig_backup/
+
+# Release package + page assets (built artifacts, not source)
+- Upload -/
+pictures/
+
+# Enhanced glass-DLC built binary (the xml shell IS committed; the ytd/rpf is regenerated)
+DLC/dlc_elsc_enhanced/x64/
+
+# dyno watch-loop state files
+*_watch.txt

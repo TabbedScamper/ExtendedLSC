@@ -7,7 +7,7 @@ namespace ExtendedLSC.WheelFitment
 {
     /// <summary>
     /// Pattern scanner for finding memory offsets dynamically.
-    /// Based on techniques from ikt's GTAVManualTransmission.
+    /// Locates game memory addresses by AOB (array-of-bytes) signature.
     /// </summary>
     public static class PatternScanner
     {
@@ -155,9 +155,9 @@ namespace ExtendedLSC.WheelFitment
             return IntPtr.Zero;
         }
 
-        #region Known Patterns (from VStancer/Manual Transmission)
+        #region Known Patterns
 
-        // These patterns are from reverse engineering VStancer.asi and ikt's source code
+        // These byte signatures were derived by reverse-engineering the game's wheel/handling code
         // They find offsets dynamically for any game version
 
         /// <summary>
@@ -165,7 +165,7 @@ namespace ExtendedLSC.WheelFitment
         /// </summary>
         public static int FindWheelsPointerOffset()
         {
-            // Pattern from VStancer: looks for wheel array access
+            // Pattern: looks for wheel array access
             var addr = FindPattern("4C 8B ?? ?? ?? 00 00 48 8B 40 20 48 8B 80 B0 00 00 00");
             if (addr == IntPtr.Zero)
             {
@@ -217,7 +217,7 @@ namespace ExtendedLSC.WheelFitment
         /// </summary>
         public static int FindHandlingOffset()
         {
-            // Pattern from VStancer
+            // Pattern
             var addr = FindPattern("88 90 ?? ?? ?? 00 0F B7 90 ?? 00 00 00");
             if (addr == IntPtr.Zero)
             {
