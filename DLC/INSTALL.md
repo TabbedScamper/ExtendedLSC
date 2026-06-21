@@ -1,4 +1,4 @@
-# ExtendedLSC Add-On DLC (`dlc_elsc`)
+# ExtendedLSC Add-On DLC (`elsc`)
 
 Add-on DLC that ships ELSC's modified assets so users **never have to hand-edit `vehshare.ytd`** or
 any base game file. Currently carries the **clear/whitened vehicle glass texture** required for the live
@@ -15,13 +15,13 @@ The DLC overrides `vehshare.ytd` purely by **load order** — exactly how Rockst
 ships its `vehshare.ytd` over the base game. No base files are modified; fully removable.
 
 ## Install (Single Player, GTA V Legacy)
-1. Copy the `dlc_elsc` folder into:
-   `...\Grand Theft Auto V\mods\update\x64\dlcpacks\dlc_elsc\`
+1. Copy the `elsc` folder into:
+   `...\Grand Theft Auto V\mods\update\x64\dlcpacks\elsc\`
    (use the `mods` folder via OpenIV; if you don't use a `mods` folder, the real `update\x64\dlcpacks\`)
 2. Open `mods\update\update.rpf\common\data\dlclist.xml` in OpenIV (edit mode) and add this line at the
    **very end** of the `<Paths>` list (last = loads last = overrides vanilla):
    ```xml
-   <Item>dlcpacks:/dlc_elsc/</Item>
+   <Item>dlcpacks:/elsc/</Item>
    ```
 3. Save, launch the game.
 
@@ -30,7 +30,7 @@ ships its `vehshare.ytd` over the base game. No base files are modified; fully r
 - Side/rear windows: clear on "None"; take vivid color when ELSC applies a custom tint.
 
 ## Uninstall
-- Delete the `dlc_elsc` folder and remove the `dlclist.xml` line. Base game untouched.
+- Delete the `elsc` folder and remove the `dlclist.xml` line. Base game untouched.
 
 ## Build notes (for maintainers)
 - Source: `patch2023_02` `vehshare.ytd` (latest-loading vanilla copy, 54 textures).
